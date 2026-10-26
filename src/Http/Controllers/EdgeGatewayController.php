@@ -29,8 +29,6 @@ class EdgeGatewayController extends AdminController
             return response()->json(['result' => 'deley'], 300);
         }
 
-        dd(Hash::make('123456'));
-
         $user = $this->service->auth($username, $password, $clientid, $ipaddr);
 
         if ($user) {
