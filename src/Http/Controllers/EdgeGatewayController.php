@@ -6,12 +6,12 @@ use DagaSmart\BizAdmin\Renderers\Json;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
-use DagaSmart\Edge\Services\NanoService;
+use DagaSmart\Edge\Services\EdgeGatewayService;
 
 
-class NanoController extends AdminController
+class EdgeGatewayController extends AdminController
 {
-    protected string $serviceName = NanoService::class;
+    protected string $serviceName = EdgeGatewayService::class;
 
     /**
      * NanoMQ 客户端鉴权
@@ -28,6 +28,8 @@ class NanoController extends AdminController
         if (empty($clientid)) {
             return response()->json(['result' => 'deley'], 300);
         }
+
+        dd(Hash::make('123456'));
 
         $user = $this->service->auth($username, $password, $clientid, $ipaddr);
 

@@ -2,6 +2,7 @@
 
 use DagaSmart\Edge\Http\Controllers;
 use DagaSmart\Edge\Http\Middleware\Middleware;
+use DagaSmart\Edge\Services\EdgeGatewayService;
 use Illuminate\Routing\Router;
 use Illuminate\Support\Facades\Route;
 use DagaSmart\BizAdmin\Middleware\Authenticate;
@@ -14,22 +15,19 @@ Route::group([
         Middleware::class,
     ],
 ], function (Router $router) {
-    Route::get('edge', [Controllers\EdgeController::class, 'index']);
+    // Route::get('edge', [Controllers\EdgeController::class, 'index']);
 
-    Route::post('edge/nano/auth', [Controllers\NanoController::class, 'auth'])
+    Route::post('edge/gateway/auth', [Controllers\EdgeGatewayController::class, 'auth'])
         ->withoutMiddleware([Permission::class, Authenticate::class, Middleware::class]);
 
-    Route::post('edge/nano/super', [Controllers\NanoController::class, 'super'])
+    Route::post('edge/gateway/super', [Controllers\EdgeGatewayController::class, 'super'])
         ->withoutMiddleware([Permission::class, Authenticate::class]);
 
-    Route::post('edge/nano/acl', [Controllers\NanoController::class, 'acl'])
+    Route::post('edge/gateway/acl', [Controllers\EdgeGatewayController::class, 'acl'])
         ->withoutMiddleware([Permission::class, Authenticate::class]);
-
-    Route::post('edge/mqtt/auth', [Controllers\MqttController::class, 'auth']);
 
     // resource必须放最后面
-    $router->resource('edge/mqtt/index', Controllers\MqttController::class);
-    $router->resource('edge/nano/index', Controllers\NanoController::class);
+    $router->resource('edge/gateway', Controllers\EdgeGatewayController::class);
 });
 
 // 免登录无限制
