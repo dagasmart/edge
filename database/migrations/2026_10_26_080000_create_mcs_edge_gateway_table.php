@@ -42,11 +42,11 @@ return new class extends Migration
 
                 $table->timestamps();
 
-                $table->index('service_name');
-                $table->index('service_code');
-                $table->index('service_ip');
-                $table->index(['service_code', 'service_ip']);
-                $table->unique(['service_code', 'service_ip'])->nullsNotDistinct();
+                $table->index('gateway');
+                $table->index('code');
+                $table->index('ip');
+                $table->index(['code', 'ip']);
+                $table->unique(['code', 'ip'])->nullsNotDistinct();
             });
         }
 
