@@ -1,0 +1,23 @@
+services:
+  nanomq:
+    image: emqx/nanomq:latest-full
+    container_name: nanomq
+    restart: unless-stopped
+    ports:
+      - "21884:8883"   # 宿主机 21884 → 容器 TLS 8883（MQTTX / 管理端）
+      - "21883:1883"   # 宿主机 21883 → 容器明文 1883（门禁设备）
+    volumes:
+      - /data/nanomq/conf/nanomq.conf:/etc/nanomq.conf:ro
+      - /data/nanomq/certs:/etc/nanomq/certs:ro
+    command: ["/usr/local/bin/nanomq", "start", "--conf", "/etc/nanomq.conf"]
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

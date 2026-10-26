@@ -1,0 +1,36 @@
+{
+    "name": "dagasmart/edge",
+    "alias": "网关服务",
+    "description": "实现短信、邮件发送/验证、nanoMQ/MQTT/IOT边缘网关服务等",
+    "type": "library",
+    "version": "1.0.0",
+    "keywords": ["bizadmin", "extension"],
+    "homepage": "https://github.com/dagasmart/edge",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Administrator",
+            "email": "dagasmart@163.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.0",
+        "dagasmart/bizadmin": "*"
+    },
+    "autoload": {
+        "psr-4": {
+            "DagaSmart\\Edge\\": "src/"
+        },
+        "files": [
+            "src/helpers.php"
+        ]
+    },
+    "extra": {
+        "bizadmin": "DagaSmart\\Edge\\EdgeServiceProvider",
+        "laravel": {
+            "providers": [
+                "DagaSmart\\Edge\\EdgeServiceProvider"
+            ]
+        }
+    }
+}
