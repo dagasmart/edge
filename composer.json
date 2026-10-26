@@ -1,6 +1,6 @@
 {
     "name": "dagasmart/edge",
-    "alias": "网关服务",
+    "alias": "边缘网关",
     "description": "实现短信、邮件发送/验证、nanoMQ/MQTT/IOT边缘网关服务等",
     "type": "library",
     "version": "1.0.0",
