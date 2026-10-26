@@ -5,3 +5,4 @@ composer.phar
 composer.lock
 *.project
 .idea/
+/database/migrations/2026_09_24_000001_create_mcs_edge_gateway_table.php
