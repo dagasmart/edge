@@ -3,7 +3,7 @@
 namespace DagaSmart\Edge\Models;
 
 /**
- *设备数据流
+ *数据流模型
  */
 class EdgeDataStream extends Model
 {

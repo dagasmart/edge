@@ -15,7 +15,7 @@ return new class extends Migration
     {
         if (! Schema::hasTable($this->name)) {
             Schema::create($this->name, function (Blueprint $table) {
-                $table->comment('边缘网关用户表');
+                $table->comment('边缘网关认证表');
                 $table->id();
 
                 $table->string('username', 64)
