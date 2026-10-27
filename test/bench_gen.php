@@ -80,4 +80,4 @@ echo "[gen] Done! {$written} request bodies → {$output}\n";
 echo "[gen] File size: " . round(filesize($output) / 1024 / 1024, 1) . " MB\n";
 echo "\n";
 echo "Next step:\n";
-echo "  wrk -t12 -c1000 -d30s --script=bench_wrk.lua --latency http://127.0.0.1:9503/mqtt/auth\n";
+echo "  wrk -t12 -c1000 -d30s --script=extensions/edge/test/bench_wrk.lua --latency http://127.0.0.1:9503/mqtt/auth\n";
