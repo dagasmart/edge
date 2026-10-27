@@ -1,61 +1,58 @@
 <?php
 declare(strict_types=1);
 
-use Swow\Coroutine;
 use Swow\Channel;
+use Swow\Coroutine;
 
-function hmacAuthenticate(string $clientId, string $password): bool
+function hmacAuthenticate(string $clientId, string $username, string $password): bool
 {
     $parts = explode('|', $password, 3);
     if (count($parts) !== 3) {
-        fwrite(STDERR, "[hmac] parts mismatch\n");
         return false;
     }
 
     [$b64Sign, $timestamp, $nonce] = array_map('trim', $parts);
     $sign = base64_decode($b64Sign, true);
     if ($sign === false || !ctype_digit($timestamp)) {
-        fwrite(STDERR, "[hmac] base64 or timestamp invalid\n");
         return false;
     }
 
-    if (abs((int)$timestamp - time()) > TIME_DRIFT) {
-        fwrite(STDERR, "[hmac] timestamp drift\n");
+    $drift = defined('TIME_DRIFT') ? TIME_DRIFT : 120;
+    if (abs((int)$timestamp - time()) > $drift) {
         return false;
     }
 
-    $payload = $clientId . '|' . $timestamp . '|' . $nonce;
+    $payload = $clientId . '|' . $username . '|' . $timestamp . '|' . $nonce;
 
-    // ---------- L1 本地缓存：秘钥（双密钥支持） ----------
-    $cacheKey = "secret:{$clientId}";
+    // ---------- secret 获取 + 空值缓存 ----------
+    $cacheKey = "secret:{$clientId}:{$username}";
     $secret = localCacheGet($cacheKey);
+
     if ($secret === null) {
-        // 先查主密钥
-        $secret = redisGet("device:secret:{$clientId}");
-
-        // 主密钥不存在，查过渡期旧密钥
+        $secret = redisGet("device:secret:{$clientId}:{$username}");
         if (!is_string($secret) || $secret === '') {
-            $secret = redisGet("device:secret:old:{$clientId}");
+            $secret = redisGet("device:secret:old:{$clientId}:{$username}");
         }
-
         if (is_string($secret) && $secret !== '') {
             localCacheSet($cacheKey, $secret, LOCAL_CACHE_TTL);
+        } else {
+            localCacheSet($cacheKey, '__NULL__', 30); // ✅ 空缓存防穿透
         }
+    } elseif ($secret === '__NULL__') {
+        return false;
     }
 
     if (!is_string($secret) || $secret === '') {
-        fwrite(STDERR, "[hmac] no secret for {$clientId}\n");
         return false;
     }
 
     // ---------- HMAC 校验 ----------
     $expect = hash_hmac('sha256', $payload, $secret, true);
     if (!hash_equals($expect, $sign)) {
-        fwrite(STDERR, "[hmac] signature mismatch\n");
         return false;
     }
 
-    // ---------- 并发查吊销 + nonce ----------
+    // ---------- 并发吊销 + nonce ----------
     $ch = new Channel(2);
     $revoked = false;
     $nonceOk = false;
@@ -63,22 +60,23 @@ function hmacAuthenticate(string $clientId, string $password): bool
     Coroutine::run(function () use ($clientId, $ch, &$revoked): void {
         try {
             $revoked = redisExists("device:revoke:{$clientId}");
-        } catch (\Throwable $e) {
-            fwrite(STDERR, "[hmac] revoke check: " . $e->getMessage() . "\n");
-        }
-        $ch->push('revoke');
+        } catch (\Throwable) {}
+        $ch->push('r');
     });
 
-    Coroutine::run(function () use ($clientId, $nonce, $ch, &$nonceOk): void {
+    Coroutine::run(function () use ($clientId, $username, $nonce, $ch, &$nonceOk): void {
         try {
-            $nonceOk = redisSetNxEx("device:nonce:{$clientId}", $nonce, 600);
-        } catch (\Throwable $e) {
-            fwrite(STDERR, "[hmac] nonce set: " . $e->getMessage() . "\n");
-        }
-        $ch->push('nonce');
+            $nk = "device:nonce:{$clientId}:{$username}";
+            $existing = redisGet($nk);
+            if ($existing === $nonce) {
+                $nonceOk = true; // ✅ 同 nonce 在有效期内放行
+            } else {
+                $nonceOk = redisSetNxEx($nk, $nonce, 120);
+            }
+        } catch (\Throwable) {}
+        $ch->push('n');
     });
 
-    // 等待完成（2秒超时）
     $done = 0;
     while ($done < 2) {
         try {
@@ -89,13 +87,7 @@ function hmacAuthenticate(string $clientId, string $password): bool
         }
     }
 
-    if ($revoked) {
-        fwrite(STDERR, "[hmac] revoked: {$clientId}\n");
-        return false;
-    }
-
-    if (!$nonceOk) {
-        fwrite(STDERR, "[hmac] nonce replay\n");
+    if ($revoked || !$nonceOk) {
         return false;
     }
 

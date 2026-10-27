@@ -1,32 +1,31 @@
 <?php
 declare(strict_types=1);
 
-use Swow\Coroutine;
+use Swow\Channel;
 
 /* =========================================================
- * Redis 连接池（pphpredis + Swow 协程安全）
+ * Redis 连接池（Swow Channel 真协程池）
  * ========================================================= */
 
-/** @var \SplQueue|null */
+/** @var Channel|null $redisPool */
 $redisPool = null;
 
 /** @var int */
 $redisPoolSize = 16;
 
-/** @var int Redis 库号 */
+/** @var int */
 $redisDb = 2;
 
-/** @var string Redis 密码 */
+/** @var string */
 $redisPassword = '';
 
 function redisPoolInit(int $size = 16, int $db = 2): void
 {
     global $redisPool, $redisPoolSize, $redisDb, $redisPassword;
-    $redisPool = new \SplQueue();
+    $redisPool = new Channel($size);
     $redisPoolSize = $size;
     $redisDb = $db;
 
-    // 从 server.php 定义的常量取
     if (defined('REDIS_PASSWORD')) {
         $redisPassword = REDIS_PASSWORD;
     }
@@ -45,41 +44,25 @@ function redisPoolInit(int $size = 16, int $db = 2): void
             if ($redisDb > 0) {
                 $redis->select($redisDb);
             }
-            $redisPool->enqueue($redis);
+            $redisPool->push($redis); // ✅ Channel::push，不是 enqueue
             $ok++;
-            fwrite(STDOUT, "[redis] connected ({$ok}/{$size})\n");
         } catch (\Throwable $e) {
             fwrite(STDERR, "[redis] init failed: " . $e->getMessage() . "\n");
         }
     }
-
     fwrite(STDERR, "[EdgeAuth] Redis pool initialized: {$ok}/{$size}\n");
-    fwrite(STDERR, "[EdgeAuth] Redis pool={$size} db={$redisDb} host={$host} port={$port}\n");
 }
 
-function redisPoolPop(float $timeout = 3.0): ?\Redis
+function redisPoolPop(float $timeout = 3): ?\Redis
 {
     global $redisPool;
     if ($redisPool === null) {
         redisPoolInit();
     }
-
-    $start = microtime(true);
-    while (true) {
-        if (!$redisPool->isEmpty()) {
-            return $redisPool->dequeue();
-        }
-        $elapsed = microtime(true) - $start;
-        if ($elapsed >= $timeout) {
-            fwrite(STDERR, "[redis] pool pop timeout\n");
-            return null;
-        }
-        if (class_exists(Coroutine::class) && Coroutine::getCurrent() !== null) {
-            Coroutine::yield();
-            usleep(1000);
-        } else {
-            usleep(10000);
-        }
+    try {
+        return $redisPool->pop($timeout);
+    } catch (\Throwable) {
+        return null;
     }
 }
 
@@ -95,28 +78,26 @@ function redisPoolPush(\Redis $conn): void
 
     try {
         $conn->ping();
-        $redisPool->enqueue($conn);
-    } catch (\Throwable $e) {
-        try {
-            $new = new \Redis();
-            $new->connect($host, $port, 2.0);
-            if ($redisPassword !== '') {
-                $new->auth($redisPassword);
-            }
-            if ($redisDb > 0) {
-                $new->select($redisDb);
-            }
-            $redisPool->enqueue($new);
-            fwrite(STDERR, "[redis] replaced dead connection\n");
-        } catch (\Throwable $e2) {
-            fwrite(STDERR, "[redis] failed to replace: " . $e2->getMessage() . "\n");
+        $redisPool->push($conn);
+        return;
+    } catch (\Throwable) {
+        // dead, recreate
+    }
+
+    try {
+        $new = new \Redis();
+        $new->connect($host, $port, 2.0);
+        if ($redisPassword !== '') {
+            $new->auth($redisPassword);
         }
+        if ($redisDb > 0) {
+            $new->select($redisDb);
+        }
+        $redisPool->push($new);
+    } catch (\Throwable $e2) {
+        fwrite(STDERR, "[redis] replace failed: " . $e2->getMessage() . "\n");
     }
 }
-
-/* =========================================================
- * RAII 包裹器
- * ========================================================= */
 
 function withRedis(callable $fn): mixed
 {
@@ -140,19 +121,14 @@ function redisGet(string $key): mixed
     return withRedis(fn(\Redis $conn) => $conn->get($key));
 }
 
-function redisSet(string $key, string $value): bool
-{
-    return withRedis(fn(\Redis $conn) => (bool) $conn->set($key, $value));
-}
-
 function redisSetex(string $key, int $ttl, string $value): bool
 {
-    return withRedis(fn(\Redis $conn) => (bool) $conn->setex($key, $ttl, $value));
+    return withRedis(fn(\Redis $conn) => (bool)$conn->setex($key, $ttl, $value));
 }
 
 function redisExists(string $key): bool
 {
-    return withRedis(fn(\Redis $conn) => (bool) $conn->exists($key));
+    return withRedis(fn(\Redis $conn) => (bool)$conn->exists($key));
 }
 
 function redisDel(string ...$keys): int
@@ -162,11 +138,11 @@ function redisDel(string ...$keys): int
 
 function redisSetNxEx(string $key, string $value, int $ttl): bool
 {
-    return withRedis(fn(\Redis $conn) => (bool) $conn->set($key, $value, ['NX', 'EX' => $ttl]));
+    return withRedis(fn(\Redis $conn) => (bool)$conn->set($key, $value, ['NX', 'EX' => $ttl]));
 }
 
 /* =========================================================
- * L1 本地缓存
+ * L1 本地缓存（带上限）
  * ========================================================= */
 
 /** @var \ArrayObject|null */
@@ -176,22 +152,15 @@ function localCacheInit(): void
 {
     global $localCache;
     $localCache = new \ArrayObject();
-    fwrite(STDERR, "[EdgeAuth] Local L1 cache (ArrayObject, no-lock) initialized\n");
 }
 
 function localCacheGet(string $key): mixed
 {
     global $localCache;
-    if ($localCache === null) {
-        return null;
-    }
-    if (!isset($localCache[$key])) {
+    if ($localCache === null || !isset($localCache[$key])) {
         return null;
     }
     $entry = $localCache[$key];
-    if (!is_array($entry) || !isset($entry['expires'])) {
-        return null;
-    }
     if ($entry['expires'] < time()) {
         unset($localCache[$key]);
         return null;
@@ -205,28 +174,24 @@ function localCacheSet(string $key, mixed $value, int $ttl): void
     if ($localCache === null) {
         return;
     }
+    // 防膨胀：超 10000 条清 20%
+    if ($localCache->count() > 10000) {
+        $i = 0;
+        foreach ($localCache as $k => $v) {
+            unset($localCache[$k]);
+            if (++$i > 2000) break;
+        }
+    }
     $localCache[$key] = [
-        'value' => $value,
+        'value'   => $value,
         'expires' => time() + $ttl,
     ];
-}
-
-function localCacheDelete(string $key): void
-{
-    global $localCache;
-    if ($localCache === null) {
-        return;
-    }
-    unset($localCache[$key]);
 }
 
 function localCacheStats(): int
 {
     global $localCache;
-    if ($localCache === null) {
-        return 0;
-    }
-    return $localCache->count();
+    return $localCache !== null ? $localCache->count() : 0;
 }
 
 /* =========================================================
@@ -235,18 +200,106 @@ function localCacheStats(): int
 
 function redisPoolStats(): array
 {
-    global $redisPool;
+    global $redisPool, $redisPoolSize;
     if ($redisPool === null) {
         return ['total' => 0, 'free' => 0];
     }
     return [
-        'total' => $GLOBALS['redisPoolSize'] ?? 0,
-        'free'  => $redisPool->count(),
+        'total' => $redisPoolSize ?? 0,
+        'free'  => $redisPool->getLength(), // ✅ Channel 用 getLength()
     ];
 }
 
 /* =========================================================
- * 限流辅助函数
+ * 并发熔断
+ * ========================================================= */
+
+/** @var Channel|null */
+$globalConcurrency = null;
+
+function concurrencyInit(int $max): void
+{
+    global $globalConcurrency;
+    $globalConcurrency = new Channel($max);
+    for ($i = 0; $i < $max; $i++) {
+        $globalConcurrency->push(1);
+    }
+}
+
+function concurrencyAcquire(float $timeout = 2.0): bool
+{
+    global $globalConcurrency;
+    if ($globalConcurrency === null) {
+        return true;
+    }
+    try {
+        $globalConcurrency->pop($timeout);
+        return true;
+    } catch (\Throwable) {
+        return false;
+    }
+}
+
+function concurrencyRelease(): void
+{
+    global $globalConcurrency;
+    if ($globalConcurrency !== null) {
+        $globalConcurrency->push(1);
+    }
+}
+
+/* =========================================================
+ * 客户端失败熔断
+ * ========================================================= */
+
+function isClientBlocked(string $clientId): bool
+{
+    $v = redisGet("block:{$clientId}");
+    return $v !== null && $v !== false;
+}
+
+function recordClientFail(string $clientId): void
+{
+    $key = "fail:{$clientId}";
+    withRedis(function (\Redis $conn) use ($key, $clientId) {
+        $c = $conn->incr($key);
+        if ($c === 1) {
+            $conn->expire($key, 300);
+        }
+        if ($c >= 20) {
+            $conn->setex("block:{$clientId}", 600, '1');
+            fwrite(STDERR, "[block] {$clientId}\n");
+        }
+    });
+}
+
+/* =========================================================
+ * 指标
+ * ========================================================= */
+
+$metrics = [
+    'auth_total' => 0,
+    'auth_ok'    => 0,
+    'auth_fail'  => 0,
+    'cache_hit'  => 0,
+];
+
+function metricsInc(string $key, int $n = 1): void
+{
+    global $metrics;
+    if (isset($metrics[$key])) {
+        $metrics[$key] += $n;
+    }
+}
+
+function metricsSnapshot(): array
+{
+    global $metrics;
+    return $metrics;
+}
+
+/* =========================================================
+ * 限流
  * ========================================================= */
 
 function rateLimited(string $key): bool
@@ -255,14 +308,13 @@ function rateLimited(string $key): bool
     $window = defined('RATE_TTL') ? RATE_TTL : 60;
     try {
         return withRedis(function (\Redis $conn) use ($key, $max, $window) {
-            $current = $conn->incr($key);
-            if ($current === 1) {
+            $c = $conn->incr($key);
+            if ($c === 1) {
                 $conn->expire($key, $window);
             }
-            return $current > $max;
+            return $c > $max;
         });
-    } catch (\Throwable $e) {
-        fwrite(STDERR, "[rateLimit] " . $e->getMessage() . "\n");
+    } catch (\Throwable) {
         return false;
     }
 }
@@ -270,15 +322,8 @@ function rateLimited(string $key): bool
 function hitRate(string $key, int $ttl = 60): int
 {
     try {
-        return withRedis(function (\Redis $conn) use ($key, $ttl) {
-            $current = $conn->incr($key);
-            if ($current === 1) {
-                $conn->expire($key, $ttl);
-            }
-            return $current;
-        });
-    } catch (\Throwable $e) {
-        fwrite(STDERR, "[hitRate] " . $e->getMessage() . "\n");
+        return withRedis(fn(\Redis $conn) => $conn->incr($key));
+    } catch (\Throwable) {
         return 0;
     }
 }
@@ -287,17 +332,5 @@ function resetRate(string $key): void
 {
     try {
         withRedis(fn(\Redis $conn) => $conn->del($key));
-    } catch (\Throwable $e) {
-        fwrite(STDERR, "[resetRate] " . $e->getMessage() . "\n");
-    }
+    } catch (\Throwable) {}
 }
-
-/* =========================================================
- * 常量定义（唯一入口，用 defined 保护）
- * server.php 里已经 define 过了，这里全部 if(!defined) 兜底
- * ========================================================= */
-
-if (!defined('LOCAL_CACHE_TTL')) { define('LOCAL_CACHE_TTL', 60); }
-if (!defined('TIME_DRIFT'))     { define('TIME_DRIFT', 300); }
-if (!defined('RATE_LIMIT_MAX')) { define('RATE_LIMIT_MAX', 10); }
-if (!defined('RATE_LIMIT_WINDOW')) { define('RATE_LIMIT_WINDOW', 60); }
