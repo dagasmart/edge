@@ -12,11 +12,13 @@ if (!defined('REDIS_PASSWORD'))  define('REDIS_PASSWORD', 'uApDVQD7');
 if (!defined('REDIS_DB'))        define('REDIS_DB',       2);
 if (!defined('REDIS_POOL_SIZE')) define('REDIS_POOL_SIZE', 64);
 if (!defined('CACHE_TTL'))       define('CACHE_TTL',      300);
-if (!defined('RATE_TTL'))        define('RATE_TTL',       60);
-if (!defined('RATE_MAX'))        define('RATE_MAX',       10);
-if (!defined('TIME_DRIFT'))      define('TIME_DRIFT',     120);
 if (!defined('LOCAL_CACHE_TTL')) define('LOCAL_CACHE_TTL', 60);
-if (!defined('MAX_CONCURRENCY')) define('MAX_CONCURRENCY', 5000);
+// 压测时临时改成：
+if (!defined('RATE_MAX'))  define('RATE_MAX',  100000); // 原来 10
+if (!defined('RATE_TTL'))  define('RATE_TTL',  60);
+if (!defined('TIME_DRIFT')) define('TIME_DRIFT', 300); // 原来 120，给生成器更大窗口
+if (!defined('MAX_CONCURRENCY')) define('MAX_CONCURRENCY', 10000); // 原来 5000
+
 
 // ---------- 加载业务文件 ----------
 require_once __DIR__ . '/helper.php';

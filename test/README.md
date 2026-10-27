@@ -1,32 +1,11 @@
-Éú³ÉÑ¹²âÁÙÊ±Êı¾İÎÄ¼ş£º
-# ÖØĞÂÉú³ÉÇëÇóÌå£¨ts ²»¼ÓÆ«ÒÆ£¬¾ÍÊÇµ±Ç°Ê±¼ä£©
-php -r '
-$secret="test-secret-12345"; $c="test-1"; $count=200000; $lines=[];
-for($i=0;$i<$count;$i++){
-  $ts=time(); $n=bin2hex(random_bytes(12));
-  $s=base64_encode(hash_hmac("sha256","{$c}|{$ts}|{$n}",$secret,true));
-  $lines[]="clientid={$c}&username={$c}&password=".urlencode("{$s}|{$ts}|{$n}");
-}
-file_put_contents("/tmp/req_bodies.txt",implode("\n",$lines));
-echo "Generated ".count($lines)." requests\n";
-'
-
-# ÏÈ 5 ÃëÑéÖ¤
-wrk -t12 -c400 -d5s --script=bench_replay.lua --latency http://127.0.0.1:9503/mqtt/auth
+å‹æµ‹å‘½ä»¤
+bash
+# 1. ç”Ÿæˆè¯·æ±‚ä½“
+php extensions/edge/test/bench_gen.php 200000 /tmp/bench_bodies.txt
 
 
-# ÊÖ¶¯ÑéÖ¤
-php -r '
-$secret = "test-secret-12345";
-$ts = time();
-$nonce = bin2hex(random_bytes(8));
-$payload = "test-1|{$ts}|{$nonce}";
-$sig = base64_encode(hash_hmac("sha256", $payload, $secret, true));
-echo "curl -X POST http://127.0.0.1:9503/mqtt/auth -H \"Content-Type: application/x-www-form-urlencoded\" -d \"clientid=test-1&username=test-1&password=" . urlencode($sig) . "%7C{$ts}%7C{$nonce}\"\n";
-' | bash
+# 2. å…ˆè·‘ä¸€æ¬¡å°æµé‡é¢„çƒ­
+wrk -t2 -c50 -d5s --script=extensions/edge/test/bench_wrk.lua http://127.0.0.1:9503/mqtt/auth
 
-
-Ñ¹Á¦²âÊÔ£º
-wrk -t12 -c400 -d30s --script=bench_replay.lua --latency http://127.0.0.1:9503/mqtt/auth
-
-wrk -t12 -c1000 -d5s --script=bench_replay.lua --latency http://127.0.0.1:9503/mqtt/auth
+# 2. ç„¶åæ­£å¼å‹
+wrk -t12 -c1000 -d30s --script=extensions/edge/test/bench_wrk.lua --latency http://127.0.0.1:9503/mqtt/auth
