@@ -13,8 +13,8 @@ $output  = $argv[2] ?? '/tmp/bench_bodies.txt';
 
 // ---------- Redis 连接 ----------
 $redis = new Redis();
-$redis->connect('127.0.0.1', 6379, 2.0);
-$redis->auth('123456');
+$redis->connect('127.0.0.1', 16379, 2);
+$redis->auth('uApDVQD7');
 $redis->select(2);
 
 // ---------- 配置 ----------
