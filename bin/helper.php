@@ -44,7 +44,7 @@ function redisPoolInit(int $size = 16, int $db = 2): void
             if ($redisDb > 0) {
                 $redis->select($redisDb);
             }
-            $redisPool->push($redis); // ✅ Channel::push，不是 enqueue
+            $redisPool->push($redis);
             $ok++;
         } catch (\Throwable $e) {
             fwrite(STDERR, "[redis] init failed: " . $e->getMessage() . "\n");
@@ -96,6 +96,8 @@ function redisPoolPush(\Redis $conn): void
         $redisPool->push($new);
     } catch (\Throwable $e2) {
         fwrite(STDERR, "[redis] replace failed: " . $e2->getMessage() . "\n");
+        // ✅ 连接池可能逐渐枯竭，记录指标便于告警
+        metricsInc('redis_pool_exhausted');
     }
 }
 
@@ -174,13 +176,9 @@ function localCacheSet(string $key, mixed $value, int $ttl): void
     if ($localCache === null) {
         return;
     }
-    // 防膨胀：超 10000 条清 20%
-    if ($localCache->count() > 10000) {
-        $i = 0;
-        foreach ($localCache as $k => $v) {
-            unset($localCache[$k]);
-            if (++$i > 2000) break;
-        }
+    // ✅ 超上限直接拒绝写入，靠 TTL 自然淘汰，避免误删热点 key
+    if ($localCache->count() >= 10000) {
+        return;
     }
     $localCache[$key] = [
         'value'   => $value,
@@ -206,7 +204,7 @@ function redisPoolStats(): array
     }
     return [
         'total' => $redisPoolSize ?? 0,
-        'free'  => $redisPool->getLength(), // ✅ Channel 用 getLength()
+        'free'  => $redisPool->getLength(),
     ];
 }
 
@@ -249,7 +247,7 @@ function concurrencyRelease(): void
 }
 
 /* =========================================================
- * 客户端失败熔断
+ * 客户端失败熔断（Lua 原子版）
  * ========================================================= */
 
 function isClientBlocked(string $clientId): bool
@@ -262,10 +260,12 @@ function recordClientFail(string $clientId): void
 {
     $key = "fail:{$clientId}";
     withRedis(function (\Redis $conn) use ($key, $clientId) {
-        $c = $conn->incr($key);
-        if ($c === 1) {
-            $conn->expire($key, 300);
-        }
+        // ✅ Lua 脚本保证 INCR + EXPIRE 原子性，消除幽灵 key
+        $script = "local c = redis.call('INCR', KEYS[1])
+if c == 1 then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return c";
+        $c = (int) $conn->eval($script, [$key, 300], 1);
+
         if ($c >= 20) {
             $conn->setex("block:{$clientId}", 600, '1');
             fwrite(STDERR, "[block] {$clientId}\n");
@@ -278,10 +278,11 @@ function recordClientFail(string $clientId): void
  * ========================================================= */
 
 $metrics = [
-    'auth_total' => 0,
-    'auth_ok'    => 0,
-    'auth_fail'  => 0,
-    'cache_hit'  => 0,
+    'auth_total'            => 0,
+    'auth_ok'               => 0,
+    'auth_fail'             => 0,
+    'cache_hit'             => 0,
+    'redis_pool_exhausted'  => 0, // ✅ 连接池枯竭指标
 ];
 
 function metricsInc(string $key, int $n = 1): void

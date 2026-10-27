@@ -2,7 +2,6 @@
 declare(strict_types=1);
 
 use Swow\Psr7\Server\Server;
-use Swow\Socket;
 
 // ---------- 配置常量 ----------
 if (!defined('AUTH_PORT'))       define('AUTH_PORT',      9503);
@@ -11,14 +10,17 @@ if (!defined('REDIS_PORT'))      define('REDIS_PORT',     16379);
 if (!defined('REDIS_PASSWORD'))  define('REDIS_PASSWORD', 'uApDVQD7');
 if (!defined('REDIS_DB'))        define('REDIS_DB',       2);
 if (!defined('REDIS_POOL_SIZE')) define('REDIS_POOL_SIZE', 64);
+
+// ✅ 并发上限与 Redis 池大小对齐，避免 503 误报（压测可调大，但保持 ≈ 池×2）
+if (!defined('MAX_CONCURRENCY')) define('MAX_CONCURRENCY', REDIS_POOL_SIZE * 2);
+
 if (!defined('CACHE_TTL'))       define('CACHE_TTL',      300);
 if (!defined('LOCAL_CACHE_TTL')) define('LOCAL_CACHE_TTL', 60);
-// 压测时临时改成：
-if (!defined('RATE_MAX'))  define('RATE_MAX',  100000); // 原来 10
-if (!defined('RATE_TTL'))  define('RATE_TTL',  60);
-if (!defined('TIME_DRIFT')) define('TIME_DRIFT', 300); // 原来 120，给生成器更大窗口
-if (!defined('MAX_CONCURRENCY')) define('MAX_CONCURRENCY', 10000); // 原来 5000
 
+// 压测时临时改成（生产务必回退）：
+if (!defined('RATE_MAX'))   define('RATE_MAX',  100000); // 原来 10
+if (!defined('RATE_TTL'))   define('RATE_TTL',  60);
+if (!defined('TIME_DRIFT')) define('TIME_DRIFT', 300);   // 原来 120，给生成器更大窗口
 
 // ---------- 加载业务文件 ----------
 require_once __DIR__ . '/helper.php';
@@ -42,15 +44,10 @@ concurrencyInit(MAX_CONCURRENCY);
 // ---------- Server ----------
 $server = new Server();
 
-// SO_REUSEPORT（Linux only，Windows 静默忽略）
-try {
-    $sock = $server->getSocket();
-    if (method_exists($sock, 'setOption')) {
-        @$sock->setOption(Socket::SOL_SOCKET, 15, 1); // SO_REUSEPORT
-    }
-} catch (\Throwable) {
-    // ignore
-}
+// 注意：不手动设置 SO_REUSEPORT
+// - Linux：Swow Server 内部已处理，无需手动设置
+// - Windows：不支持，Swow\Socket::setOption() 调用会抛 Error
+// 之前的 try/catch 也无法捕获 Engine 层面的 Error，因此直接省略
 
 // TLS（可选）
 if (defined('TLS_CERT') && defined('TLS_KEY') && file_exists(TLS_CERT)) {
@@ -59,15 +56,34 @@ if (defined('TLS_CERT') && defined('TLS_KEY') && file_exists(TLS_CERT)) {
     fwrite(STDOUT, "[EdgeAuth] TLS enabled\n");
 }
 
-// ✅ 正确：第三个参数只接受 int flags
+// 第三个参数只接受 int flags
 $server->bind('0.0.0.0', AUTH_PORT, Server::BIND_FLAG_NONE)->listen();
 
 fwrite(STDOUT, "[EdgeAuth] Listening on 0.0.0.0:" . AUTH_PORT . PHP_EOL);
 fwrite(STDOUT, "[EdgeAuth] Redis: " . ($redisOk ? 'OK' : 'DEGRADED') . PHP_EOL);
 
-// ---------- 优雅退出 ----------
+// ---------- 优雅退出（跨平台安全版） ----------
+// Windows：Swow\Signal 构造抛异常（安全限制）、pcntl 无效 → 降级为 none，Ctrl+C 停止
+// Linux：Swow\Signal 生效；不可用时回退 pcntl
 $running = true;
-if (function_exists('pcntl_signal')) {
+$signalMode = 'none';
+
+if (class_exists('Swow\Signal')) {
+    try {
+        $sigMask = \Swow\Signal::TERM | \Swow\Signal::INT;
+        $signal  = new \Swow\Signal($sigMask);
+        \Swow\Coroutine::run(static function () use ($signal, &$running): void {
+            $signal->wait();
+            fwrite(STDOUT, "[EdgeAuth] received SIGTERM/SIGINT, shutting down\n");
+            $running = false;
+        });
+        $signalMode = 'swow';
+    } catch (\Throwable $e) {
+        fwrite(STDERR, "[EdgeAuth] Swow\Signal unavailable ({$e->getMessage()}), falling back\n");
+    }
+}
+
+if ($signalMode === 'none' && function_exists('pcntl_signal')) {
     pcntl_async_signals(true);
     pcntl_signal(SIGTERM, function () use (&$running) {
         fwrite(STDOUT, "[EdgeAuth] SIGTERM\n");
@@ -77,8 +93,14 @@ if (function_exists('pcntl_signal')) {
         fwrite(STDOUT, "[EdgeAuth] SIGINT\n");
         $running = false;
     });
+    $signalMode = 'pcntl';
 }
 
+if ($signalMode === 'none') {
+    fwrite(STDOUT, "[EdgeAuth] no signal handler (Windows dev mode), use Ctrl+C to stop\n");
+}
+
+// ---------- 主循环 ----------
 while ($running) {
     try {
         $conn = $server->acceptConnection();

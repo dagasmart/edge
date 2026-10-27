@@ -4,6 +4,9 @@ declare(strict_types=1);
 use Swow\Psr7\Server\ServerConnection;
 use Swow\Psr7\Message\ServerRequest;
 
+// ✅ 缓存有效标记常量，替代硬编码 '1'
+const AUTH_CACHE_VALID = '1';
+
 function handleAuth(ServerConnection $conn, ServerRequest $req): void
 {
     metricsInc('auth_total');
@@ -42,7 +45,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         $cacheKey = "auth:hmac:{$clientId}:{$username}";
         $cached   = redisGet($cacheKey);
 
-        if ($cached === '1') {
+        if ($cached === AUTH_CACHE_VALID) {
             if (redisExists("device:revoke:{$clientId}")) {
                 redisDel($cacheKey);
                 $conn->respond('', 401);
@@ -59,7 +62,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         $ok = hmacAuthenticate($clientId, $username, $password);
 
         if ($ok) {
-            redisSetex($cacheKey, CACHE_TTL, '1');
+            redisSetex($cacheKey, CACHE_TTL, AUTH_CACHE_VALID);
             resetRate("rate:ip:{$ip}");
             $conn->respond('', 200);
             metricsInc('auth_ok');
