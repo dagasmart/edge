@@ -1,10 +1,14 @@
 <?php
+
 declare(strict_types=1);
 
 use Swow\Channel;
 use Swow\Coroutine;
 
-// ✅ 本地缓存空值标记常量
+if (!defined('LOCAL_CACHE_TTL')) {
+    define('LOCAL_CACHE_TTL', 60);
+}
+
 const LOCAL_CACHE_NULL_MARKER = '__NULL__';
 
 function hmacAuthenticate(string $clientId, string $username, string $password): bool
@@ -15,31 +19,33 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
     }
 
     [$b64Sign, $timestamp, $nonce] = array_map('trim', $parts);
-    $sign = base64_decode($b64Sign, true);
+
+    // ✅ P0 修复：URL-safe base64 反向替换（-_~ → +/=）
+    $sign = base64_decode(strtr($b64Sign, '-_~', '+/='), true);
     if ($sign === false || !ctype_digit($timestamp)) {
         return false;
     }
 
     $drift = defined('TIME_DRIFT') ? TIME_DRIFT : 120;
-    if (abs((int)$timestamp - time()) > $drift) {
+    if (abs((int) $timestamp - time()) > $drift) {
         return false;
     }
 
     $payload = $clientId . '|' . $username . '|' . $timestamp . '|' . $nonce;
 
     // ---------- secret 获取 + 空值缓存 ----------
-    $cacheKey = "secret:{$clientId}:{$username}";
+    $cacheKey = 'secret:' . $clientId . ':' . $username;
     $secret = localCacheGet($cacheKey);
 
     if ($secret === null) {
-        $secret = redisGet("device:secret:{$clientId}:{$username}");
+        $secret = redisGet('device:secret:' . $clientId . ':' . $username);
         if (!is_string($secret) || $secret === '') {
-            $secret = redisGet("device:secret:old:{$clientId}:{$username}");
+            $secret = redisGet('device:secret:old:' . $clientId . ':' . $username);
         }
         if (is_string($secret) && $secret !== '') {
             localCacheSet($cacheKey, $secret, LOCAL_CACHE_TTL);
         } else {
-            localCacheSet($cacheKey, LOCAL_CACHE_NULL_MARKER, 30); // 空缓存防穿透
+            localCacheSet($cacheKey, LOCAL_CACHE_NULL_MARKER, 30);
         }
     } elseif ($secret === LOCAL_CACHE_NULL_MARKER) {
         return false;
@@ -49,63 +55,55 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
         return false;
     }
 
-    // ---------- HMAC 校验 ----------
+    // ---------- HMAC 校验（时序安全） ----------
     $expect = hash_hmac('sha256', $payload, $secret, true);
     if (!hash_equals($expect, $sign)) {
         return false;
     }
 
-    // ---------- 并发吊销 + nonce（修复版）----------
-    // ✅ Channel 容量设为 2，子协程 push 不会因满而阻塞抛异常
-    $ch = new Channel(2);
-    $results = ['r' => false, 'n' => false];
+    // ---------- 并发吊销 + nonce 防重放 ----------
+    $chR = new Channel(1);
+    $chN = new Channel(1);
 
-    Coroutine::run(function () use ($clientId, $ch, &$results): void {
+    Coroutine::run(static function () use ($clientId, $chR): void {
         try {
-            $results['r'] = (bool) redisExists("device:revoke:{$clientId}");
-        } catch (\Throwable) {
-            $results['r'] = false;
-        } finally {
-            // ✅ 确保必 push，主协程不会死等
-            try { $ch->push('r'); } catch (\Throwable) {}
+            $r = (bool) redisExists('device:revoke:' . $clientId);
+            $chR->push($r, 2.0);
+        } catch (Throwable) {
+            $chR->push(false, 2.0);
         }
     });
 
-    Coroutine::run(function () use ($clientId, $username, $nonce, $ch, &$results): void {
+    Coroutine::run(static function () use ($clientId, $username, $nonce, $chN): void {
         try {
-            $nk = "device:nonce:{$clientId}:{$username}";
+            $nk = 'device:nonce:' . $clientId . ':' . $username;
             $existing = redisGet($nk);
             if ($existing === $nonce) {
-                $results['n'] = true; // 同 nonce 在有效期内放行
+                $chN->push(true, 2.0);
             } else {
-                $results['n'] = redisSetNxEx($nk, $nonce, 120);
+                // ✅ P1 修复：nonce TTL 覆盖完整时间窗口
+                $nonceTtl = defined('TIME_DRIFT') ? TIME_DRIFT * 2 : 300;
+                $chN->push(redisSetNxEx($nk, $nonce, $nonceTtl), 2.0);
             }
-        } catch (\Throwable) {
-            $results['n'] = false;
-        } finally {
-            // ✅ 确保必 push，主协程不会死等
-            try { $ch->push('n'); } catch (\Throwable) {}
+        } catch (Throwable) {
+            $chN->push(false, 2.0);
         }
     });
 
-    // 等待两个协程完成，最多等 2 秒
-    $done = 0;
-    while ($done < 2) {
-        try {
-            $ch->pop(2.0);
-            $done++;
-        } catch (\Throwable) {
-            break; // 超时或异常
-        }
-    }
-
-    // ✅ 只有两个都返回才信任结果；不完整则降级拒绝，避免基于脏状态误判
-    if ($done < 2) {
-        fwrite(STDERR, "[hmac] sub-coroutine incomplete ({$done}/2)\n");
+    try {
+        $r = $chR->pop(2.0);
+        $n = $chN->pop(2.0);
+    } catch (Throwable) {
+        fwrite(STDERR, '[hmac] sub-coroutine incomplete' . PHP_EOL);
         return false;
     }
 
-    if ($results['r'] || !$results['n']) {
+    if ($r === null || $n === null) {
+        fwrite(STDERR, '[hmac] sub-coroutine timeout' . PHP_EOL);
+        return false;
+    }
+
+    if ($r || !$n) {
         return false;
     }
 

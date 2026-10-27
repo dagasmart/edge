@@ -1,10 +1,10 @@
 <?php
+
 declare(strict_types=1);
 
 use Swow\Psr7\Server\ServerConnection;
 use Swow\Psr7\Message\ServerRequest;
 
-// ✅ 缓存有效标记常量，替代硬编码 '1'
 const AUTH_CACHE_VALID = '1';
 
 function handleAuth(ServerConnection $conn, ServerRequest $req): void
@@ -17,11 +17,33 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     }
 
     try {
-        $body     = $req->getParsedBody();
-        $clientId = (string)($body['clientid'] ?? '');
-        $username = (string)($body['username'] ?? '');
-        $password = (string)($body['password'] ?? '');
-        $ip       = (string)($body['ipaddr'] ?? '');
+        // ✅ P0 修复：手动解析 application/x-www-form-urlencoded
+        $rawBody = (string) $req->getBody()->getContents();
+        parse_str($rawBody, $body);
+
+        $clientId = (string) ($body['clientid'] ?? '');
+        $username = (string) ($body['username'] ?? '');
+        $password = (string) ($body['password'] ?? '');
+
+        // ✅ P2 修复：IP 优先从真实连接 / Header 取，body 作为覆盖
+        $ip = $req->getHeaderLine('X-Forwarded-For');
+        if ($ip === '') {
+            $ip = $req->getHeaderLine('X-Real-IP');
+        }
+        if ($ip === '') {
+            try {
+                $ip = (string) $conn->getRemoteAddress();
+            } catch (Throwable) {
+                $ip = '';
+            }
+        }
+        $bodyIp = (string) ($body['ipaddr'] ?? '');
+        if ($bodyIp !== '') {
+            $ip = $bodyIp;
+        }
+        if ($ip === '') {
+            $ip = 'unknown';
+        }
 
         if ($clientId === '' || $username === '' || $password === '') {
             $conn->respond('', 401);
@@ -35,18 +57,22 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             return;
         }
 
-        if (rateLimited("rate:ip:{$ip}")) {
+        if (rateLimited('rate:ip:' . $ip)) {
             $conn->respond('', 429);
             metricsInc('auth_fail');
             return;
         }
 
-        // 缓存命中
-        $cacheKey = "auth:hmac:{$clientId}:{$username}";
-        $cached   = redisGet($cacheKey);
+        // ✅ P1 修复：缓存 key 包含 nonce，防重放绕过
+        $passParts = explode('|', $password, 3);
+        $nonce = $passParts[2] ?? '';
+        $cacheKey = 'auth:hmac:' . $clientId . ':' . $username . ':' . $nonce;
+
+        $cached = redisGet($cacheKey);
 
         if ($cached === AUTH_CACHE_VALID) {
-            if (redisExists("device:revoke:{$clientId}")) {
+            // 缓存命中仍然检查吊销
+            if (redisExists('device:revoke:' . $clientId)) {
                 redisDel($cacheKey);
                 $conn->respond('', 401);
                 metricsInc('auth_fail');
@@ -63,12 +89,11 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
         if ($ok) {
             redisSetex($cacheKey, CACHE_TTL, AUTH_CACHE_VALID);
-            resetRate("rate:ip:{$ip}");
+            // ✅ P3 修复：不重置限流，成功也计入窗口
             $conn->respond('', 200);
             metricsInc('auth_ok');
         } else {
             recordClientFail($clientId);
-            hitRate("rate:ip:{$ip}");
             $conn->respond('', 401);
             metricsInc('auth_fail');
         }
