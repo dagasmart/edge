@@ -3,6 +3,8 @@ bash
 # 1. 生成请求体
 php extensions/edge/test/bench_gen.php 200000 /tmp/bench_bodies.txt
 
+# 1.1 数据指标
+watch -n 1 'curl -s http://127.0.0.1:9503/health'
 
 # 2. 先跑一次小流量预热
 wrk -t2 -c50 -d5s --script=extensions/edge/test/bench_wrk.lua http://127.0.0.1:9503/mqtt/auth
