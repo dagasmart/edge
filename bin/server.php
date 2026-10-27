@@ -17,15 +17,32 @@ if (!defined('RATE_MAX'))        define('RATE_MAX',       10);
 if (!defined('TIME_DRIFT'))      define('TIME_DRIFT',     300);
 if (!defined('LOCAL_CACHE_TTL')) define('LOCAL_CACHE_TTL', 60);
 
+// ---------- 全局致命错误兜底 ----------
+register_shutdown_function(function () {
+    $e = error_get_last();
+    if ($e && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+        fwrite(STDERR, sprintf(
+            "[shutdown] %s in %s:%d\n",
+            $e['message'], $e['file'], $e['line']
+        ));
+    }
+});
+
+set_exception_handler(function (\Throwable $e) {
+    fwrite(STDERR, sprintf(
+        "[uncaught] %s in %s:%d\n",
+        $e->getMessage(), $e->getFile(), $e->getLine()
+    ));
+});
+
 // ---------- 加载业务文件 ----------
 require_once __DIR__ . '/helper.php';
 require_once __DIR__ . '/hmac.php';
 require_once __DIR__ . '/auth.php';
 
 // ---------- 初始化 ----------
-// ---------- 初始化 ----------
-redisPoolInit();      // ← 改这里
-localCacheInit();    // ← 改这里
+redisPoolInit();
+localCacheInit();
 
 // ---------- 启动 HTTP 服务 ----------
 $server = new Server();
@@ -34,7 +51,7 @@ $server->bind('0.0.0.0', AUTH_PORT)->listen();
 fwrite(STDOUT, "[EdgeAuth] Listening on 0.0.0.0:" . AUTH_PORT . PHP_EOL);
 fwrite(STDOUT, "[EdgeAuth] Redis pool=" . REDIS_POOL_SIZE . " db=" . REDIS_DB . PHP_EOL);
 
-// 优雅退出
+// ---------- 优雅退出 ----------
 $running = true;
 if (function_exists('pcntl_signal')) {
     pcntl_async_signals(true);
@@ -85,10 +102,10 @@ while ($running) {
                     }
                 } catch (\Throwable $e) {
                     fwrite(STDERR, sprintf(
-                        "[%s] %s in %s:%d\n",
-                        $path, $e->getMessage(), $e->getFile(), $e->getLine()
+                        "[handler] %s in %s:%d\n",
+                        $e->getMessage(), $e->getFile(), $e->getLine()
                     ));
-                    $conn->respond('', 401);
+                    try { $conn->respond('', 401); } catch (\Throwable) {}
                 }
 
                 if (!$conn->shouldKeepAlive()) {
@@ -96,7 +113,7 @@ while ($running) {
                 }
             }
         } catch (\Throwable $e) {
-            fwrite(STDERR, "[conn] " . $e->getMessage() . "\n");
+            fwrite(STDERR, "[conn-fatal] " . $e->getMessage() . "\n");
         } finally {
             try { $conn->close(); } catch (\Throwable) {}
         }

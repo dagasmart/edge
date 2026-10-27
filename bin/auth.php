@@ -16,18 +16,30 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         return;
     }
 
+    // ---------- IP 限流 ----------
     if (rateLimited($ip)) {
         $conn->respond('', 429);
         return;
     }
 
-    // 认证结果缓存
+    // ---------- 认证结果缓存（带吊销穿透） ----------
     $cacheKey = "auth:hmac:{$clientId}";
-    if (redisGet($cacheKey) === '1') {
+    $cached   = redisGet($cacheKey);
+
+    if ($cached === '1') {
+        // 穿透检查吊销：吊销优先于缓存
+        if (redisExists("device:revoke:{$clientId}")) {
+            redisDel($cacheKey);
+            fwrite(STDERR, "[auth] cache bypass: revoked {$clientId}\n");
+            $conn->respond('', 401);
+            return;
+        }
+        // 未吊销，直接放行
         $conn->respond('', 200);
         return;
     }
 
+    // ---------- 走完整 HMAC 校验 ----------
     $ok = hmacAuthenticate($clientId, $password);
 
     if ($ok) {

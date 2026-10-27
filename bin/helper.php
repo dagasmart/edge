@@ -26,16 +26,19 @@ function redisPoolInit(int $size = 16, int $db = 2): void
     $redisPoolSize = $size;
     $redisDb = $db;
 
-    // 从 server.php 定义的常量取密码
+    // 从 server.php 定义的常量取
     if (defined('REDIS_PASSWORD')) {
         $redisPassword = REDIS_PASSWORD;
     }
+
+    $host = defined('REDIS_HOST') ? REDIS_HOST : '127.0.0.1';
+    $port = defined('REDIS_PORT') ? (int)REDIS_PORT : 6379;
 
     $ok = 0;
     for ($i = 0; $i < $size; $i++) {
         $redis = new \Redis();
         try {
-            $redis->connect('127.0.0.1', 6379, 2.0);
+            $redis->connect($host, $port, 2.0);
             if ($redisPassword !== '') {
                 $redis->auth($redisPassword);
             }
@@ -44,13 +47,14 @@ function redisPoolInit(int $size = 16, int $db = 2): void
             }
             $redisPool->enqueue($redis);
             $ok++;
+            fwrite(STDOUT, "[redis] connected ({$ok}/{$size})\n");
         } catch (\Throwable $e) {
             fwrite(STDERR, "[redis] init failed: " . $e->getMessage() . "\n");
         }
     }
 
     fwrite(STDERR, "[EdgeAuth] Redis pool initialized: {$ok}/{$size}\n");
-    fwrite(STDERR, "[EdgeAuth] Redis pool={$size} db={$redisDb}\n");
+    fwrite(STDERR, "[EdgeAuth] Redis pool={$size} db={$redisDb} host={$host} port={$port}\n");
 }
 
 function redisPoolPop(float $timeout = 3.0): ?\Redis
@@ -86,13 +90,16 @@ function redisPoolPush(\Redis $conn): void
         return;
     }
 
+    $host = defined('REDIS_HOST') ? REDIS_HOST : '127.0.0.1';
+    $port = defined('REDIS_PORT') ? (int)REDIS_PORT : 6379;
+
     try {
         $conn->ping();
         $redisPool->enqueue($conn);
     } catch (\Throwable $e) {
         try {
             $new = new \Redis();
-            $new->connect('127.0.0.1', 6379, 2.0);
+            $new->connect($host, $port, 2.0);
             if ($redisPassword !== '') {
                 $new->auth($redisPassword);
             }
