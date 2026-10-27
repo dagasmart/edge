@@ -10,7 +10,7 @@ if (!defined('REDIS_HOST'))      define('REDIS_HOST',     '127.0.0.1');
 if (!defined('REDIS_PORT'))      define('REDIS_PORT',     16379);
 if (!defined('REDIS_PASSWORD'))  define('REDIS_PASSWORD', 'uApDVQD7');
 if (!defined('REDIS_DB'))        define('REDIS_DB',       2);
-if (!defined('REDIS_POOL_SIZE')) define('REDIS_POOL_SIZE', 16);
+if (!defined('REDIS_POOL_SIZE')) define('REDIS_POOL_SIZE', 64);
 if (!defined('CACHE_TTL'))       define('CACHE_TTL',      300);
 if (!defined('RATE_TTL'))        define('RATE_TTL',       60);
 if (!defined('RATE_MAX'))        define('RATE_MAX',       10);
