@@ -1,26 +1,34 @@
 <?php
+
 declare(strict_types=1);
+
 namespace DagaSmart\Edge;
 
-use Exception;
+use DagaSmart\BizAdmin\Extend\ServiceProvider;
 use DagaSmart\BizAdmin\Renderers\Form;
 use DagaSmart\BizAdmin\Renderers\TextControl;
-use DagaSmart\BizAdmin\Extend\ServiceProvider;
+use DagaSmart\Edge\Services\EdgeAclEngineService;
+use DagaSmart\Edge\Services\EdgeAuthSignerService;
+use Exception;
 use Illuminate\Console\Command;
 use ReflectionClass;
 
-
 class EdgeServiceProvider extends ServiceProvider
 {
-	protected $menu = [];
+    protected $menu = [];
 
     /**
-     * @return void
      * @throws Exception
      */
     public function register(): void
     {
         parent::register();
+
+        /** ✅ 批量注册配置文件 */
+        $this->registerConfigs([
+            'services.stock' => 'stock.php',
+            'services.finance' => 'finance.php',
+        ]);
 
         /**✅ 加载路由*/
         parent::registerRoutes(__DIR__.'/Http/routes.php');
@@ -33,6 +41,26 @@ class EdgeServiceProvider extends ServiceProvider
         /** ✅ 命令在 register 阶段就注册（Artisan 需要） */
         if ($this->app->runningInConsole()) {
             $this->commands($this->discoverCommands());
+        }
+        //网关签名验签服务
+        $this->app->singleton(EdgeAuthSignerService::class, function () {
+            return new EdgeAuthSignerService();
+        });
+        // 网关规则服务
+        $this->app->singleton(EdgeAclEngineService::class, function () {
+            return new EdgeAclEngineService();
+        });
+
+    }
+
+    /** 批量注册配置文件 */
+    protected function registerConfigs(array $maps): void
+    {
+        foreach ($maps as $key => $file) {
+            $path = __DIR__."/../config/{$file}";
+            if (file_exists($path)) {
+                $this->mergeConfigFrom($path, $key);
+            }
         }
     }
 
@@ -69,11 +97,10 @@ class EdgeServiceProvider extends ServiceProvider
         return $commands;
     }
 
-
     public function settingForm(): ?Form
-	{
-	    return $this->baseSettingForm()->body([
+    {
+        return $this->baseSettingForm()->body([
             TextControl::make()->name('value')->label('Value')->required(),
-	    ]);
-	}
+        ]);
+    }
 }
