@@ -1,71 +1,72 @@
-#!/bin/bash
-# EdgeAuth Swow 集群停止脚本
-# 用法: bash extensions/edge/bin/stop-cluster.sh [实例数，默认4]
+#!/usr/bin/env bash
+# EdgeAuth 集群停止（artisan 方式）
+set -Eeuo pipefail
 
-INSTANCE_COUNT=${1:-4}
+APP_NAME="edge-auth"
+PID_DIR="/var/run/${APP_NAME}"
 BASE_PORT=9503
+INSTANCE_COUNT=${1:-4}
 
 echo "========================================"
-echo " EdgeAuth Swow Cluster — 停止"
-echo " 实例数: ${INSTANCE_COUNT}"
-echo " 端口范围: ${BASE_PORT} ~ $((BASE_PORT + INSTANCE_COUNT - 1))"
+echo " EdgeAuth — 停止"
 echo "========================================"
 
-# 先尝试优雅停止（SIGTERM）
-for port in $(seq $BASE_PORT $((BASE_PORT + INSTANCE_COUNT - 1))); do
-    PID=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -oP 'pid=\K[0-9]+' | head -1)
-    if [ -n "$PID" ]; then
-        echo "端口 ${port} → PID ${PID} → 发送 SIGTERM"
-        kill -15 $PID 2>/dev/null
+for i in $(seq 0 $((INSTANCE_COUNT-1))); do
+    port=$((BASE_PORT+i))
+    pf="${PID_DIR}/${APP_NAME}.${port}.pid"
+
+    if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
+        pid=$(cat "$pf")
+        echo "  :${port} → PID ${pid} → SIGTERM"
+        kill -TERM "$pid" 2>/dev/null || true
     else
-        echo "端口 ${port} → 没有进程在监听"
-        # 兜底：fuser 强杀
-        fuser -k ${port}/tcp 2>/dev/null
+        # 兜底：从端口找
+        pid=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -oP 'pid=\K[0-9]+' | head -1)
+        if [[ -n "$pid" ]]; then
+            echo "  :${port} → PID ${pid} (无pid文件) → SIGTERM"
+            kill -TERM "$pid" 2>/dev/null || true
+        else
+            echo "  :${port} → 未运行"
+            fuser -k "${port}/tcp" 2>/dev/null || true
+        fi
     fi
 done
 
-# 等待最多 10 秒让进程自己退出
-echo "等待进程退出..."
-for i in $(seq 1 10); do
-    REMAINING=0
-    for port in $(seq $BASE_PORT $((BASE_PORT + INSTANCE_COUNT - 1))); do
-        if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
-            REMAINING=$((REMAINING + 1))
-        fi
+# 等待退出
+echo "等待进程退出…"
+for w in $(seq 1 10); do
+    remaining=0
+    for i in $(seq 0 $((INSTANCE_COUNT-1))); do
+        port=$((BASE_PORT+i))
+        pf="${PID_DIR}/${APP_NAME}.${port}.pid"
+        [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null && remaining=$((remaining+1))
     done
-    if [ $REMAINING -eq 0 ]; then
-        echo "✅ 所有实例已停止"
-        break
-    fi
-    echo "  还有 ${REMAINING} 个实例在退出中... (${i}/10)"
+    [[ $remaining -eq 0 ]] && { echo "✅ 全部停止"; break; }
+    echo "  ${remaining} 个仍在退出… (${w}/10)"
     sleep 1
 done
 
-# 10 秒后还没退出，强制 SIGKILL
-REMAINING=0
-for port in $(seq $BASE_PORT $((BASE_PORT + INSTANCE_COUNT - 1))); do
-    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
-        REMAINING=$((REMAINING + 1))
-        PID=$(ss -tlnp 2>/dev/null | grep ":${port} " | grep -oP 'pid=\K[0-9]+' | head -1)
-        if [ -n "$PID" ]; then
-            echo "⚠️ 端口 ${port} (PID ${PID}) 超时未退出 → SIGKILL"
-            kill -9 $PID 2>/dev/null
-        fi
-        fuser -k -9 ${port}/tcp 2>/dev/null
+# SIGKILL 兜底
+for i in $(seq 0 $((INSTANCE_COUNT-1))); do
+    port=$((BASE_PORT+i))
+    pf="${PID_DIR}/${APP_NAME}.${port}.pid"
+    if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
+        pid=$(cat "$pf")
+        echo "  ⚠️ :${port} → SIGKILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        fuser -k -9 "${port}/tcp" 2>/dev/null || true
     fi
+    rm -f "$pf"
 done
 
-if [ $REMAINING -eq 0 ]; then
-    echo "✅ 集群已完全停止"
-else
-    echo "❌ 仍有实例未停止，请手动检查"
-fi
-
-# 清理可能残留的 PHP 进程
+# 清理孤儿 artisan 进程
 ORPHAN=$(ps aux | grep 'edge:auth-swow' | grep -v grep | awk '{print $2}')
-if [ -n "$ORPHAN" ]; then
-    echo "清理残留进程: $ORPHAN"
-    echo "$ORPHAN" | xargs kill -9 2>/dev/null
+if [[ -n "$ORPHAN" ]]; then
+    echo "清理孤儿 artisan 进程…"
+    echo "$ORPHAN" | xargs kill -TERM 2>/dev/null || true
+    sleep 1
+    ORPHAN=$(ps aux | grep 'edge:auth-swow' | grep -v grep | awk '{print $2}')
+    [[ -n "$ORPHAN" ]] && echo "$ORPHAN" | xargs kill -9 2>/dev/null || true
 fi
 
-echo "完成。"
+echo "✅ 集群已停止"

@@ -1,54 +1,61 @@
-#!/bin/bash
-# EdgeAuth Swow 多实例集群启动脚本
-# 用法: bash extensions/edge/bin/start-cluster.sh [实例数，默认4]
+#!/usr/bin/env bash
+# EdgeAuth 集群启动（artisan 方式）
+set -Eeuo pipefail
 
-INSTANCE_COUNT=${1:-4}
+PHP_BIN="/xp/server/php/php-8.4/bin/php"
+BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+APP_NAME="edge-auth"
+LOG_DIR="/var/log/${APP_NAME}"
+PID_DIR="/var/run/${APP_NAME}"
 BASE_PORT=9503
-PHP_BIN=$(which php)
-ARTISAN="php artisan edge:auth-swow"
+POOL_SIZE=256
+INSTANCE_COUNT=${1:-4}
 
 echo "========================================"
-echo " EdgeAuth Swow Cluster"
-echo " 实例数: ${INSTANCE_COUNT}"
-echo " 端口范围: ${BASE_PORT} ~ $((BASE_PORT + INSTANCE_COUNT - 1))"
+echo " EdgeAuth — 启动 (artisan 模式)"
+echo " 实例: ${INSTANCE_COUNT}, 端口: ${BASE_PORT}~$((BASE_PORT+INSTANCE_COUNT-1))"
 echo "========================================"
 
-# 停掉旧进程
-echo "停止旧实例..."
-for port in $(seq $BASE_PORT $((BASE_PORT + INSTANCE_COUNT - 1))); do
-    fuser -k ${port}/tcp 2>/dev/null
+mkdir -p "$LOG_DIR" "$PID_DIR"
+
+# 先停旧
+for i in $(seq 0 $((INSTANCE_COUNT-1))); do
+    port=$((BASE_PORT+i))
+    pf="${PID_DIR}/${APP_NAME}.${port}.pid"
+    if [[ -f "$pf" ]] && kill -0 "$(cat "$pf")" 2>/dev/null; then
+        kill -TERM "$(cat "$pf")" 2>/dev/null || true
+        echo "  停止旧 :${port}"
+    fi
+    fuser -k "${port}/tcp" 2>/dev/null || true
 done
 sleep 1
 
-# 启动新实例
-for i in $(seq 0 $((INSTANCE_COUNT - 1))); do
-    PORT=$((BASE_PORT + i))
-    echo "启动实例 $((i+1))/${INSTANCE_COUNT} → 端口 ${PORT}"
-
-    # 每个实例用独立的环境变量区分
-    AUTH_PORT=${PORT} \
+# 启动新
+cd "${BASE_DIR}"
+for i in $(seq 0 $((INSTANCE_COUNT-1))); do
+    port=$((BASE_PORT+i))
+    echo "  启动 :${port} …"
+    AUTH_PORT="${port}" \
     REDIS_DB=2 \
     MAX_CONCURRENCY=10000 \
-    REDIS_POOL_SIZE=256 \
-    $PHP_BIN artisan edge:auth-swow \
-        >> /var/log/edge-auth/instance-${PORT}.log 2>&1 &
+    REDIS_POOL_SIZE="${POOL_SIZE}" \
+    nohup "${PHP_BIN}" artisan edge:auth-swow \
+        >> "${LOG_DIR}/${APP_NAME}.${port}.log" \
+        2>> "${LOG_DIR}/${APP_NAME}.${port}.err" &
 
-    PID=$!
-    echo "  PID: ${PID}, 日志: /var/log/edge-auth/instance-${PORT}.log"
-    sleep 0.3  # 错开启动，避免 Redis 连接风暴
+    echo $! > "${PID_DIR}/${APP_NAME}.${port}.pid"
+    echo "    PID: $!, 日志: ${LOG_DIR}/${APP_NAME}.${port}.log"
+    sleep 0.3
 done
+cd - >/dev/null
 
-# 等一下确认端口都起来了
 sleep 2
 echo ""
-echo "端口监听状态:"
-for port in $(seq $BASE_PORT $((BASE_PORT + INSTANCE_COUNT - 1))); do
-    if ss -tlnp | grep -q ":${port} "; then
-        echo "  ✅ :${port} — LISTEN"
-    else
-        echo "  ❌ :${port} — NOT LISTENING"
-    fi
+echo "端口状态:"
+for i in $(seq 0 $((INSTANCE_COUNT-1))); do
+    port=$((BASE_PORT+i))
+    ss -tlnp 2>/dev/null | grep -q ":${port} " \
+        && echo "  ✅ :${port} LISTEN" \
+        || echo "  ❌ :${port} NOT LISTENING"
 done
-
-echo ""
-echo "集群启动完成。查看日志: tail -f /var/log/edge-auth/instance-*.log"
+echo "完成。"
