@@ -1,8 +1,7 @@
 <?php
-
+declare(strict_types=1);
 use DagaSmart\Edge\Http\Controllers;
 use DagaSmart\Edge\Http\Middleware\Middleware;
-use DagaSmart\Edge\Services\EdgeGatewayService;
 use Illuminate\Routing\Router;
 use Illuminate\Support\Facades\Route;
 use DagaSmart\BizAdmin\Middleware\Authenticate;

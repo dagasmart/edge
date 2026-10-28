@@ -10,7 +10,7 @@ use Swow\Psr7\Server\ServerConnection;
  * ========================================================= */
 
 /**
- * POST /extension/edge/gateway/auth
+ * POST /admin-api/extension/edge/gateway/auth
  */
 function handleAuth(ServerConnection $conn, ServerRequest $req): void
 {
@@ -36,9 +36,10 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
     // ---------- 参数校验 ----------
     if ($clientId === '' || $username === '' || $password === '') {
-        debugLog('MISSING_FIELDS: ct=' . $contentType . ' body_len=' . strlen($body));
+        debugLog('MISSING_FIELDS: ct='.$contentType.' body_len='.strlen($body));
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'missing_fields'], 401);
+
         return;
     }
 
@@ -46,9 +47,10 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     deviceConcurrencyCleanup();
 
     // ---------- 全局并发控制 ----------
-    if (!concurrencyAcquire()) {
+    if (! concurrencyAcquire()) {
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 503);
+
         return;
     }
 
@@ -58,32 +60,35 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         concurrencyRelease();
         metricsInc('auth_fail');
         metricsInc('device_concurrency_exceeded');
-        debugLog('DEVICE OVERLOADED: ' . $clientId . ' (max=' . MAX_CONCURRENCY_PER_DEVICE . ')');
+        debugLog('DEVICE OVERLOADED: '.$clientId.' (max='.MAX_CONCURRENCY_PER_DEVICE.')');
         respondJson($conn, [
             'result' => 'deny',
             'reason' => 'device_overloaded',
-            'detail' => 'max ' . MAX_CONCURRENCY_PER_DEVICE . ' concurrent requests per device',
+            'detail' => 'max '.MAX_CONCURRENCY_PER_DEVICE.' concurrent requests per device',
         ], 429);
+
         return;
     }
 
     // ---------- 限流 ----------
-    $rateKey = 'rate:' . $clientId;
+    $rateKey = 'rate:'.$clientId;
     if (rateLimited($rateKey)) {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 429);
+
         return;
     }
 
     // ---------- 熔断检查 ----------
     if (isClientBlocked($clientId)) {
-        debugLog('BLOCKED: ' . $clientId);
+        debugLog('BLOCKED: '.$clientId);
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'blocked'], 401);
+
         return;
     }
 
@@ -92,7 +97,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         $authenticated = hmacAuthenticate($clientId, $username, $password);
         $reason = detachAuthReason();
 
-        if (!$authenticated) {
+        if (! $authenticated) {
             $attackReasons = [
                 'signature mismatch',
             ];
@@ -101,13 +106,14 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
             if ($shouldCountFail) {
                 recordClientFail($clientId);
-                debugLog('FAIL RECORDED: ' . $clientId . ' reason=' . $reason);
+                debugLog('FAIL RECORDED: '.$clientId.' reason='.$reason);
             } else {
-                debugLog('FAIL SKIPPED: ' . $clientId . ' reason=' . $reason . ' (not counted)');
+                debugLog('FAIL SKIPPED: '.$clientId.' reason='.$reason.' (not counted)');
             }
 
             metricsInc('auth_fail');
             respondJson($conn, ['result' => 'deny'], 401);
+
             return;
         }
 
@@ -123,7 +129,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 }
 
 /**
- * POST /extension/edge/gateway/super
+ * POST /admin-api/extension/edge/gateway/super
  */
 function handleSuper(ServerConnection $conn, ServerRequest $req): void
 {
@@ -131,7 +137,7 @@ function handleSuper(ServerConnection $conn, ServerRequest $req): void
 }
 
 /**
- * POST /extension/edge/gateway/acl
+ * POST /admin-api/extension/edge/gateway/acl
  */
 function handleAcl(ServerConnection $conn, ServerRequest $req): void
 {

@@ -26,7 +26,7 @@ class EdgeServiceProvider extends ServiceProvider
         [
             'parent' => '边缘网关',
             'title' => '网关服务',
-            'url' => '/extension/edge/gateway',
+            'url' => '/admin-api/extension/edge/gateway',
             'url_type' => 1,
             'icon' => 'carbon:ibm-cloud-transit-gateway',
         ],

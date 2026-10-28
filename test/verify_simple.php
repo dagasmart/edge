@@ -12,7 +12,7 @@
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
 
-$baseUrl = $argv[1] ?? 'http://127.0.0.1:9503/extension/edge/gateway';
+$baseUrl = $argv[1] ?? 'http://127.0.0.1:9503/admin-api/extension/edge/gateway';
 
 // ---------- Redis 配置（与 seed_redis.php / server.php 一致） ----------
 const REDIS_HOST     = '127.0.0.1';

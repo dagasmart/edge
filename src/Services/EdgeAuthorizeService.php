@@ -3,7 +3,6 @@
 namespace DagaSmart\Edge\Services;
 
 use DagaSmart\Edge\Models\EdgeAuthorize;
-use DagaSmart\Edge\Models\EdgeGateway;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
 
@@ -13,7 +12,7 @@ use Illuminate\Support\Facades\Log;
  */
 class EdgeAuthorizeService extends AdminService
 {
-    protected string $modelName = EdgeGateway::class;
+    protected string $modelName = EdgeAuthorize::class;
 
     // ==================== 超级用户白名单 ====================
     protected array $superUsers = ['admin', 'gateway01', 'bench_client'];
@@ -33,18 +32,19 @@ class EdgeAuthorizeService extends AdminService
             ->where('username', $username)
             ->where('active', true);
 
-        if (!empty($service)) {
+        if (! empty($service)) {
             $query->where('service', $service);
         }
 
         $user = $query->first();
 
-        if (!$user) {
+        if (! $user) {
             Log::channel('edge')->warning('EdgeGateway auth: user not found', [
                 'username' => $username,
-                'service'  => $service,
+                'service' => $service,
                 'clientid' => $clientid,
             ]);
+
             return null;
         }
 
@@ -58,6 +58,7 @@ class EdgeAuthorizeService extends AdminService
                 'username' => $username,
                 'clientid' => $clientid,
             ]);
+
             return null;
         }
 
@@ -70,72 +71,10 @@ class EdgeAuthorizeService extends AdminService
             'username' => $username,
             'clientid' => $clientid,
         ]);
+
         return null;
     }
 
-    // ==================== 超级用户 ====================
-
-    /**
-     * 超级用户判定（NanoMQ super_req 调用）
-     */
-    public function isSuperUser(string $username, string $clientid, string $service = 'nano'): bool
-    {
-        if (in_array($username, $this->superUsers, true) || in_array($clientid, $this->superUsers, true)) {
-            return true;
-        }
-
-        $user = EdgeAuthorize::query()
-            ->where('username', $username)
-            ->where('active', true)
-            ->where('service', $service)
-            ->first();
-
-        return $user && $user->is_super;
-    }
-
-    // ==================== ACL ====================
-
-    /**
-     * ACL 鉴权（NanoMQ acl_req 调用）
-     */
-    public function checkAcl(string $clientid, string $username, string $topic, int $access, string $ipaddr): bool
-    {
-        if ($this->isSuperUser($username, $clientid, 'nano')) {
-            return true;
-        }
-
-        $prefix = $clientid;
-
-        if ($access === 2) {
-            $pattern = '#^' . preg_quote($prefix, '#') . '/up(/|$)#';
-            $allowed = (bool) preg_match($pattern, $topic);
-
-            if (!$allowed) {
-                Log::channel('edge')->info('EdgeGateway acl: publish denied', [
-                    'clientid' => $clientid,
-                    'topic'    => $topic,
-                ]);
-            }
-            return $allowed;
-        }
-
-        if ($access === 1) {
-            $pattern1 = '#^' . preg_quote($prefix, '#') . '/down(/|$)#';
-            $pattern2 = '#^' . preg_quote($prefix, '#') . '/up/response(/|$)#';
-
-            $allowed = (bool) (preg_match($pattern1, $topic) || preg_match($pattern2, $topic));
-
-            if (!$allowed) {
-                Log::channel('edge')->info('EdgeGateway acl: subscribe denied', [
-                    'clientid' => $clientid,
-                    'topic'    => $topic,
-                ]);
-            }
-            return $allowed;
-        }
-
-        return false;
-    }
 
     // ==================== 内部工具 ====================
 
@@ -145,6 +84,7 @@ class EdgeAuthorizeService extends AdminService
     protected function isHmacSignature(string $password): bool
     {
         $parts = explode('|', $password);
+
         return count($parts) === 3 && strlen($parts[0]) > 0 && is_numeric($parts[1]);
     }
 
@@ -157,22 +97,23 @@ class EdgeAuthorizeService extends AdminService
             return false;
         }
 
-        $parts     = explode('|', $password, 3);
-        $b64Sign   = $parts[0];
+        $parts = explode('|', $password, 3);
+        $b64Sign = $parts[0];
         $timestamp = $parts[1];
-        $nonce     = $parts[2];
+        $nonce = $parts[2];
 
         // 时间窗口 ±300s
         if (abs(time() - (int) $timestamp) > 300) {
             Log::channel('edge')->warning('EdgeGateway acl: timestamp expired', [
                 'timestamp' => $timestamp,
-                'now'       => time(),
+                'now' => time(),
             ]);
+
             return false;
         }
 
         $redisKey = "device:secret:{$clientid}:{$username}";
-        $secret   = null;
+        $secret = null;
 
         try {
             $redis = app('redis')->connection('edge');
@@ -185,18 +126,20 @@ class EdgeAuthorizeService extends AdminService
             Log::channel('edge')->warning('EdgeGateway acl: secret not found in Redis', [
                 'key' => $redisKey,
             ]);
+
             return false;
         }
 
-        $payload  = "{$clientid}|{$username}|{$timestamp}|{$nonce}";
-        $rawSign  = hash_hmac('sha256', $payload, $secret, true);
+        $payload = "{$clientid}|{$username}|{$timestamp}|{$nonce}";
+        $rawSign = hash_hmac('sha256', $payload, $secret, true);
         $expected = rtrim(strtr(base64_encode($rawSign), '+/', '-_'), '=');
 
-        if (!hash_equals($expected, $b64Sign)) {
+        if (! hash_equals($expected, $b64Sign)) {
             Log::channel('edge')->warning('EdgeGateway acl: signature mismatch', [
                 'clientid' => $clientid,
                 'username' => $username,
             ]);
+
             return false;
         }
 
@@ -209,15 +152,17 @@ class EdgeAuthorizeService extends AdminService
     protected function getSecretFromNativeRedis(string $clientid, string $username): ?string
     {
         try {
-            $redis = new \Redis();
+            $redis = new \Redis;
             $redis->connect('127.0.0.1', 16379, 2);
             $redis->auth('uApDVQD7');
             $redis->select(2);
+
             return $redis->get("device:secret:{$clientid}:{$username}") ?: null;
         } catch (\Exception $e) {
             Log::channel('edge')->error('EdgeGateway: native redis failed', [
                 'error' => $e->getMessage(),
             ]);
+
             return null;
         }
     }
@@ -233,20 +178,21 @@ class EdgeAuthorizeService extends AdminService
             return;
         }
 
-        $key   = "device:secret:{$device->client_id}:{$device->username}";
-        $redis = new \Redis();
+        $key = "device:secret:{$device->client_id}:{$device->username}";
+        $redis = new \Redis;
 
         try {
             $redis->connect('127.0.0.1', 16379, 2);
             $redis->auth('uApDVQD7');
             $redis->select(2);
 
-            if (!$device->active) {
+            if (! $device->active) {
                 $redis->del($key);
                 Log::channel('edge')->info('EdgeAuth Redis: key removed (inactive)', [
-                    'key'     => $key,
+                    'key' => $key,
                     'service' => $device->service,
                 ]);
+
                 return;
             }
 
@@ -256,22 +202,26 @@ class EdgeAuthorizeService extends AdminService
                 Log::channel('edge')->warning('EdgeAuth Redis: secret not found, key removed', [
                     'key' => $key,
                 ]);
+
                 return;
             }
 
             $redis->set($key, $secret);
             Log::channel('edge')->info('EdgeAuth Redis: key synced', [
-                'key'     => $key,
+                'key' => $key,
                 'service' => $device->service,
-                'len'     => strlen($secret),
+                'len' => strlen($secret),
             ]);
         } catch (\Exception $e) {
             Log::channel('edge')->error('EdgeAuth Redis: sync failed', [
                 'error' => $e->getMessage(),
-                'key'   => $key,
+                'key' => $key,
             ]);
         } finally {
-            try { $redis->close(); } catch (\Exception $e) {}
+            try {
+                $redis->close();
+            } catch (\Exception $e) {
+            }
         }
     }
 
@@ -284,8 +234,8 @@ class EdgeAuthorizeService extends AdminService
             return;
         }
 
-        $key   = "device:secret:{$device->client_id}:{$device->username}";
-        $redis = new \Redis();
+        $key = "device:secret:{$device->client_id}:{$device->username}";
+        $redis = new \Redis;
 
         try {
             $redis->connect('127.0.0.1', 16379, 2);
@@ -293,16 +243,19 @@ class EdgeAuthorizeService extends AdminService
             $redis->select(2);
             $redis->del($key);
             Log::channel('edge')->info('EdgeAuth Redis: key removed (deleted)', [
-                'key'     => $key,
+                'key' => $key,
                 'service' => $device->service,
             ]);
         } catch (\Exception $e) {
             Log::channel('edge')->error('EdgeAuth Redis: remove failed', [
                 'error' => $e->getMessage(),
-                'key'   => $key,
+                'key' => $key,
             ]);
         } finally {
-            try { $redis->close(); } catch (\Exception $e) {}
+            try {
+                $redis->close();
+            } catch (\Exception $e) {
+            }
         }
     }
 
@@ -314,18 +267,16 @@ class EdgeAuthorizeService extends AdminService
      */
     protected function getSecretForDevice(EdgeAuthorize $device): ?string
     {
-        if (!empty($device->secret)) {
+        if (! empty($device->secret)) {
             return $device->secret;
         }
 
         Log::channel('edge')->warning('EdgeAuth: device has no secret in DB', [
             'client_id' => $device->client_id,
-            'username'  => $device->username,
-            'id'        => $device->id ?? null,
+            'username' => $device->username,
+            'id' => $device->id ?? null,
         ]);
 
         return null;
     }
-
-
 }

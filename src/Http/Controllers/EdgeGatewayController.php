@@ -1,12 +1,9 @@
 <?php
-
+declare(strict_types=1);
 namespace DagaSmart\Edge\Http\Controllers;
 
-use DagaSmart\BizAdmin\Renderers\Json;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Hash;
 use DagaSmart\Edge\Services\EdgeGatewayService;
+use Illuminate\Http\Request;
 
 class EdgeGatewayController extends AdminController
 {
@@ -16,18 +13,18 @@ class EdgeGatewayController extends AdminController
      * 边缘网关 客户端认证
      * ✅ NanoMQ 主认证已切到 EdgeAuth Swow (:9503)
      * 以下方法仅用于后台管理/手动测试/降级备用
-     * POST /extension/edge/gateway/auth
+     * POST /admin-api/extension/edge/gateway/auth
      */
     public function auth(Request $request)
     {
         $username = $request->input('username');
         $password = $request->input('password');
         $clientid = $request->input('clientid', '');
-        $ipaddr   = $request->input('ipaddr', $request->ip());
-        $service   = $request->input('service', 'nano');
+        $ipaddr = $request->input('ipaddr', $request->ip());
+        $service = $request->input('service', 'nano');
 
         if (empty($clientid)) {
-            return response()->json(['result' => 'deley'], 300);
+            return response()->json(['result' => 'deley'], 400);
         }
 
         $user = $this->service->auth($username, $password, $clientid, $ipaddr, $service);
@@ -41,7 +38,7 @@ class EdgeGatewayController extends AdminController
 
     /**
      * NanoMQ 超级用户判定
-     * POST /extension/edge/gateway/super
+     * POST /admin-api/extension/edge/gateway/super
      */
     public function super(Request $request)
     {
@@ -58,6 +55,7 @@ class EdgeGatewayController extends AdminController
         if ($isSuper) {
             return response()->json(['result' => 'allow'], 200);
         }
+
         // 已对齐 EdgeAuth handleSuper 逻辑
         // 返回 deny（superuser 由 EdgeAuth 的 ACL 规则覆盖）
         return response()->json(['result' => 'deley'], 300);
@@ -65,16 +63,16 @@ class EdgeGatewayController extends AdminController
 
     /**
      * NanoMQ ACL 鉴权
-     * POST /extension/edge/gateway/acl
+     * POST /admin-api/extension/edge/gateway/acl
      */
     public function acl(Request $request)
     {
         // 已对齐 EdgeAuth handleAcl 逻辑
         $clientid = $request->input('clientid', '');
         $username = $request->input('username', '');
-        $topic    = $request->input('topic', '');
-        $access   = (int) $request->input('access', 0); // 1=sub, 2=pub
-        $ipaddr   = $request->input('ipaddr', $request->ip());
+        $topic = $request->input('topic', '');
+        $access = (int) $request->input('access', 0); // 1=sub, 2=pub
+        $ipaddr = $request->input('ipaddr', $request->ip());
 
         // 空字段拒绝
         if ($clientid === '' || $username === '' || $topic === '') {
