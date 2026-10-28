@@ -9,6 +9,8 @@
  *   php seed_redis.php --force                # 强制覆盖已存在的密钥
  *   php seed_redis.php --host 127.0.0.1 --port 16379 --db 2 --password xxx
  *
+ * Redis key 格式：device:secret:{clientid}:{username}   ← 冒号，不替换
+ *
  * 退出码：
  *   0 = 全部成功
  *   1 = 参数错误 / 连接失败
@@ -81,17 +83,17 @@ HELP;
     exit(0);
 }
 
-// ===================== 读取 secret.php =====================
+// ===================== 读取 secrets.php（统一文件名，复数） =====================
 
-$secretFile = dirname(__DIR__) . '/config/secret.php';
+$secretFile = dirname(__DIR__) . '/config/secrets.php';
 if (!is_file($secretFile)) {
-    fwrite(STDERR, "❌ secret.php 不存在: {$secretFile}\n");
+    fwrite(STDERR, "❌ secrets.php 不存在: {$secretFile}\n");
     exit(1);
 }
 
 $secrets = include $secretFile;
 if (!is_array($secrets) || empty($secrets)) {
-    fwrite(STDERR, "❌ secret.php 返回空或格式错误\n");
+    fwrite(STDERR, "❌ secrets.php 返回空或格式错误\n");
     exit(1);
 }
 
@@ -126,13 +128,13 @@ $failed = 0;
 
 foreach ($secrets as $key => $secret) {
     [$clientId, $username] = explode(':', $key, 2);
+    // ★ 关键：Redis key 保留冒号，与 hmac.php 查询格式一致
     $redisKey = "device:secret:{$clientId}:{$username}";
 
     // 检查是否已存在
     $exists = $redis->exists($redisKey);
     $existingValue = $exists ? $redis->get($redisKey) : null;
 
-    // 格式化输出
     $status = '';
     $action = '';
 
@@ -168,7 +170,7 @@ foreach ($secrets as $key => $secret) {
 
     printf("  %-50s %s\n", $key, $status);
 
-    // dry-run 或正常模式都打印详情
+    // dry-run 或已存在时打印详情
     if (($options['dry-run'] || ($exists && !$options['force'])) && $existingValue !== null) {
         echo "     当前值: {$existingValue}\n";
         echo "     新值:   {$secret}\n";
@@ -179,7 +181,6 @@ foreach ($secrets as $key => $secret) {
 
 if (!$options['dry-run']) {
     echo "\n━━━ 验证写入结果 ━━━\n";
-    $allGood = true;
     foreach ($secrets as $key => $secret) {
         [$clientId, $username] = explode(':', $key, 2);
         $redisKey = "device:secret:{$clientId}:{$username}";
@@ -188,7 +189,6 @@ if (!$options['dry-run']) {
             echo "  ✅ {$key} = 正确\n";
         } else {
             echo "  ❌ {$key} = 不匹配 (got: " . ($actual ?? 'nil') . ")\n";
-            $allGood = false;
             $failed++;
             $ok = max(0, $ok - 1);
         }

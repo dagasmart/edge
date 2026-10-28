@@ -7,7 +7,7 @@
 #    extensions/edge/bash/       本脚本 + start/stop/reload-cluster.sh
 #    extensions/edge/bin/        server.php (仅做存在性提示，不用于启动)
 #    extensions/edge/config/     secrets.php / env.sh
-#    extensions/edge/test/       verify_simple.php
+#    extensions/edge/test/       verify_simple.php / seed_redis.php
 # ============================================================
 
 set -Eeuo pipefail
@@ -112,6 +112,11 @@ check_env() {
     # server.php 提示（不阻断）
     [[ -f "$BIN_DIR" ]] && log "server.php 存在（仅提示，启动走 artisan）" \
         || warn "server.php 未找到: ${BIN_DIR}（不影响 artisan 启动）"
+
+    # secrets.php（统一文件名，复数）
+    [[ -f "${CONF_DIR}/secrets.php" ]] \
+        && log "secrets.php 存在" \
+        || warn "secrets.php 未找到: ${CONF_DIR}/secrets.php（seed 将使用内置 bench_secret）"
 
     # Redis
     if command -v redis-cli >/dev/null 2>&1; then
@@ -303,8 +308,8 @@ After=network.target redis.service
 [Service]
 Type=forking
 WorkingDirectory=${BASE_DIR}
-ExecStart=${_SD}/start.sh
-ExecStop=${_SD}/stop.sh
+ExecStart=${_SD}/start-cluster.sh
+ExecStop=${_SD}/stop-cluster.sh
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
@@ -314,7 +319,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable "${APP_NAME}.service" >/dev/null 2>&1 || true
-    log "systemd 服务已安装"
+    log "systemd 服务已安装 (ExecStart=start-cluster.sh, ExecStop=stop-cluster.sh)"
 }
 
 # ===================== Nginx / logrotate =====================

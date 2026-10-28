@@ -1,7 +1,7 @@
 #!/usr/bin/env php
 <?php
 /**
- * EdgeAuth 功能验证脚本（与 server.php / hmac.php 对齐版）
+ * EdgeAuth 功能验证脚本（与 server.php / hmac.php 字节级对齐版）
  *
  * 协议：
  *   password = b64Sign|timestamp|nonce
@@ -9,6 +9,10 @@
  *   nonce    = 随机字符串，防重放
  *
  * 用法：php extensions/edge/test/verify_simple.php [base_url]
+ *
+ * 退出码：
+ *   0 = 全部通过
+ *   1 = 存在失败项
  */
 
 error_reporting(E_ALL);
@@ -16,16 +20,16 @@ ini_set('display_errors', '1');
 
 $baseUrl = $argv[1] ?? 'http://127.0.0.1:9503';
 
-// ===================== 读取 secret.php =====================
+// ===================== 读取 secrets.php（统一文件名，复数） =====================
 
-$secretFile = dirname(__DIR__) . '/config/secret.php';
+$secretFile = dirname(__DIR__) . '/config/secrets.php';
 if (!is_file($secretFile)) {
-    fwrite(STDERR, "❌ secret.php 不存在: {$secretFile}\n");
+    fwrite(STDERR, "❌ secrets.php 不存在: {$secretFile}\n");
     fwrite(STDERR, "   将仅使用内置 bench_secret 做基础验证\n");
     $secrets = ['bench_client:bench_user' => 'bench_secret'];
 } else {
     $secrets = include $secretFile;
-    echo "📦 从 secret.php 加载了 " . count($secrets) . " 个设备密钥\n\n";
+    echo "📦 从 secrets.php 加载了 " . count($secrets) . " 个设备密钥\n\n";
 }
 
 // ===================== 签名函数（与 hmac.php 字节级对齐） =====================
@@ -35,13 +39,13 @@ function sign(string $clientId, string $username, string $secret): string
     $timestamp = (string)time();
     $nonce = bin2hex(random_bytes(8)); // 16 hex chars, 防重放
 
-    // ★ 跟 hmac.php 完全一致的 payload
+    // ★ 跟 hmac.php 完全一致的 payload（竖线分隔，含 nonce）
     $payload = $clientId . '|' . $username . '|' . $timestamp . '|' . $nonce;
 
     // ★ HMAC-SHA256 原始二进制（第四个参数 true）
     $rawSign = hash_hmac('sha256', $payload, $secret, true);
 
-    // ★ URL-safe base64（跟 hmac.php 的 strtr('-_~', '+/=') 反向对应）
+    // ★ URL-safe base64（跟 hmac.php 的 strtr 反向对应：+/ → -_）
     $b64Sign = strtr(base64_encode($rawSign), '+/', '-_');
 
     // ★ password = b64Sign|timestamp|nonce

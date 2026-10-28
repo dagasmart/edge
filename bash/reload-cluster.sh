@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-# EdgeAuth 集群滚动重启（artisan 方式）
+# ============================================================
+#  EdgeAuth 集群滚动重启（artisan 方式）
+#  用法：
+#    reload-cluster.sh              # 默认 4 实例，端口 9503~9506，间隔 3s
+#    reload-cluster.sh 4 5          # 4 实例，间隔 5s
+#    reload-cluster.sh 9503 9504    # 只滚动重载指定端口
+# ============================================================
 set -Eeuo pipefail
 
 PHP_BIN="/xp/server/php/php-8.4/bin/php"
@@ -9,7 +15,13 @@ LOG_DIR="/var/log/${APP_NAME}"
 PID_DIR="/var/run/${APP_NAME}"
 POOL_SIZE=256
 
-# 解析端口参数
+# ★ 对齐 deploy.sh 的环境变量（可被外部覆盖）
+REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
+REDIS_PORT="${REDIS_PORT:-16379}"
+REDIS_PASS="${REDIS_PASS:-uApDVQD7}"
+REDIS_DB="${REDIS_DB:-2}"
+
+# 解析参数：reload-cluster.sh [count [interval]]  或  reload-cluster.sh port1 port2 ...
 if [[ $# -ge 1 && "$1" =~ ^[0-9]+$ ]] && { [[ $# -eq 1 ]] || [[ "$2" =~ ^[0-9]+$ ]]; }; then
     INSTANCE_COUNT=${1:-4}
     SLEEP_BETWEEN=${2:-3}
@@ -24,6 +36,7 @@ fi
 echo "========================================"
 echo " EdgeAuth — 滚动重启 (artisan 模式)"
 echo " 端口: ${PORTS[*]}"
+echo " Redis: ${REDIS_HOST}:${REDIS_PORT} db=${REDIS_DB}"
 echo "========================================"
 
 health_check() {
@@ -60,11 +73,14 @@ for port in "${PORTS[@]}"; do
         fuser -k "${port}/tcp" 2>/dev/null || true
     fi
 
-    # 启新
+    # 启新（★ 补齐 Redis 环境变量）
     echo "  启动新实例…"
     cd "${BASE_DIR}"
     AUTH_PORT="${port}" \
-    REDIS_DB=2 \
+    REDIS_HOST="${REDIS_HOST}" \
+    REDIS_PORT="${REDIS_PORT}" \
+    REDIS_PASS="${REDIS_PASS}" \
+    REDIS_DB="${REDIS_DB}" \
     MAX_CONCURRENCY=10000 \
     REDIS_POOL_SIZE="${POOL_SIZE}" \
     nohup "${PHP_BIN}" artisan edge:auth-swow \
@@ -96,6 +112,5 @@ for port in "${PORTS[@]}"; do
         || echo "  ❌ :${port} FAIL"
 done
 
-# nginx reload
 command -v nginx &>/dev/null && pgrep nginx &>/dev/null && { nginx -s reload 2>/dev/null && echo "✅ nginx reloaded" || true; }
 echo "完成。"
