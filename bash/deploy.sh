@@ -82,7 +82,7 @@ while [[ $# -gt 0 ]]; do
         -n|--dry-run)   DRY_RUN=1; shift ;;
         -s|--no-verify) VERIFY=0; shift ;;
         --no-ssl)       SSL_ENABLED=0; shift ;;
-        -h|--help)      sed -n '/^sed/,/^EOF/p' "${BASH_SOURCE[0]}" 2>/dev/null; exit 0 ;;
+        -h|--help)      echo "用法: $0 [deploy|rollback|status|stop|restart] [--dry-run] [--no-verify] [--no-ssl]"; exit 0 ;;
         *) die "未知参数: $1" ;;
     esac
 done
@@ -157,23 +157,24 @@ seed_redis() {
         pairs+=("bench_client:bench_user=bench_secret")
     fi
 
-    local _kv _k _v
+    local _kv
     for _kv in "${pairs[@]}"; do
         _PAIR_KEY+=("${_kv%%=*}"); _PAIR_VAL+=("${_kv#*=}")
     done
 
     for i in "${!_PAIR_KEY[@]}"; do
         local key="${_PAIR_KEY[$i]}" secret="${_PAIR_VAL[$i]}"
-        local rk="device:secret:${key/:/-}"
+        # ★ 修正：保留冒号，不替换。hmac.php 查的就是 device:secret:{cid}:{uid}
+        local rk="device:secret:${key}"
         [[ $DRY_RUN -eq 1 ]] && { info "(dry) SET ${rk}"; continue; }
         if command -v redis-cli >/dev/null 2>&1; then
             redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" -a "$REDIS_PASS" -n "$REDIS_DB" \
-                --no-auth-warning SET "$rk" "$secret" >/dev/null || die "Redis SET 失败"
+                --no-auth-warning SET "$rk" "$secret" >/dev/null || die "Redis SET 失败: ${rk}"
         else
             "${PHP_BIN}" -r "
                 \$r=new Redis();\$r->connect('${REDIS_HOST}',${REDIS_PORT},2) or exit(1);
                 \$r->auth('${REDIS_PASS}') or exit(1);\$r->select(${REDIS_DB}) or exit(1);
-                \$r->set('${rk}','${secret}') or exit(1);" || die "Redis SET 失败"
+                \$r->set('${rk}','${secret}') or exit(1);" || die "Redis SET 失败: ${rk}"
         fi
         log "seeded: ${rk}"
     done
@@ -276,11 +277,15 @@ health_check() {
 
 run_verify() {
     [[ $VERIFY -eq 0 ]] && return
-    [[ -x "${TEST_DIR}/verify_simple.php" ]] || { warn "verify 不可执行，跳过"; return; }
+    [[ -f "${TEST_DIR}/verify_simple.php" ]] || { warn "verify_simple.php 不存在，跳过"; return; }
     info "运行 verify…"
     [[ $DRY_RUN -eq 1 ]] && return
-    "${PHP_BIN}" "${TEST_DIR}/verify_simple.php" 2>&1 | tee "${LOG_DIR}/verify.log" | grep -q "ALL PASSED" \
-        && log "verify 全部通过 🎯" || warn "verify 有失败项"
+    "${PHP_BIN}" "${TEST_DIR}/verify_simple.php" 2>&1 | tee "${LOG_DIR}/verify.log"
+    if grep -q "ALL PASSED" "${LOG_DIR}/verify.log"; then
+        log "verify 全部通过 🎯"
+    else
+        warn "verify 有失败项（详见 ${LOG_DIR}/verify.log）"
+    fi
 }
 
 # ===================== systemd =====================
@@ -298,8 +303,8 @@ After=network.target redis.service
 [Service]
 Type=forking
 WorkingDirectory=${BASE_DIR}
-ExecStart=${_SD}/start-cluster.sh
-ExecStop=${_SD}/stop-cluster.sh
+ExecStart=${_SD}/start.sh
+ExecStop=${_SD}/stop.sh
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
@@ -312,7 +317,7 @@ EOF
     log "systemd 服务已安装"
 }
 
-# ===================== Nginx / logrotate（与之前一致，不变）=====================
+# ===================== Nginx / logrotate =====================
 
 generate_nginx_conf() {
     command -v nginx >/dev/null 2>&1 || { warn "nginx 未安装，跳过"; return; }
