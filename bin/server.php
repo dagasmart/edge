@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 use Swow\Coroutine;
 use Swow\Psr7\Server\Server;
-use Swow\Signal;
 
 // ---------- 配置常量 ----------
 if (!defined('AUTH_PORT')) {
@@ -43,12 +42,6 @@ if (!defined('RATE_TTL')) {
 if (!defined('TIME_DRIFT')) {
     define('TIME_DRIFT', (int) ($_ENV['TIME_DRIFT'] ?? 300));
 }
-if (!defined('MAX_REQUESTS_PER_CONN')) {
-    define('MAX_REQUESTS_PER_CONN', (int) ($_ENV['MAX_REQUESTS_PER_CONN'] ?? 10000));
-}
-if (!defined('MAX_CONNECTIONS')) {
-    define('MAX_CONNECTIONS', (int) ($_ENV['MAX_CONNECTIONS'] ?? 5000));
-}
 if (!defined('BACKLOG')) {
     define('BACKLOG', (int) ($_ENV['BACKLOG'] ?? 4096));
 }
@@ -75,59 +68,33 @@ concurrencyInit(MAX_CONCURRENCY);
 // ---------- Server ----------
 $server = new Server;
 
-// ✅ 必须设置，否则 500+ 连接 accept 队列满直接 RST
-$server->set([
-    'max_connections' => MAX_CONNECTIONS,
-    'backlog'          => BACKLOG,
-    'max_requests'     => 0,
-]);
+// ✅ Swow Psr7\Server 正确配置：链式方法 + listen(backlog)
+$server->setTcpNodelay(true)
+    ->setTcpKeepAlive(true, 60)
+    ->setRecvMessageTimeout(30000);
 
-// TLS（可选）
-if (defined('TLS_CERT') && defined('TLS_KEY') && file_exists(TLS_CERT) && file_exists(TLS_KEY)) {
-    $server->setSslCertFile(TLS_CERT);
-    $server->setSslKeyFile(TLS_KEY);
-    fwrite(STDOUT, '[EdgeAuth] TLS enabled' . PHP_EOL);
-}
-
-$server->bind('0.0.0.0', AUTH_PORT, Server::BIND_FLAG_NONE)->listen();
+$server->bind('0.0.0.0', AUTH_PORT, Server::BIND_FLAG_NONE)
+    ->listen(BACKLOG);
 
 fwrite(STDOUT, '[EdgeAuth] Listening on 0.0.0.0:' . AUTH_PORT . PHP_EOL);
 fwrite(STDOUT, '[EdgeAuth] Redis: ' . ($redisOk ? 'OK' : 'DEGRADED') . PHP_EOL);
 
-// ---------- 优雅退出（三级降级） ----------
+// ---------- 优雅退出（pcntl，不依赖 Swow\Signal 版本差异） ----------
 $running = true;
-$signalMode = 'none';
 
-if (class_exists('Swow\Signal')) {
-    try {
-        $sigMask = Signal::TERM | Signal::INT;
-        $signal = new Signal($sigMask);
-        Coroutine::run(static function () use ($signal, &$running): void {
-            $signal->wait();
-            fwrite(STDOUT, '[EdgeAuth] received SIGTERM/SIGINT, shutting down' . PHP_EOL);
-            $running = false;
-        });
-        $signalMode = 'swow';
-    } catch (Throwable $e) {
-        fwrite(STDERR, '[EdgeAuth] Swow\Signal unavailable (' . $e->getMessage() . '), falling back' . PHP_EOL);
-    }
-}
-
-if ($signalMode === 'none' && function_exists('pcntl_signal')) {
+if (function_exists('pcntl_signal')) {
     pcntl_async_signals(true);
     pcntl_signal(SIGTERM, function () use (&$running): void {
-        fwrite(STDOUT, '[EdgeAuth] SIGTERM' . PHP_EOL);
+        fwrite(STDOUT, '[EdgeAuth] SIGTERM received, shutting down' . PHP_EOL);
         $running = false;
     });
     pcntl_signal(SIGINT, function () use (&$running): void {
-        fwrite(STDOUT, '[EdgeAuth] SIGINT' . PHP_EOL);
+        fwrite(STDOUT, '[EdgeAuth] SIGINT received, shutting down' . PHP_EOL);
         $running = false;
     });
-    $signalMode = 'pcntl';
-}
-
-if ($signalMode === 'none') {
-    fwrite(STDOUT, '[EdgeAuth] no signal handler (Windows dev mode), use Ctrl+C to stop' . PHP_EOL);
+    fwrite(STDOUT, '[EdgeAuth] Signal handler: pcntl' . PHP_EOL);
+} else {
+    fwrite(STDOUT, '[EdgeAuth] Signal handler: none (no pcntl)' . PHP_EOL);
 }
 
 // ---------- 主循环 ----------
@@ -143,9 +110,6 @@ while ($running) {
 
     Coroutine::run(static function () use ($conn): void {
         try {
-            $requests = 0;
-            $maxRequests = MAX_REQUESTS_PER_CONN; // ✅ 从常量读，可 env 覆盖
-
             while (true) {
                 $req = $conn->recvHttpRequest();
                 $path = $req->getUri()->getPath();
@@ -188,8 +152,7 @@ while ($running) {
                         $conn->respond('', 404);
                 }
 
-                $requests++;
-                if (!$conn->shouldKeepAlive() || $requests >= $maxRequests) {
+                if (!$conn->shouldKeepAlive()) {
                     break;
                 }
             }

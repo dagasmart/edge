@@ -17,7 +17,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     }
 
     try {
-        // ✅ P0 修复：手动解析 application/x-www-form-urlencoded
+        // ✅ 手动解析 application/x-www-form-urlencoded
         $rawBody = (string) $req->getBody()->getContents();
         parse_str($rawBody, $body);
 
@@ -25,23 +25,10 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         $username = (string) ($body['username'] ?? '');
         $password = (string) ($body['password'] ?? '');
 
-        // ✅ P2 修复：IP 优先从真实连接 / Header 取，body 作为覆盖
-        $ip = $req->getHeaderLine('X-Forwarded-For');
-        if ($ip === '') {
-            $ip = $req->getHeaderLine('X-Real-IP');
-        }
-        if ($ip === '') {
-            try {
-                $ip = (string) $conn->getRemoteAddress();
-            } catch (Throwable) {
-                $ip = '';
-            }
-        }
-        $bodyIp = (string) ($body['ipaddr'] ?? '');
-        if ($bodyIp !== '') {
-            $ip = $bodyIp;
-        }
-        if ($ip === '') {
+        // ✅ IP：只从真实 TCP 连接取，不信任任何 Header
+        try {
+            $ip = (string) $conn->getPeerAddress();
+        } catch (Throwable) {
             $ip = 'unknown';
         }
 
@@ -63,7 +50,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             return;
         }
 
-        // ✅ P1 修复：缓存 key 包含 nonce，防重放绕过
+        // ✅ 缓存 key 包含 nonce，防重放绕过
         $passParts = explode('|', $password, 3);
         $nonce = $passParts[2] ?? '';
         $cacheKey = 'auth:hmac:' . $clientId . ':' . $username . ':' . $nonce;
@@ -89,7 +76,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
         if ($ok) {
             redisSetex($cacheKey, CACHE_TTL, AUTH_CACHE_VALID);
-            // ✅ P3 修复：不重置限流，成功也计入窗口
+            // ✅ 不重置限流，成功也计入窗口
             $conn->respond('', 200);
             metricsInc('auth_ok');
         } else {

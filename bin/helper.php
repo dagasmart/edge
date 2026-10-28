@@ -8,16 +8,13 @@ use Swow\Channel;
  * Redis 连接池（Swow Channel 真协程池）
  * ========================================================= */
 
-/** @var Channel|null */
+/** @var Channel|null $redisPool */
 $redisPool = null;
 
-/** @var int */
 $redisPoolSize = 16;
 
-/** @var int */
 $redisDb = 2;
 
-/** @var string */
 $redisPassword = '';
 
 function redisPoolInit(int $size = 256, int $db = 2): void
@@ -62,7 +59,9 @@ function redisPoolPop(float $timeout = 1.0): ?\Redis
         redisPoolInit();
     }
     try {
-        return $redisPool->pop($timeout);
+        // ✅ 转成毫秒 int
+        $ms = (int) ($timeout * 1000);
+        return $redisPool->pop($ms);
     } catch (\Throwable) {
         return null;
     }
@@ -149,13 +148,13 @@ function redisSetNxEx(string $key, string $value, int $ttl): bool
  * L1 本地缓存（带上限，超了拒绝写入，靠 TTL 淘汰）
  * ========================================================= */
 
-/** @var \ArrayObject|null */
+/** @var ArrayObject|null $localCache */
 $localCache = null;
 
 function localCacheInit(): void
 {
     global $localCache;
-    $localCache = new \ArrayObject();
+    $localCache = new ArrayObject();
 }
 
 function localCacheGet(string $key): mixed
@@ -211,13 +210,11 @@ function redisPoolStats(): array
 }
 
 /* =========================================================
- * 并发熔断（Atomic 信号量，兼容所有 Swow 版本）
+ * 并发控制（Atomic 信号量，兼容所有 Swow 版本）
  * ========================================================= */
 
-/** @var \Swow\Atomic|null */
 $globalConcurrency = null;
 
-/** @var int */
 $concurrencyMax = 10000;
 
 function concurrencyInit(int $max): void
@@ -236,7 +233,7 @@ function concurrencyAcquire(float $timeout = 2.0): bool
 {
     global $globalConcurrency, $concurrencyMax;
     if ($globalConcurrency === null) {
-        return true; // 降级放行
+        return true;
     }
     $current = $globalConcurrency->add(1);
     if ($current > $concurrencyMax) {
@@ -249,9 +246,7 @@ function concurrencyAcquire(float $timeout = 2.0): bool
 function concurrencyRelease(): void
 {
     global $globalConcurrency;
-    if ($globalConcurrency !== null) {
-        $globalConcurrency->sub(1);
-    }
+    $globalConcurrency?->sub(1);
 }
 
 /* =========================================================
@@ -304,7 +299,7 @@ function metricsInc(string $key, int $n = 1): void
 function metricsSnapshot(): array
 {
     global $metrics;
-    return $metrics;
+    return $metrics ?? [];
 }
 
 /* =========================================================

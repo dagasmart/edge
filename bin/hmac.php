@@ -20,7 +20,7 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
 
     [$b64Sign, $timestamp, $nonce] = array_map('trim', $parts);
 
-    // ✅ P0 修复：URL-safe base64 反向替换（-_~ → +/=）
+    // ✅ URL-safe base64 反向替换
     $sign = base64_decode(strtr($b64Sign, '-_~', '+/='), true);
     if ($sign === false || !ctype_digit($timestamp)) {
         return false;
@@ -55,7 +55,7 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
         return false;
     }
 
-    // ---------- HMAC 校验（时序安全） ----------
+    // ---------- HMAC 校验 ----------
     $expect = hash_hmac('sha256', $payload, $secret, true);
     if (!hash_equals($expect, $sign)) {
         return false;
@@ -68,9 +68,9 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
     Coroutine::run(static function () use ($clientId, $chR): void {
         try {
             $r = (bool) redisExists('device:revoke:' . $clientId);
-            $chR->push($r, 2.0);
+            $chR->push($r, 2000);          // ✅ int 毫秒
         } catch (Throwable) {
-            $chR->push(false, 2.0);
+            $chR->push(false, 2000);
         }
     });
 
@@ -79,20 +79,19 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
             $nk = 'device:nonce:' . $clientId . ':' . $username;
             $existing = redisGet($nk);
             if ($existing === $nonce) {
-                $chN->push(true, 2.0);
+                $chN->push(false, 2000); // ✅ 修复：已存在 = 重放 = 拒绝
             } else {
-                // ✅ P1 修复：nonce TTL 覆盖完整时间窗口
                 $nonceTtl = defined('TIME_DRIFT') ? TIME_DRIFT * 2 : 300;
-                $chN->push(redisSetNxEx($nk, $nonce, $nonceTtl), 2.0);
+                $chN->push(redisSetNxEx($nk, $nonce, $nonceTtl), 2000);
             }
         } catch (Throwable) {
-            $chN->push(false, 2.0);
+            $chN->push(false, 2000);
         }
     });
 
     try {
-        $r = $chR->pop(2.0);
-        $n = $chN->pop(2.0);
+        $r = $chR->pop(2000);               // ✅ int 毫秒
+        $n = $chN->pop(2000);
     } catch (Throwable) {
         fwrite(STDERR, '[hmac] sub-coroutine incomplete' . PHP_EOL);
         return false;
