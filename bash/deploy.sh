@@ -39,7 +39,7 @@ TEST_DIR="${BASE_DIR}/extensions/edge/test"
 
 # server.php 位置（★重点★）：默认与脚本同目录，若在别处请改成绝对路径
 #   例: BIN_DIR="${BASE_DIR}/extensions/edge/bin/server.php"
-BIN_DIR="${_SD}/server.php"   # server.php 所在目录，可改为 extensions/edge/bin
+BIN_DIR="${BASE_DIR}/extensions/edge/bin/server.php"   # server.php 所在目录，可改为 extensions/edge/bin
 
 LOG_DIR="/var/log/${APP_NAME}"
 PID_DIR="/var/run/${APP_NAME}"
