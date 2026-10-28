@@ -1,85 +1,144 @@
-# EdgeAuth 部署工具链（对齐版）
-
-本目录为修复后的**全量落地文件**，解决历史遗留的三个不一致问题：
-1. Redis key 冒号被错误替换成短横线 → 已统一为冒号 `device:secret:{cid}:{uid}`
-2. 文件名 `secret.php` / `secrets.php` 混用 → 已统一为 `secrets.php`（复数）
-3. systemd 引用的 `start.sh`/`stop.sh` 与实际文件 `start-cluster.sh`/`stop-cluster.sh` 不符 → 已对齐
-
----
+# EdgeAuth 部署说明
 
 ## 目录结构
 
-```
+\`\`\`
 extensions/edge/
-├── README.md                    # 本文件
 ├── bash/
-│   ├── deploy.sh                # 总入口（CI / 首次部署），内部 seed+start+verify
-│   ├── start-cluster.sh         # 集群启动，被 systemd ExecStart 引用
-│   ├── stop-cluster.sh          # 集群停止，被 systemd ExecStop 引用
-│   └── reload-cluster.sh        # 滚动重启（独立运维）
+│   ├── deploy.sh              # 总入口（seed → build → start → health → verify）
+│   ├── start-cluster.sh       # 集群启动（systemd ExecStart）
+│   ├── stop-cluster.sh        # 集群停止（systemd ExecStop）
+│   └── reload-cluster.sh      # 滚动重启
 ├── config/
-│   └── secrets.php              # 设备密钥源（deploy.sh / seed_redis.php / verify 共用）
+│   └── secrets.php            # 设备密钥（统一命名，复数）
 └── test/
-    ├── verify_simple.php        # 12 项回归验证，与 hmac.php 字节级对齐
-    └── seed_redis.php           # Redis 密钥写入（--dry-run / --force）
-```
+├── verify_simple.php      # 协议验证（12 项断言）
+└── seed_redis.php         # Redis 预热脚本（独立运行用）
+\`\`\`
 
-## 对齐契约（所有文件共同遵守）
+## 对齐契约（部署前必读）
 
-| 项目 | 统一值 |
-|------|--------|
-| 密钥文件名 | `secrets.php`（复数） |
-| Redis key | `device:secret:{clientid}:{username}`（冒号，不替换） |
-| 签名协议 | `b64Sign\|timestamp\|nonce`，HMAC-SHA256 原始二进制 + URL-safe base64 |
-| 启动命令 | `php artisan edge:auth-swow`（全链路统一，端口由 `AUTH_PORT` 环境变量注入） |
-| Redis 环境变量 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASS` / `REDIS_DB`，所有脚本一致 |
+| 项目 | 约定 |
+|------|------|
+| Redis key 格式 | `device:secret:{clientid}:{username}`（**冒号，不替换**） |
+| 密钥文件名 | **`secrets.php`**（全部脚本统一，无单数 secret.php） |
+| systemd 引用 | `start-cluster.sh` / `stop-cluster.sh`（与实际文件名一致） |
+| 启动方式 | `php artisan edge:auth-swow`（所有脚本统一） |
+| 端口 | 9503–9506 |
+| Redis | 127.0.0.1:16379 db=2 密码 uApDVQD7 |
+| 协议 | b64Sign\|timestamp\|nonce，HMAC-SHA256 raw binary，±300s |
 
-## 快速使用
+## 快速部署
 
-```bash
-# 首次部署（交互式，会提示是否写 Redis）
-sudo bash extensions/edge/bash/deploy.sh
-
-# 预演（不实际写入/启动）
+\`\`\`bash
+# 预演
 sudo bash extensions/edge/bash/deploy.sh --dry-run
 
-# CI 自动部署
-sudo CI=1 bash extensions/edge/bash/deploy.sh
+# 正式部署
+sudo bash extensions/edge/bash/deploy.sh
+\`\`\`
 
-# 只更新密钥
-sudo bash extensions/edge/bash/deploy.sh --seed-only
+## 自检命令
 
-# 滚动重载（生产常用）
+\`\`\`bash
+# 确认无单数引用残留
+grep -rn "secret\.php" extensions/edge/    # 只应命中 secrets.php
+
+# 确认无冒号替换残留
+grep -rn '${key/:/-}' extensions/edge/      # 应无命中
+
+# 确认 Redis key 格式正确
+redis-cli -h 127.0.0.1 -p 16379 -a uApDVQD7 -n 2 --no-auth-warning KEYS "device:secret:*"
+\`\`\`
+
+## 运维操作
+
+### 状态查看
+
+\`\`\`bash
+sudo bash extensions/edge/bash/deploy.sh status
+# 或
+systemctl status edge-auth.service
+\`\`\`
+
+### 滚动重启（不停服）
+
+\`\`\`bash
 sudo bash extensions/edge/bash/reload-cluster.sh
+\`\`\`
 
-# 手动验证
-/xp/server/php/php-8.4/bin/php extensions/edge/test/verify_simple.php
-```
+### 强制重载（Kill + 重启）
 
-## 关键修复点对照
+当 `stop-cluster.sh` 无法干净退出、或需要紧急重置所有实例时，按以下顺序操作：
 
-| 文件 | 修复内容 |
-|------|---------|
-| `bash/deploy.sh` | `seed_redis()` 中 `device:secret:${key}` 保留冒号（去掉 `${key/:/-}`）；systemd 指向 `start-cluster.sh` / `stop-cluster.sh` |
-| `bash/start-cluster.sh` | 补齐 `REDIS_HOST`/`REDIS_PORT`/`REDIS_PASS`/`REDIS_DB` 环境变量透传 |
-| `bash/reload-cluster.sh` | 同上，补齐 Redis 环境变量；启停逻辑与 deploy 的 `start_all` 一致 |
-| `config/secrets.php` | 文件名由 `secret.php` 改为 `secrets.php`；注释中错误的短横线说明改为冒号 |
-| `test/verify_simple.php` | 文件名引用 `secret.php` → `secrets.php` |
-| `test/seed_redis.php` | 文件名引用 `secret.php` → `secrets.php`；key 格式已是冒号（正确） |
+\`\`\`bash
+# 1. 正规停（最干净）
+sudo bash extensions/edge/bash/stop-cluster.sh
 
-## 部署前自检
+# 2. 兜底：确保没有任何 edge:auth-swow 残留
+sudo pkill -f "artisan edge:auth-swow" 2>/dev/null || true
+sudo fuser -k 9503/tcp 9504/tcp 9505/tcp 9506/tcp 2>/dev/null || true
 
-```bash
-# 1. 文件名统一
-ls extensions/edge/config/secrets.php        # 应存在
-ls extensions/edge/config/secret.php 2>&1     # 应不存在
+# 3. 确认全清干净
+pgrep -fa "edge:auth-swow" || echo "✅ 无残留进程"
+ss -tlnp | grep -E '950[3-6]' || echo "✅ 端口全释放"
 
-# 2. 无单数引用残留
-grep -rn "secret\.php" extensions/edge/       # 应只命中 secrets.php
+# 4. 重载 systemd
+sudo systemctl daemon-reload
 
-# 3. 无冒号替换残留
-grep -rn '${key/:/-}' extensions/edge/         # 应无命中
+# 5. 重新启动
+sudo bash extensions/edge/bash/start-cluster.sh
+# 或走 systemd：
+# sudo systemctl restart edge-auth.service
 
-# 4. systemd 脚本真实存在
-ls extensions/edge/bash/start-cluster.sh extensions/edge/bash/stop-cluster.sh
-```
+# 6. 健康检查
+for p in 9503 9504 9505 9506; do
+curl -s -o /dev/null -w ":${p} → %{http_code}\n" --max-time 2 http://127.0.0.1:${p}/health
+done
+\`\`\`
+
+**一步到位版（单条命令）：**
+
+\`\`\`bash
+sudo bash extensions/edge/bash/stop-cluster.sh && \
+sudo pkill -f "artisan edge:auth-swow" 2>/dev/null; \
+sudo fuser -k 9503/tcp 9504/tcp 9505/tcp 9506/tcp 2>/dev/null; \
+sudo systemctl daemon-reload && \
+sudo bash extensions/edge/bash/start-cluster.sh
+\`\`\`
+
+> ⚠️ **注意**：`pkill -f "artisan edge:auth-swow"` 只匹配该特定命令，不会影响其他 PHP 进程。
+> 如果确认机器上没有其他 PHP 业务且 Swow worker 仍未退出，可最后补一刀：
+> `sudo killall -9 php`（慎用）。
+
+**重载后验证 Redis 密钥未被清掉：**
+
+\`\`\`bash
+redis-cli -h 127.0.0.1 -p 16379 -a uApDVQD7 -n 2 --no-auth-warning KEYS "device:secret:*"
+\`\`\`
+
+应返回 5 个冒号格式 key：
+\`\`\`
+device:secret:device001:user001
+device:secret:device002:user001
+device:secret:device003:user002
+device:secret:gateway01:admin
+device:secret:bench_client:bench_user
+\`\`\`
+
+**最终确认：跑 verify**
+
+\`\`\`bash
+php extensions/edge/test/verify_simple.php
+# 期望：12/12 ALL PASSED 🎯
+\`\`\`
+
+## 变更记录
+
+| 日期 | 修正 |
+|------|------|
+| 2026-10-28 | seed_redis key 冒号替换 bug 修复（${key/:/-} → ${key}） |
+| 2026-10-28 | systemd 引用对齐到 start-cluster.sh / stop-cluster.sh |
+| 2026-10-28 | 文件名统一：secret.php → secrets.php（三处同步） |
+| 2026-10-28 | secrets.php 注释中错误的短横线说明更正为冒号 |
+| 2026-10-28 | 新增强制重载（Kill + 重启）操作文档 |
