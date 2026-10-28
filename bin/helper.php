@@ -247,7 +247,8 @@ function redisPoolStats(): array
 }
 
 /* =========================================================
- * 并发控制
+ * 并发控制 —— Swow\Channel 信号量（不依赖 Swow\Atomic）
+ * 修正：类名 Swow\Channel（非 Swow\Coroutine\Channel）
  * ========================================================= */
 
 $globalConcurrency = null;
@@ -257,32 +258,166 @@ function concurrencyInit(int $max): void
 {
     global $globalConcurrency, $concurrencyMax;
     $concurrencyMax = $max;
-    if (class_exists('Swow\Atomic')) {
-        $globalConcurrency = new \Swow\Atomic(0);
-    } else {
-        $globalConcurrency = null;
-        fwrite(STDERR, '[EdgeAuth] WARNING: Swow\Atomic not found, concurrency limit DISABLED' . PHP_EOL);
+    $globalConcurrency = new \Swow\Channel($max);
+    for ($i = 0; $i < $max; $i++) {
+        $globalConcurrency->push(1, 1);
     }
+    fwrite(STDOUT, '[EdgeAuth] Concurrency: Swow\Channel semaphore (max=' . $max . ')' . PHP_EOL);
 }
 
 function concurrencyAcquire(float $timeout = 2.0): bool
 {
-    global $globalConcurrency, $concurrencyMax;
+    global $globalConcurrency;
     if ($globalConcurrency === null) {
         return true;
     }
-    $current = $globalConcurrency->add(1);
-    if ($current > $concurrencyMax) {
-        $globalConcurrency->sub(1);
+    try {
+        $ms = (int) ($timeout * 1000);
+        return (bool) $globalConcurrency->pop($ms > 0 ? $ms : 1);
+    } catch (Throwable) {
         return false;
     }
-    return true;
 }
 
 function concurrencyRelease(): void
 {
     global $globalConcurrency;
-    $globalConcurrency?->sub(1);
+    if ($globalConcurrency === null) {
+        return;
+    }
+    try {
+        $globalConcurrency->push(1, 1);
+    } catch (Throwable) {
+        // 满了忽略
+    }
+}
+
+function concurrencyStats(): array
+{
+    global $globalConcurrency, $concurrencyMax;
+    if ($globalConcurrency === null) {
+        return ['max' => $concurrencyMax, 'used' => 0, 'free' => $concurrencyMax];
+    }
+    $free = $globalConcurrency->getLength();
+    return [
+        'max'  => $concurrencyMax,
+        'used' => $concurrencyMax - $free,
+        'free' => $free,
+    ];
+}
+
+/* =========================================================
+ * 设备级并发分桶限流（方案 A：进程内 Channel，多 worker 各自独立）
+ * REUSEPORT 模式下 4 worker 各维护独立桶，
+ * MAX_CONCURRENCY_PER_DEVICE=2 → 等效全局 ~8 并发/设备
+ * 修正：Swow\Channel 类名 + acquire 中不刷新 last_used
+ * ========================================================= */
+
+$__edge_device_semaphores = [];
+$__edge_device_sem_max = 5;
+$__edge_device_sem_ttl = 300;
+
+function deviceConcurrencyInit(int $perDevice, int $cleanupTtl = 300): void
+{
+    global $__edge_device_sem_max, $__edge_device_sem_ttl;
+    $__edge_device_sem_max = $perDevice;
+    $__edge_device_sem_ttl = $cleanupTtl;
+}
+
+function deviceConcurrencyAcquire(string $clientId): ?string
+{
+    global $__edge_device_semaphores, $__edge_device_sem_max;
+
+    if (!isset($__edge_device_semaphores[$clientId])) {
+        $ch = new \Swow\Channel($__edge_device_sem_max);
+        for ($i = 0; $i < $__edge_device_sem_max; $i++) {
+            $ch->push(1, 1);
+        }
+        $__edge_device_semaphores[$clientId] = [
+            'channel'   => $ch,
+            'last_used' => time(),
+        ];
+    }
+
+    // 注意：acquire 不刷新 last_used，只在 release 时刷新
+    // 这样 cleanup 的语义是"最后一次请求完成后的空闲时间"
+
+    try {
+        $got = $__edge_device_semaphores[$clientId]['channel']->pop(1);
+        return $got ? $clientId : null;
+    } catch (Throwable) {
+        return null;
+    }
+}
+
+function deviceConcurrencyRelease(?string $clientId): void
+{
+    global $__edge_device_semaphores;
+
+    if ($clientId === null || !isset($__edge_device_semaphores[$clientId])) {
+        return;
+    }
+
+    try {
+        $__edge_device_semaphores[$clientId]['channel']->push(1, 1);
+        $__edge_device_semaphores[$clientId]['last_used'] = time();
+    } catch (Throwable) {
+        // 桶满忽略
+    }
+}
+
+/**
+ * 清理过期空桶
+ * @return void
+ */
+function deviceConcurrencyCleanup(): void
+{
+    global $__edge_device_semaphores, $__edge_device_sem_ttl;
+
+    static $lastCleanup = 0;
+    $now = time();
+    // ---------------------------------------------------------------------------
+    // 节流间隔说明（按需调整），默认60s：                                              |
+    // | 方案         | 间隔 | 理由                                                 |
+    // |-------------|------|-----------------------------------------------------|
+    // | 太保守       | 60s  | 别清理太频繁，过期桶最多多活 60s                          |
+    // | 保守但合理    | 10s  | 平衡频率和开销，过期桶最多多活 10s                        |
+    // | ★ 推荐       | 5s   | handler 入口已在调，5s 节流即高流量也只每 5s 真正扫一次，   |
+    // |             |      | 几乎零成本，过期桶最多多占 5s                            |
+    // | 激进         | 1s   | 完全没问题，但 debugLog 可能刷得频繁                     |
+    // 当前取值：5s（推荐档）                                                         |
+    // ----------------------------------------------------------------------------
+    if ($now - $lastCleanup < 5) {  // ← 60 改 5
+        return;
+    }
+    $lastCleanup = $now;
+
+    $removed = 0;
+    foreach ($__edge_device_semaphores as $cid => $bucket) {
+        if ($now - $bucket['last_used'] > $__edge_device_sem_ttl) {
+            unset($__edge_device_semaphores[$cid]);
+            $removed++;
+        }
+    }
+    if ($removed > 0) {
+        debugLog('deviceConcurrencyCleanup: removed ' . $removed . ' idle buckets');
+    }
+}
+
+function deviceConcurrencyStats(): array
+{
+    global $__edge_device_semaphores, $__edge_device_sem_max;
+
+    $stats = [];
+    foreach ($__edge_device_semaphores as $cid => $bucket) {
+        $free = $bucket['channel']->getLength();
+        $stats[$cid] = [
+            'max'  => $__edge_device_sem_max,
+            'used' => $__edge_device_sem_max - $free,
+            'free' => $free,
+        ];
+    }
+    return $stats;
 }
 
 /* =========================================================
@@ -319,11 +454,12 @@ return c';
  * ========================================================= */
 
 $metrics = [
-    'auth_total'           => 0,
-    'auth_ok'              => 0,
-    'auth_fail'            => 0,
-    'cache_hit'            => 0,
-    'redis_pool_exhausted' => 0,
+    'auth_total'                  => 0,
+    'auth_ok'                     => 0,
+    'auth_fail'                   => 0,
+    'cache_hit'                   => 0,
+    'redis_pool_exhausted'        => 0,
+    'device_concurrency_exceeded' => 0,
 ];
 
 function metricsInc(string $key, int $n = 1): void

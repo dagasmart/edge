@@ -26,6 +26,10 @@ if (!defined('REDIS_POOL_SIZE')) {
 if (!defined('MAX_CONCURRENCY')) {
     define('MAX_CONCURRENCY', 10000);
 }
+// REUSEPORT 模式下 4 worker 各独立计数，设 2 等效全局 ~8 并发/设备
+if (!defined('MAX_CONCURRENCY_PER_DEVICE')) {
+    define('MAX_CONCURRENCY_PER_DEVICE', 2);
+}
 if (!defined('CACHE_TTL')) {
     define('CACHE_TTL', 300);
 }
@@ -45,7 +49,7 @@ if (!defined('BACKLOG')) {
     define('BACKLOG', 4096);
 }
 
-// 路由基准前缀（仅用于日志/兜底信息）
+// 路由基准前缀
 if (!defined('AUTH_HTTP_PREFIX')) {
     define('AUTH_HTTP_PREFIX', '/extension/edge/gateway');
 }
@@ -70,6 +74,7 @@ try {
 
 localCacheInit();
 concurrencyInit(MAX_CONCURRENCY);
+deviceConcurrencyInit(MAX_CONCURRENCY_PER_DEVICE, 300);
 
 // ---------- Server ----------
 $server = new Server;
@@ -78,12 +83,23 @@ $server->setTcpNodelay(true)
     ->setTcpKeepAlive(true, 60)
     ->setRecvMessageTimeout(30000);
 
-$server->bind('0.0.0.0', AUTH_PORT, Server::BIND_FLAG_NONE)
+// REUSEPORT：4 个 worker 进程全部监听同一端口，内核层 round-robin 分发
+// 修正：BIND_FLAG_REUSEPORT（原 BIND_FLAG_NONE 为默认值 0，无实际效果）
+$isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+$bindFlags = $isWindows
+    ? \Swow\Socket::BIND_FLAG_NONE
+    : \Swow\Socket::BIND_FLAG_REUSEPORT;
+
+$server->bind('0.0.0.0', AUTH_PORT, $bindFlags)
     ->listen(BACKLOG);
 
-fwrite(STDOUT, '[EdgeAuth] Listening on 0.0.0.0:' . AUTH_PORT . PHP_EOL);
+fwrite(STDOUT, '[EdgeAuth] Listening on 0.0.0.0:' . AUTH_PORT
+    . ($isWindows ? ' (single-process, no REUSEPORT)' : ' (REUSEPORT)')
+    . PHP_EOL);
+
 fwrite(STDOUT, '[EdgeAuth] Route base: ' . AUTH_HTTP_PREFIX . PHP_EOL);
 fwrite(STDOUT, '[EdgeAuth] Redis: ' . ($redisOk ? 'OK' : 'DEGRADED') . PHP_EOL);
+fwrite(STDOUT, '[EdgeAuth] Concurrency: max=' . MAX_CONCURRENCY . ' global, ' . MAX_CONCURRENCY_PER_DEVICE . '/device' . PHP_EOL);
 
 // ---------- 优雅退出 ----------
 $running = true;
@@ -105,7 +121,6 @@ if (function_exists('pcntl_signal')) {
 
 // ---------- 主循环 ----------
 while ($running) {
-    // ---- accept 阶段：独立 try，失败就 continue ----
     try {
         $conn = $server->acceptConnection();
     } catch (Throwable $e) {
@@ -115,27 +130,24 @@ while ($running) {
             && !str_contains($msg, 'timed out')) {
             fwrite(STDERR, '[accept] ' . $msg . PHP_EOL);
         }
-        continue;  // ★ 接受失败 → 跳过本轮，不碰 $conn
+        continue;
     }
 
-    // ---- 成功 accept，交给协程处理 ----
     Coroutine::run(static function () use ($conn): void {
         try {
             while (true) {
                 try {
                     $req = $conn->recvHttpRequest();
                 } catch (Throwable $e) {
-                    // 客户端断开 / 超时 → 正常退出协程
                     $msg = $e->getMessage();
                     if (!str_contains($msg, 'closed')
                         && !str_contains($msg, 'reset')
                         && !str_contains($msg, 'timed out')) {
                         fwrite(STDERR, '[recv] ' . $msg . PHP_EOL);
                     }
-                    break;  // ★ 退出 while(true) 读请求循环
+                    break;
                 }
 
-                // 路径归一化
                 $path = $req->getUri()->getPath();
                 $path = '/' . ltrim($path, '/');
                 $path = rtrim($path, '/');
@@ -169,7 +181,10 @@ while ($running) {
                             break;
 
                         case '/extension/edge/gateway/metrics':
-                            respondJson($conn, metricsSnapshot(), 200);
+                            $m = metricsSnapshot();
+                            $m['device_concurrency'] = deviceConcurrencyStats();
+                            $m['global_concurrency'] = concurrencyStats();
+                            respondJson($conn, $m, 200);
                             break;
 
                         default:
@@ -199,7 +214,6 @@ while ($running) {
                             'msg'   => $innerE->getMessage(),
                         ], 500);
                     } catch (Throwable) {
-                        // respondJson 也失败了，连接已坏，直接跳出
                         break;
                     }
                 }
@@ -209,7 +223,6 @@ while ($running) {
                 }
             }
         } catch (Throwable $e) {
-            // 协程顶层兜底（不应该到这里，但保底）
             $msg = $e->getMessage();
             if (!str_contains($msg, 'closed')
                 && !str_contains($msg, 'reset')

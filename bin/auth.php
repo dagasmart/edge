@@ -3,7 +3,7 @@
 declare(strict_types=1);
 
 use Swow\Psr7\Message\ServerRequest;
-use Swow\Psr7\Server\ServerConnection;   // ✅ 修正：Server\ServerConnection
+use Swow\Psr7\Server\ServerConnection;
 
 /* =========================================================
  * EdgeAuth HTTP 路由处理
@@ -14,14 +14,13 @@ use Swow\Psr7\Server\ServerConnection;   // ✅ 修正：Server\ServerConnection
  */
 function handleAuth(ServerConnection $conn, ServerRequest $req): void
 {
-    // ---------- 请求体解析：同时支持 JSON 和 form-urlencoded ----------
+    // ---------- 请求体解析 ----------
     $body = (string) $req->getBody();
     $contentType = strtolower($req->getHeaderLine('Content-Type'));
 
     if (str_contains($contentType, 'application/json')) {
         $data = json_decode($body, true) ?? [];
     } else {
-        // form-urlencoded: clientid=device001&username=user001&password=...
         parse_str($body, $data);
     }
 
@@ -43,26 +42,48 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         return;
     }
 
+    // ---------- 定期清理空闲设备桶 ----------
+    deviceConcurrencyCleanup();
+
+    // ---------- 全局并发控制 ----------
+    if (!concurrencyAcquire()) {
+        metricsInc('auth_fail');
+        respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 503);
+        return;
+    }
+
+    // ---------- 设备级并发控制 ----------
+    $deviceToken = deviceConcurrencyAcquire($clientId);
+    if ($deviceToken === null) {
+        concurrencyRelease();
+        metricsInc('auth_fail');
+        metricsInc('device_concurrency_exceeded');
+        debugLog('DEVICE OVERLOADED: ' . $clientId . ' (max=' . MAX_CONCURRENCY_PER_DEVICE . ')');
+        respondJson($conn, [
+            'result' => 'deny',
+            'reason' => 'device_overloaded',
+            'detail' => 'max ' . MAX_CONCURRENCY_PER_DEVICE . ' concurrent requests per device',
+        ], 429);
+        return;
+    }
+
     // ---------- 限流 ----------
     $rateKey = 'rate:' . $clientId;
     if (rateLimited($rateKey)) {
+        deviceConcurrencyRelease($deviceToken);
+        concurrencyRelease();
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 429);
         return;
     }
 
-    // ---------- 熔断检查（快速拒绝，不走 HMAC） ----------
+    // ---------- 熔断检查 ----------
     if (isClientBlocked($clientId)) {
         debugLog('BLOCKED: ' . $clientId);
+        deviceConcurrencyRelease($deviceToken);
+        concurrencyRelease();
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'blocked'], 401);
-        return;
-    }
-
-    // ---------- 并发控制 ----------
-    if (!concurrencyAcquire()) {
-        metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 503);
         return;
     }
 
@@ -72,9 +93,8 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         $reason = detachAuthReason();
 
         if (!$authenticated) {
-            // ★ 只对有攻击嫌疑的 reason 计 fail
             $attackReasons = [
-                'signature mismatch',    // 格式全对但密钥错 → 试探攻击
+                'signature mismatch',
             ];
 
             $shouldCountFail = in_array($reason, $attackReasons, true);
@@ -97,6 +117,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         respondJson($conn, ['result' => 'allow'], 200);
 
     } finally {
+        deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
     }
 }
