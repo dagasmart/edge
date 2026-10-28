@@ -52,10 +52,13 @@ class EdgeAuthSwowCommand extends Command
             return self::FAILURE;
         }
 
-        // 在 require 之前定义常量，确保 server.php 里能用到
+        // ---------- 端口：优先从环境变量 AUTH_PORT 读取 ----------
         if (!defined('AUTH_PORT')) {
-            define('AUTH_PORT', 9503);
+            $port = (int) (getenv('AUTH_PORT') ?: 9503);
+            define('AUTH_PORT', $port);
         }
+
+        $this->info("Binding to port: " . AUTH_PORT);
 
         require $serverFile;
 
