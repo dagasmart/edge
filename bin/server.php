@@ -1,5 +1,4 @@
 <?php
-
 declare(strict_types=1);
 
 use Swow\Coroutine;
@@ -34,16 +33,21 @@ if (!defined('LOCAL_CACHE_TTL')) {
     define('LOCAL_CACHE_TTL', 60);
 }
 if (!defined('RATE_MAX')) {
-    define('RATE_MAX', (int) ($_ENV['RATE_MAX'] ?? 10));
+    define('RATE_MAX', 10);
 }
 if (!defined('RATE_TTL')) {
-    define('RATE_TTL', (int) ($_ENV['RATE_TTL'] ?? 60));
+    define('RATE_TTL', 60);
 }
 if (!defined('TIME_DRIFT')) {
-    define('TIME_DRIFT', (int) ($_ENV['TIME_DRIFT'] ?? 300));
+    define('TIME_DRIFT', 300);
 }
 if (!defined('BACKLOG')) {
-    define('BACKLOG', (int) ($_ENV['BACKLOG'] ?? 4096));
+    define('BACKLOG', 4096);
+}
+
+// 路由基准前缀（仅用于日志/兜底信息）
+if (!defined('AUTH_HTTP_PREFIX')) {
+    define('AUTH_HTTP_PREFIX', '/extension/edge/gateway');
 }
 
 // ---------- 加载业务文件 ----------
@@ -53,7 +57,9 @@ require_once __DIR__ . '/auth.php';
 
 // ---------- 初始化 ----------
 $redisOk = false;
+
 try {
+    fwrite(STDOUT, '[EdgeAuth] Redis pool: ' . REDIS_POOL_SIZE . '-' . REDIS_DB . PHP_EOL);
     redisPoolInit(REDIS_POOL_SIZE, REDIS_DB);
     $st = redisPoolStats();
     $redisOk = ($st['free'] ?? 0) > 0;
@@ -68,7 +74,6 @@ concurrencyInit(MAX_CONCURRENCY);
 // ---------- Server ----------
 $server = new Server;
 
-// ✅ Swow Psr7\Server 正确配置：链式方法 + listen(backlog)
 $server->setTcpNodelay(true)
     ->setTcpKeepAlive(true, 60)
     ->setRecvMessageTimeout(30000);
@@ -77,9 +82,10 @@ $server->bind('0.0.0.0', AUTH_PORT, Server::BIND_FLAG_NONE)
     ->listen(BACKLOG);
 
 fwrite(STDOUT, '[EdgeAuth] Listening on 0.0.0.0:' . AUTH_PORT . PHP_EOL);
+fwrite(STDOUT, '[EdgeAuth] Route base: ' . AUTH_HTTP_PREFIX . PHP_EOL);
 fwrite(STDOUT, '[EdgeAuth] Redis: ' . ($redisOk ? 'OK' : 'DEGRADED') . PHP_EOL);
 
-// ---------- 优雅退出（pcntl，不依赖 Swow\Signal 版本差异） ----------
+// ---------- 优雅退出 ----------
 $running = true;
 
 if (function_exists('pcntl_signal')) {
@@ -99,57 +105,103 @@ if (function_exists('pcntl_signal')) {
 
 // ---------- 主循环 ----------
 while ($running) {
+    // ---- accept 阶段：独立 try，失败就 continue ----
     try {
         $conn = $server->acceptConnection();
     } catch (Throwable $e) {
-        if (!$running) {
-            break;
+        $msg = $e->getMessage();
+        if (!str_contains($msg, 'closed')
+            && !str_contains($msg, 'reset')
+            && !str_contains($msg, 'timed out')) {
+            fwrite(STDERR, '[accept] ' . $msg . PHP_EOL);
         }
-        continue;
+        continue;  // ★ 接受失败 → 跳过本轮，不碰 $conn
     }
 
+    // ---- 成功 accept，交给协程处理 ----
     Coroutine::run(static function () use ($conn): void {
         try {
             while (true) {
-                $req = $conn->recvHttpRequest();
+                try {
+                    $req = $conn->recvHttpRequest();
+                } catch (Throwable $e) {
+                    // 客户端断开 / 超时 → 正常退出协程
+                    $msg = $e->getMessage();
+                    if (!str_contains($msg, 'closed')
+                        && !str_contains($msg, 'reset')
+                        && !str_contains($msg, 'timed out')) {
+                        fwrite(STDERR, '[recv] ' . $msg . PHP_EOL);
+                    }
+                    break;  // ★ 退出 while(true) 读请求循环
+                }
+
+                // 路径归一化
                 $path = $req->getUri()->getPath();
+                $path = '/' . ltrim($path, '/');
+                $path = rtrim($path, '/');
+                if ($path === '' || $path === '/') {
+                    $path = '/';
+                }
 
-                switch ($path) {
-                    case '/mqtt/auth':
-                        handleAuth($conn, $req);
-                        break;
+                fwrite(STDERR, '[route] path=[' . $path . '] method=' . $req->getMethod() . PHP_EOL);
 
-                    case '/health':
-                        try {
-                            $health = [
-                                'status' => ($GLOBALS['redisOk'] ?? false) ? 'ok' : 'degraded',
-                                'redis'  => redisPoolStats(),
+                try {
+                    switch ($path) {
+                        case '/extension/edge/gateway/auth':
+                            handleAuth($conn, $req);
+                            break;
+
+                        case '/extension/edge/gateway/super':
+                            handleSuper($conn, $req);
+                            break;
+
+                        case '/extension/edge/gateway/acl':
+                            handleAcl($conn, $req);
+                            break;
+
+                        case '/extension/edge/gateway/health':
+                            $stats = redisPoolStats();
+                            respondJson($conn, [
+                                'status' => ($stats['free'] ?? 0) > 0 ? 'ok' : 'degraded',
+                                'redis'  => $stats,
                                 'cache'  => ['size' => localCacheStats()],
-                            ];
-                            $conn->respond(
-                                json_encode($health, JSON_UNESCAPED_SLASHES),
-                                200,
-                                ['Content-Type' => 'application/json']
-                            );
-                        } catch (Throwable $e) {
-                            $conn->respond(
-                                json_encode(['status' => 'error', 'msg' => $e->getMessage()], JSON_UNESCAPED_SLASHES),
-                                500,
-                                ['Content-Type' => 'application/json']
-                            );
-                        }
-                        break;
+                            ], 200);
+                            break;
 
-                    case '/metrics':
-                        $conn->respond(
-                            json_encode(metricsSnapshot(), JSON_UNESCAPED_SLASHES),
-                            200,
-                            ['Content-Type' => 'application/json']
-                        );
-                        break;
+                        case '/extension/edge/gateway/metrics':
+                            respondJson($conn, metricsSnapshot(), 200);
+                            break;
 
-                    default:
-                        $conn->respond('', 404);
+                        default:
+                            fwrite(STDERR, '[route] 404 for [' . $path . ']' . PHP_EOL);
+                            respondJson($conn, [
+                                'service'   => 'EdgeAuth',
+                                'status'    => 'running',
+                                'base'      => AUTH_HTTP_PREFIX,
+                                'method'    => $req->getMethod(),
+                                'path'      => $path,
+                                'endpoints' => [
+                                    'auth'    => AUTH_HTTP_PREFIX . '/auth (POST)',
+                                    'super'   => AUTH_HTTP_PREFIX . '/super (POST)',
+                                    'acl'     => AUTH_HTTP_PREFIX . '/acl (POST)',
+                                    'health'  => AUTH_HTTP_PREFIX . '/health (GET)',
+                                    'metrics' => AUTH_HTTP_PREFIX . '/metrics (GET)',
+                                ],
+                                'message' => 'EdgeAuth is running. Call a specific endpoint.',
+                            ], 200);
+                            break;
+                    }
+                } catch (Throwable $innerE) {
+                    fwrite(STDERR, '[handler-error] ' . $innerE->getMessage() . PHP_EOL);
+                    try {
+                        respondJson($conn, [
+                            'error' => 'internal',
+                            'msg'   => $innerE->getMessage(),
+                        ], 500);
+                    } catch (Throwable) {
+                        // respondJson 也失败了，连接已坏，直接跳出
+                        break;
+                    }
                 }
 
                 if (!$conn->shouldKeepAlive()) {
@@ -157,13 +209,15 @@ while ($running) {
                 }
             }
         } catch (Throwable $e) {
-            fwrite(STDERR, '[conn-fatal] ' . $e->getMessage() . PHP_EOL);
-        } finally {
-            try {
-                $conn->close();
-            } catch (Throwable) {
-                // ignore
+            // 协程顶层兜底（不应该到这里，但保底）
+            $msg = $e->getMessage();
+            if (!str_contains($msg, 'closed')
+                && !str_contains($msg, 'reset')
+                && !str_contains($msg, 'timed out')) {
+                fwrite(STDERR, '[coroutine-fatal] ' . $msg . PHP_EOL);
             }
+        } finally {
+            try { $conn->close(); } catch (Throwable) {}
         }
     });
 }

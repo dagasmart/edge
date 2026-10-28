@@ -22,19 +22,29 @@ return new class extends Migration
                     ->unique()
                     ->comment('用户名');
 
-                $table->string('password', 64)
+                $table->string('password', 100)
                     ->comment('密码 password_hash');
 
-                $table->string('client_id', 64)
+                $table->string('client_id', 100)
                     ->comment('设备 cli|sn');
 
                 $table->boolean('active')
                     ->default(false)
-                    ->comment('是否激活 1/0');
+                    ->comment('是否激活 true/false');
+
+                $table->boolean('is_super')
+                    ->default(false)
+                    ->comment('超级用户 true/false');
 
                 $table->string('service', 32)
                     ->default('api')
                     ->comment('网关类型 nano/mqtt/mqttx/email/sms/api');
+
+                $table->string('secret', 200)
+                    ->comment('HMAC 密钥(明文存储，用于签名)');
+
+                $table->dateTime('secret_change_at')
+                    ->comment('密钥变更时间');
 
                 $table->string('remark', 100)
                     ->nullable()
@@ -42,9 +52,11 @@ return new class extends Migration
 
                 $table->timestamps();
 
+                $table->index('client_id');
                 $table->index('username');
                 $table->index('active');
                 $table->index('service');
+                $table->index(['client_id', 'username']);
                 $table->index(['username', 'active', 'service']);
                 $table->unique(['username', 'service'])->nullsNotDistinct();
             });

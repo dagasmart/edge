@@ -15,7 +15,46 @@ use ReflectionClass;
 
 class EdgeServiceProvider extends ServiceProvider
 {
-    protected $menu = [];
+    protected $menu = [
+        [
+            'parent' => null,
+            'title' => '边缘网关',
+            'url' => '/extension/edge',
+            'url_type' => 1,
+            'icon' => 'carbon:gateway-security',
+        ],
+        [
+            'parent' => '边缘网关',
+            'title' => '网关服务',
+            'url' => '/extension/edge/gateway',
+            'url_type' => 1,
+            'icon' => 'carbon:ibm-cloud-transit-gateway',
+        ],
+        [
+            'parent' => '边缘网关',
+            'title' => '网关认证',
+            'url' => '/extension/edge/authorize',
+            'url_type' => 1,
+            'icon' => 'hugeicons:authorized',
+        ],
+    ];
+
+    protected $auth = [
+        // 网关服务
+        ['name' => '新增', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.gateway', 'abbr' => 'create', 'custom_order' => 1],
+        ['name' => '删除', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.gateway', 'abbr' => 'delete', 'custom_order' => 2],
+        ['name' => '编辑', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.gateway', 'abbr' => 'update', 'custom_order' => 3],
+        ['name' => '查看', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.gateway', 'abbr' => 'showed', 'custom_order' => 4],
+        ['name' => '筛选', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.gateway', 'abbr' => 'search', 'custom_order' => 5],
+        ['name' => '设置', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.gateway', 'abbr' => 'config', 'custom_order' => 6],
+        // 网关认证
+        ['name' => '新增', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.authorize', 'abbr' => 'create', 'custom_order' => 1],
+        ['name' => '删除', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.authorize', 'abbr' => 'delete', 'custom_order' => 2],
+        ['name' => '编辑', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.authorize', 'abbr' => 'update', 'custom_order' => 3],
+        ['name' => '查看', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.authorize', 'abbr' => 'showed', 'custom_order' => 4],
+        ['name' => '筛选', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.authorize', 'abbr' => 'search', 'custom_order' => 5],
+    ];
+
 
     /**
      * @throws Exception

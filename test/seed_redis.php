@@ -3,6 +3,9 @@
 /**
  * EdgeAuth Redis 密钥种子工具
  *
+ * 密钥来源：脚本内置数组（与 DB edge_authorize.secret 保持一致）
+ * secrets.php 已废弃，不再作为密钥来源。
+ *
  * 用法：
  *   php seed_redis.php                        # 正常写入（已存在则跳过）
  *   php seed_redis.php --dry-run              # 只打印，不实际写入
@@ -75,6 +78,7 @@ EdgeAuth Redis 密钥种子工具
   --db <num>        Redis 数据库（默认 2）
   -h, --help        显示此帮助
 
+密钥来源: 脚本内置（与 DB edge_authorize.secret 保持一致）
 示例:
   php seed_redis.php --dry-run
   php seed_redis.php --force --host 10.0.0.5 --port 6379
@@ -83,17 +87,21 @@ HELP;
     exit(0);
 }
 
-// ===================== 读取 secrets.php（统一文件名，复数） =====================
+// ===================== 密钥定义（内置，不依赖任何文件） =====================
+// ★ 格式: 'device_id:username' => 'secret'
+// ★ 必须与 DB edge_authorize 表的 secret 字段保持一致
+// ★ 如需外部化，改为: $secrets = json_decode(shell_exec('php artisan edge:dump-secrets --json'), true);
 
-$secretFile = dirname(__DIR__) . '/config/secrets.php';
-if (!is_file($secretFile)) {
-    fwrite(STDERR, "❌ secrets.php 不存在: {$secretFile}\n");
-    exit(1);
-}
+$secrets = [
+    'device001:user001'        => 'a8f3c9e2m7x1p5q8w2e4r6t9y',
+    'device002:user001'        => 'b2d4f6h8j0k1l3m5n7p8q9r0s',
+    'device003:user002'        => 'c3e5g7i9k2m4o6p8q0s1t2u3v',
+    'gateway01:admin'          => 'd4f6h8j0l2n4p6q8r0t1u3w5y',
+    'bench_client:bench_user'  => 'z9x8c7v6b5n4m3l2k1j0h9g8f7', // ← 已补到 25 bytes
+];
 
-$secrets = include $secretFile;
-if (!is_array($secrets) || empty($secrets)) {
-    fwrite(STDERR, "❌ secrets.php 返回空或格式错误\n");
+if (empty($secrets)) {
+    fwrite(STDERR, "❌ 内置密钥数组为空，脚本异常\n");
     exit(1);
 }
 
@@ -128,7 +136,7 @@ $failed = 0;
 
 foreach ($secrets as $key => $secret) {
     [$clientId, $username] = explode(':', $key, 2);
-    // ★ 关键：Redis key 保留冒号，与 hmac.php 查询格式一致
+    // ★ 关键：Redis key 保留冒号，与 hmac.php / EdgeAuthorizeService 查询格式一致
     $redisKey = "device:secret:{$clientId}:{$username}";
 
     // 检查是否已存在

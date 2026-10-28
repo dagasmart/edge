@@ -28,6 +28,7 @@ Route::group([
 
     // resource必须放最后面
     $router->resource('edge/gateway', Controllers\EdgeGatewayController::class);
+    $router->resource('edge/authorize', Controllers\EdgeAuthorizeController::class);
 });
 
 // 免登录无限制

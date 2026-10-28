@@ -5,73 +5,68 @@ declare(strict_types=1);
 use Swow\Channel;
 use Swow\Coroutine;
 
-if (!defined('LOCAL_CACHE_TTL')) {
-    define('LOCAL_CACHE_TTL', 60);
-}
-
-const LOCAL_CACHE_NULL_MARKER = '__NULL__';
+/* =========================================================
+ * HMAC 认证入口（Swow 侧）
+ * ========================================================= */
 
 function hmacAuthenticate(string $clientId, string $username, string $password): bool
 {
-    $parts = explode('|', $password, 3);
-    if (count($parts) !== 3) {
+    debugLog('ENTER clientId=[' . $clientId . '] username=[' . $username . '] pw_len=' . strlen($password));
+
+    $l1Key = 'secret:' . $clientId . ':' . $username;
+
+    $result = \DagaSmart\Edge\Support\HmacValidator::verify(
+        $clientId,
+        $username,
+        $password,
+
+        // ★ secretResolver：自己管缓存，只用固定 key，不做 old 前缀猜测
+        function (string $key) use ($l1Key, $clientId, $username): ?string {
+            // 只响应 Validator 拼好的正式 key，忽略任何 old: 前缀的调用
+            $expect = 'device:secret:' . $clientId . ':' . $username;
+            if ($key !== $expect) {
+                debugLog('secretResolver IGNORED key=[' . $key . '] (not canonical)');
+                return null;
+            }
+            $secret = localCacheGet($l1Key);
+            if (is_string($secret) && $secret !== '') {
+                return $secret;
+            }
+            $secret = redisGet($expect);
+            if (is_string($secret) && $secret !== '') {
+                localCacheSet($l1Key, $secret, LOCAL_CACHE_TTL);
+                debugLog('secretResolver CACHED clientId=[' . $clientId . ']');
+            }
+            return $secret;
+        },
+
+        // ★ 禁用 Validator 内部 L1：永远 miss，让它必须调 secretResolver
+        fn(string $key) => null,
+
+        // ★ 禁用 Validator 内部写缓存：防止它写 NULL_MARKER
+        fn(string $key, $value, int $ttl) => null,
+
+        defined('TIME_DRIFT') ? TIME_DRIFT : 300,
+        LOCAL_CACHE_TTL
+    );
+
+    if (($result['valid'] ?? false) === false) {
+        attachAuthReason($result['reason'] ?? 'unknown');
+        debugLog('REJECT: ' . ($result['reason'] ?? 'unknown'));
         return false;
     }
 
-    [$b64Sign, $timestamp, $nonce] = array_map('trim', $parts);
+    $nonce     = $result['nonce'];
+    $timestamp = $result['timestamp'];
+    debugLog('validator PASS → nonce=[' . $nonce . '] timestamp=[' . $timestamp . ']');
 
-    // ✅ URL-safe base64 反向替换
-    $sign = base64_decode(strtr($b64Sign, '-_~', '+/='), true);
-    if ($sign === false || !ctype_digit($timestamp)) {
-        return false;
-    }
-
-    $drift = defined('TIME_DRIFT') ? TIME_DRIFT : 120;
-    if (abs((int) $timestamp - time()) > $drift) {
-        return false;
-    }
-
-    $payload = $clientId . '|' . $username . '|' . $timestamp . '|' . $nonce;
-
-    // ---------- secret 获取 + 空值缓存 ----------
-    $cacheKey = 'secret:' . $clientId . ':' . $username;
-    $secret = localCacheGet($cacheKey);
-
-    if ($secret === null) {
-        $secret = redisGet('device:secret:' . $clientId . ':' . $username);
-        if (!is_string($secret) || $secret === '') {
-            $secret = redisGet('device:secret:old:' . $clientId . ':' . $username);
-        }
-        if (is_string($secret) && $secret !== '') {
-            localCacheSet($cacheKey, $secret, LOCAL_CACHE_TTL);
-        } else {
-            localCacheSet($cacheKey, LOCAL_CACHE_NULL_MARKER, 30);
-        }
-    } elseif ($secret === LOCAL_CACHE_NULL_MARKER) {
-        return false;
-    }
-
-    if (!is_string($secret) || $secret === '') {
-        return false;
-    }
-
-    // ---------- HMAC 校验 ----------
-    $expect = hash_hmac('sha256', $payload, $secret, true);
-    if (!hash_equals($expect, $sign)) {
-        return false;
-    }
-
-    // ---------- 并发吊销 + nonce 防重放 ----------
     $chR = new Channel(1);
     $chN = new Channel(1);
 
     Coroutine::run(static function () use ($clientId, $chR): void {
         try {
-            $r = (bool) redisExists('device:revoke:' . $clientId);
-            $chR->push($r, 2000);          // ✅ int 毫秒
-        } catch (Throwable) {
-            $chR->push(false, 2000);
-        }
+            $chR->push((bool) redisExists('device:revoke:' . $clientId), 2000);
+        } catch (Throwable) { $chR->push(false, 2000); }
     });
 
     Coroutine::run(static function () use ($clientId, $username, $nonce, $chN): void {
@@ -79,32 +74,59 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
             $nk = 'device:nonce:' . $clientId . ':' . $username;
             $existing = redisGet($nk);
             if ($existing === $nonce) {
-                $chN->push(false, 2000); // ✅ 修复：已存在 = 重放 = 拒绝
-            } else {
-                $nonceTtl = defined('TIME_DRIFT') ? TIME_DRIFT * 2 : 300;
-                $chN->push(redisSetNxEx($nk, $nonce, $nonceTtl), 2000);
+                debugLog('nonce REPLAY detected for ' . $nk);
+                $chN->push(false, 2000);
+                return;
             }
-        } catch (Throwable) {
-            $chN->push(false, 2000);
-        }
+            // ★ 用覆盖写替换 SET NX，key 存在且 nonce 不同也能成功
+            $ttl = (defined('TIME_DRIFT') ? TIME_DRIFT : 300) * 2;
+            if ($existing !== null) {
+                redisDel($nk);
+            }
+            $ok = redisSetex($nk, $ttl, $nonce);
+            debugLog('nonce WRITE nk=[' . $nk . '] ok=' . ($ok ? 'true' : 'false'));
+            $chN->push($ok, 2000);
+        } catch (Throwable) { $chN->push(false, 2000); }
     });
 
     try {
-        $r = $chR->pop(2000);               // ✅ int 毫秒
+        $r = $chR->pop(2000);
         $n = $chN->pop(2000);
     } catch (Throwable) {
-        fwrite(STDERR, '[hmac] sub-coroutine incomplete' . PHP_EOL);
-        return false;
-    }
-
-    if ($r === null || $n === null) {
-        fwrite(STDERR, '[hmac] sub-coroutine timeout' . PHP_EOL);
+        attachAuthReason('sub-coroutine timeout');
         return false;
     }
 
     if ($r || !$n) {
+        attachAuthReason($r ? 'revoked' : 'nonce_replay_or_set_failed');
+        debugLog('REJECT: revoked=' . var_export($r, true) . ' nonce_ok=' . var_export($n, true));
         return false;
     }
 
+    debugLog('ACCEPT: ' . $clientId);
     return true;
+}
+
+/* =========================================================
+ * 协程上下文工具
+ * ========================================================= */
+
+function attachAuthReason(string $reason): void
+{
+    if (!class_exists('Swow\Coroutine')) {
+        return;
+    }
+    $cid = \Swow\Coroutine::getCurrent()->getId();
+    $GLOBALS['_auth_reason'][$cid] = $reason;
+}
+
+function detachAuthReason(): string
+{
+    if (!class_exists('Swow\Coroutine')) {
+        return '';
+    }
+    $cid = \Swow\Coroutine::getCurrent()->getId();
+    $reason = $GLOBALS['_auth_reason'][$cid] ?? '';
+    unset($GLOBALS['_auth_reason'][$cid]);
+    return $reason;
 }
