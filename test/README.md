@@ -142,3 +142,96 @@ php extensions/edge/test/verify_simple.php
 | 2026-10-28 | 文件名统一：secret.php → secrets.php（三处同步） |
 | 2026-10-28 | secrets.php 注释中错误的短横线说明更正为冒号 |
 | 2026-10-28 | 新增强制重载（Kill + 重启）操作文档 |
+
+
+
+### 实时健康巡检（带异常告警）
+
+巡检脚本位于 `extensions/edge/bash/edge-health.sh`，对 health / metrics 端点做持续探测，异常时通过 syslog + 可选 webhook 告警，服务恢复时自动通知。
+
+**目录结构更新：**
+
+\`\`\`
+extensions/edge/
+├── bash/
+│   ├── deploy.sh
+│   ├── start-cluster.sh
+│   ├── stop-cluster.sh
+│   ├── reload-cluster.sh
+│   └── edge-health.sh          # ← 健康巡检 + 异常告警
+├── config/
+│   └── secrets.php
+└── test/
+├── verify_simple.php
+└── seed_redis.php
+\`\`\`
+
+**快速使用：**
+
+\`\`\`bash
+# 单次检查（调试用）
+bash extensions/edge/bash/edge-health.sh
+
+# 守护模式（每 5 秒巡检，后台运行）
+bash extensions/edge/bash/edge-health.sh --daemon --interval 5 &
+
+# 或 nohup 持久化
+nohup bash extensions/edge/bash/edge-health.sh --daemon --interval 5 >/dev/null 2>&1 &
+\`\`\`
+
+**告警逻辑：**
+
+| 场景 | 触发条件 | 动作 |
+|------|---------|------|
+| HTTP 非 200 | health 返回非 200 | 记录 ERROR，累计失败 |
+| 连续失败 3 次 | 3 次连续 check 失败 | 发 CRITICAL 告警 |
+| Redis 池水位低 | 空闲 < 20% | 发 WARNING 告警 |
+| 设备限流突增 | 单次增量 ≥ 10 | 发 WARNING 告警 |
+| Redis 枯竭 | exhausted > 0 | 发 WARNING 告警 |
+| 端口不监听 | ss 检查 :9503 不存在 | 记录 ERROR |
+| 恢复通知 | 从失败回到正常 | 发 INFO 恢复通知 |
+
+**告警通道配置：**
+
+\`\`\`bash
+# syslog（默认开启，查看方式）
+journalctl -t edge-health -f
+# 或
+grep edge-health /var/log/syslog
+
+# Webhook（钉钉 / 企微 / Slack）
+export WEBHOOK_URL="https://oapi.dingtalk.com/robot/send?access_token=xxx"
+ALERT_WEBHOOK=true bash extensions/edge/bash/edge-health.sh --daemon
+
+# 关闭 stderr 输出（纯后台运行）
+ALERT_STDERR=false bash extensions/edge/bash/edge-health.sh --daemon
+\`\`\`
+
+# 巡检 + 冒烟一起跑
+bash extensions/edge/bash/edge-health.sh && php extensions/edge/test/verify_simple.php
+
+**日志与状态文件：**
+
+| 文件 | 说明 |
+|------|------|
+| `/var/log/edge-auth/health-check.log` | 巡检日志（>50MB 自动轮转） |
+| `/var/log/edge-auth/health-check.state` | 连续失败计数、上次告警时间等状态 |
+
+**配合 watch 实时观察（开发/排障用）：**
+
+\`\`\`bash
+# 实时看 health 端点
+watch -n 1 -d 'curl -s --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/health | jq .'
+
+# health + metrics 一起盯
+watch -n 1 -d '
+echo "=== HEALTH ===";
+curl -s --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/health | jq .;
+echo "=== METRICS ===";
+curl -s --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/metrics | jq "{global: .global_concurrency, device_exceeded: .device_concurrency_exceeded, auth_ok: .auth_ok, auth_fail: .auth_fail}";
+'
+\`\`\`
+
+**systemd 集成（可选）：**
+
+如需开机自启，可将巡检注册为 systemd service（与 `edge-auth.service` 独立），避免巡检脚本异常退出导致认证服务受影响。
