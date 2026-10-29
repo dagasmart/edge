@@ -9,7 +9,7 @@ use Swow\Socket;
 require_once __DIR__.'/bootstrap.php'; // 第一行引入
 // 后面的 define 检查会自然跳过，因为 bootstrap 已经有 define
 
-// ---------- 配置常量 ----------
+// ---------- 配置常量 （bootstrap.php已配置全局常量声明，以下define部分可删可留）----------
 if (! defined('AUTH_PORT')) {
     define('AUTH_PORT', 9503);
 }
@@ -53,7 +53,6 @@ if (! defined('TIME_DRIFT')) {
 if (! defined('BACKLOG')) {
     define('BACKLOG', 4096);
 }
-
 // 路由基准前缀
 if (! defined('AUTH_HTTP_PREFIX')) {
     define('AUTH_HTTP_PREFIX', '/admin-api/extension/edge/gateway');
