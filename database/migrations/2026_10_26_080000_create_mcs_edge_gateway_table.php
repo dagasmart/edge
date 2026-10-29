@@ -41,7 +41,8 @@ return new class extends Migration
                     ->nullable()
                     ->comment('描述');
 
-                $table->timestamps();
+                $table->timestamp('created_at')->useCurrent();
+                $table->timestamp('updated_at')->useCurrent();
 
                 $table->index('gateway');
                 $table->index('code');
