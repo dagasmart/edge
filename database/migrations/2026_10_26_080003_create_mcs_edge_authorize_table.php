@@ -38,7 +38,7 @@ return new class extends Migration
 
                 $table->string('service', 32)
                     ->default('api')
-                    ->comment('网关类型 nano/mqtt/mqttx/email/sms/api');
+                    ->comment('网关类型 nano/mqtt/emqx/email/sms/api');
 
                 $table->string('secret', 200)
                     ->comment('HMAC 密钥(明文存储，用于签名)');

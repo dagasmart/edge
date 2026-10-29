@@ -8,4 +8,23 @@ namespace DagaSmart\Edge\Models;
 class EdgeGateway extends Model
 {
     protected $table = 'mcs_edge_gateway';
+
+    protected $fillable = [
+        'gateway',
+        'code',
+        'ip',
+        'port',
+        'ca',
+        'remark',
+    ];
+
+    protected $casts = [
+        'port' => 'integer',
+        'created_at' => 'datetime',
+        'updated_at' => 'datetime',
+    ];
+
+    public $timestamps = true;
+
+
 }
