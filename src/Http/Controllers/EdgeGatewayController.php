@@ -18,7 +18,6 @@ class EdgeGatewayController extends AdminController
             ->filterTogglable(false)
             ->headerToolbar([
                 $this->createButton('dialog', '250'),
-                ...$this->baseHeaderToolBar(),
             ])
             ->autoGenerateFilter()
             ->affixHeader()
@@ -55,10 +54,57 @@ class EdgeGatewayController extends AdminController
                 amis()->TableColumn('updated_at', '更新时间')
                     ->type('datetime')
                     ->width(150),
-                $this->rowActions(true, '250')
+                $this->rowActions([
+                    amis()->LinkAction()
+                        ->label('设置')
+                        ->level('link')
+                        ->actionType('drawer')
+                        ->drawer(
+                            amis()->Drawer()
+                                ->title(false)
+                                ->closeOnEsc()
+                                ->closeOnOutside()
+                                ->body(
+                                    amis()->Service()->api(admin_url('task-schedule/${id}/preview'))
+                                        ->interval(30000)
+                                        ->silentPolling()
+                                        ->body([
+                                            amis()->Tabs()->tabsMode('strong')->tabs([
+                                                amis()->Tab()->title('网关设置')->icon('menu')->body([
+                                                    amis()->TextControl('gateway', '网关名称')
+                                                        ->clearable()
+                                                        ->size('md')
+                                                        ->required(),
+                                                    amis()->SelectControl('code', '标识code')
+                                                        ->options([
+                                                            ['label' => 'NANO', 'value' => 'nano'],
+                                                            ['label' => 'MQTT', 'value' => 'mqtt'],
+                                                            ['label' => 'EMQX', 'value' => 'emqx'],
+                                                        ])
+                                                        ->clearable()
+                                                        ->size('md')
+                                                        ->required(),
+                                                    amis()->TextControl('ip', '域名ip')
+                                                        ->clearable()
+                                                        ->size('md')
+                                                        ->required(),
+                                                    amis()->NumberControl('port', '端口port')
+                                                        ->min(80)
+                                                        ->max(49150)
+                                                        ->size('md')
+                                                        ->required(),
+                                                ]),
+                                            ]),
+                                        ]),
+                                ),
+                        ),
+                    $this->rowShowButton('drawer'),
+                    $this->rowEditButton('drawer'),
+                    $this->rowDeleteButton(),
+                ])
                     ->set('align', 'center')
                     ->set('fixed', 'right')
-                    ->set('width', 180),
+                    ->set('width', 200),
             ]);
 
         return $this->baseList($crud);
@@ -68,7 +114,7 @@ class EdgeGatewayController extends AdminController
     {
         return $this->baseForm()->body([
             amis()->Tabs()->tabsMode('line')->tabs([
-                amis()->Tab()->title('网关主体')->icon('menu')->body([
+                amis()->Tab()->title('网关信息')->icon('menu')->body([
                     amis()->TextControl('gateway', '网关名称')
                         ->clearable()
                         ->size('md')
@@ -92,30 +138,7 @@ class EdgeGatewayController extends AdminController
                         ->size('md')
                         ->required(),
                 ]),
-                amis()->Tab()->title('网关设置')->icon('menu')->body([
-                    amis()->TextControl('gateway', '网关名称')
-                        ->clearable()
-                        ->size('md')
-                        ->required(),
-                    amis()->SelectControl('code', '标识code')
-                        ->options([
-                            ['label' => 'NANO', 'value' => 'nano'],
-                            ['label' => 'MQTT', 'value' => 'mqtt'],
-                            ['label' => 'EMQX', 'value' => 'emqx'],
-                        ])
-                        ->clearable()
-                        ->size('md')
-                        ->required(),
-                    amis()->TextControl('ip', '域名ip')
-                        ->clearable()
-                        ->size('md')
-                        ->required(),
-                    amis()->NumberControl('port', '端口port')
-                        ->min(80)
-                        ->max(49150)
-                        ->size('md')
-                        ->required(),
-                ]),
+
             ]),
         ]);
     }
@@ -124,7 +147,7 @@ class EdgeGatewayController extends AdminController
     {
         return $this->baseDetail()->body([
             amis()->Tabs()->tabsMode('line')->tabs([
-                amis()->Tab()->title('网关主体')->icon('menu')->body([
+                amis()->Tab()->title('网关信息')->icon('menu')->body([
                     amis()->TextControl('gateway', '网关名称')
                         ->clearable()
                         ->size('md')

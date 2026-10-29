@@ -74,10 +74,12 @@ if ($currentGatewayId !== null) {
 // ---------- 3. 从数据库加载（Laravel 可用时） ----------
 $dbValues = [];
 $dbAvailable = false;
+$dbSchema = 'master';
+
 
 try {
     if (class_exists(\Illuminate\Support\Facades\DB::class)) {
-        $rows = \Illuminate\Support\Facades\DB::connection('master')
+        $rows = \Illuminate\Support\Facades\DB::connection($dbSchema)
             ->table('mcs_edge_gateway_config')
             ->where('is_active', true)
             ->orderByRaw('gateway_id IS NULL ASC') // 全局在前，专属覆盖
