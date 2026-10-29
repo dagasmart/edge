@@ -83,6 +83,8 @@ sudo fuser -k 9503/tcp 9504/tcp 9505/tcp 9506/tcp 2>/dev/null || true
 pgrep -fa "edge:auth-swow" || echo "✅ 无残留进程"
 ss -tlnp | grep -E '950[3-6]' || echo "✅ 端口全释放"
 
+ss -tlnp | grep 9503
+
 # 4. 重载 systemd
 sudo systemctl daemon-reload
 
@@ -231,6 +233,55 @@ echo "=== METRICS ===";
 curl -s --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/metrics | jq "{global: .global_concurrency, device_exceeded: .device_concurrency_exceeded, auth_ok: .auth_ok, auth_fail: .auth_fail}";
 '
 \`\`\`
+
+实时动态看 health 端点，直接用 watch + curl + jq 就行，不用写复杂脚本。
+
+1. 最简：每 1 秒看 health 完整 JSON
+
+   watch -n 1 -d 'curl -s --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/health | jq .'
+   -n 1：每秒刷新
+   -d：高亮变化字段（status 切换、redis.free 变动会反白）
+   jq .：格式化输出
+2. 只看关键字段（不刷屏）
+
+   watch -n 1 'curl -s --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/health | jq -r "(.status) + \" | redis_free=\" + (.redis.free|tostring) + \" | cache=\" + (.cache.size|tostring) + \" | \" + (now|strftime(\"%H:%M:%S\"))"'
+
+输出类似：
+
+纯文本
+ok | redis_free=256 | cache=3 | 09:49:12
+3. 顺带把 metrics 也一起盯（推荐）
+
+   watch -n 1 -d '
+   echo "=== HEALTH ===";
+   curl -s --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/health | jq .;
+   echo "=== METRICS ===";
+   curl -s --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/metrics | jq "{global: .global_concurrency, device_exceeded: .device_concurrency_exceeded, auth_ok: .auth_ok, auth_fail: .auth_fail, redis_exhausted: .redis_pool_exhausted}";
+   '
+
+这样一眼能看到：
+
+服务是否活（health.status）
+信号量水位（global_concurrency.used/free）
+认证成功/失败计数
+设备限流触发次数
+Redis 池是否枯竭
+4. 只盯“活着没”+ 延迟（轻量）
+
+   watch -n 1 'curl -s -o /dev/null -w "code=%{http_code} time=%{time_total}s\n" --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/health'
+
+code=000 就是服务挂了或连不上。
+
+5. 后台持续记录到日志（排障用）
+
+   while true; do
+   ts=$(date +%F_%T)
+   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:9503/admin-api/extension/edge/gateway/health)
+   echo "$ts health=$code"
+   sleep 1
+   done
+
+想同时记 metrics 就再 curl 一次追加进去。
 
 **systemd 集成（可选）：**
 

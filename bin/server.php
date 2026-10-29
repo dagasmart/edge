@@ -6,6 +6,9 @@ use Swow\Coroutine;
 use Swow\Psr7\Server\Server;
 use Swow\Socket;
 
+require_once __DIR__.'/bootstrap.php'; // 第一行引入
+// 后面的 define 检查会自然跳过，因为 bootstrap 已经有 define
+
 // ---------- 配置常量 ----------
 if (! defined('AUTH_PORT')) {
     define('AUTH_PORT', 9503);
