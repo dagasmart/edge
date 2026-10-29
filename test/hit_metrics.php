@@ -1,4 +1,6 @@
 <?php
+declare(strict_types=1);
+
 $fp = @fsockopen('127.0.0.1', 9503, $errno, $errstr, 3);
 if (!$fp) {
     echo "FAIL: {$errstr}\n";

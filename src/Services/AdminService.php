@@ -1,5 +1,5 @@
 <?php
-
+declare(strict_types=1);
 namespace DagaSmart\Edge\Services;
 
 use DagaSmart\BizAdmin\Services\AdminService as BaseAdminService;

@@ -1,5 +1,4 @@
 <?php
-
 declare(strict_types=1);
 
 use Swow\Psr7\Message\ServerRequest;

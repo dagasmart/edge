@@ -1,6 +1,5 @@
 <?php
 declare(strict_types=1);
-
 namespace DagaSmart\Edge\Facades;
 
 use DagaSmart\Edge\Services\EdgeAuthSignerService;

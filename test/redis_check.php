@@ -1,4 +1,6 @@
 <?php
+declare(strict_types=1);
+
 $redis = new Redis();
 $redis->connect('127.0.0.1', 16379);
 $redis->auth('uApDVQD7');

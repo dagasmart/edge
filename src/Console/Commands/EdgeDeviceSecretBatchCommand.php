@@ -1,6 +1,5 @@
 <?php
 declare(strict_types=1);
-
 namespace DagaSmart\Edge\Console\Commands;
 
 use DagaSmart\Edge\Facades\EdgeAuth;

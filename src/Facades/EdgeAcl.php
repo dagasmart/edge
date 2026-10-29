@@ -1,7 +1,6 @@
 <?php
 declare(strict_types=1);
-
-namespace App\Facades;
+namespace DagaSmart\Edge\Facades;
 
 use DagaSmart\Edge\Services\EdgeAclEngineService;
 use Illuminate\Support\Facades\Facade;

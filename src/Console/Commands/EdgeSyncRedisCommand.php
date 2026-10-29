@@ -1,5 +1,5 @@
 <?php
-
+declare(strict_types=1);
 namespace DagaSmart\Edge\Console\Commands;
 
 use DagaSmart\Edge\Models\EdgeAuthorize;
@@ -44,7 +44,7 @@ class EdgeSyncRedisCommand extends Command
         $service = $this->option('service');
 
         $this->info('╔══════════════════════════════════════════╗');
-        $this->info('║       EdgeAuth → Redis 全量同步         ║');
+        $this->info('║       EdgeAuth → Redis 全量同步           ║');
         $this->info('╚══════════════════════════════════════════╝');
         $this->newLine();
 

@@ -1,8 +1,6 @@
 <?php
-
 declare(strict_types=1);
-
-namespace App\Jobs;
+namespace DagaSmart\Edge\Jobs;
 
 use Carbon\CarbonInterface;
 use DagaSmart\Edge\Models\EdgeDataStream;

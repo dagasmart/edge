@@ -1,5 +1,6 @@
 #!/usr/bin/env php
 <?php
+declare(strict_types=1);
 
 /**
  * EdgeAuth 功能验证脚本（Redis 密钥源，与 seed_redis.php 对齐）
@@ -7,12 +8,37 @@
  * Key 格式：device:secret:{clientId}:{username}
  * 协议：password = b64Sign|timestamp|nonce
  *
- * 用法：php extensions/edge/test/verify_simple.php [base_url]
+ * 用法：php extensions/edge/test/verify_simple.php [base_url] [--timeout <sec>]
+ *
+ *   base_url   网关基地址（默认 http://127.0.0.1:9503/admin-api/extension/edge/gateway）
+ *   --timeout  统一超时秒数，同时作用于 Redis 连接与 cURL（默认 3.0）
+ *
+ * 示例：
+ *   php verify_simple.php
+ *   php verify_simple.php http://127.0.0.1:9503/admin-api/extension/edge/gateway --timeout 5.0
  */
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
 
-$baseUrl = $argv[1] ?? 'http://127.0.0.1:9503/admin-api/extension/edge/gateway';
+// ---------- 参数解析（位置参数 + 命名参数） ----------
+
+$options = [
+    'base-url' => 'http://127.0.0.1:9503/admin-api/extension/edge/gateway',
+    'timeout'  => 3.0,
+];
+
+// 第一个非命名参数视为 base_url
+for ($i = 1; $i < $argc; $i++) {
+    if ($argv[$i] === '--timeout') {
+        $options['timeout'] = (float)($argv[++$i] ?? 3.0);
+    } elseif (strpos($argv[$i], '--') !== 0) {
+        // 第一个裸参数 = base_url
+        $options['base-url'] = $argv[$i];
+    }
+}
+
+$baseUrl = $options['base-url'];
+$timeout = $options['timeout'];
 
 // ---------- Redis 配置（与 seed_redis.php / server.php 一致） ----------
 const REDIS_HOST = '127.0.0.1';
@@ -22,44 +48,58 @@ const REDIS_DB = 2;
 const SECRET_PREFIX = 'device:secret:'; // ← 跟 seed_redis.php 对齐
 
 // ---------- 工具函数 ----------
-function httpPost(string $url, array $fields): array
+function httpPost(string $url, array $fields, float $timeout): array
 {
     $ch = curl_init($url);
     $json = json_encode($fields);
+    $t = (int) ceil($timeout);
     curl_setopt_array($ch, [
         CURLOPT_POST => true,
         CURLOPT_POSTFIELDS => $json,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT => 5,
+        CURLOPT_TIMEOUT => $t,
+        CURLOPT_CONNECTTIMEOUT => $t,
         CURLOPT_HTTPHEADER => ['Accept: application/json', 'Content-Type: application/json'],
     ]);
     $body = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $err = curl_error($ch);
     curl_close($ch);
-    if ($err) {
+
+    if ($err || $body === false) {
         return ['code' => 0, 'body' => "CURL ERROR: {$err}"];
     }
 
     return ['code' => $code, 'body' => trim($body)];
 }
 
-function httpGet(string $url): array
+function httpGet(string $url, float $timeout): array
 {
     $ch = curl_init($url);
-    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 3]);
+    $t = (int) ceil($timeout);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT => $t,
+        CURLOPT_CONNECTTIMEOUT => $t,
+        CURLOPT_HTTPHEADER => ['Accept: application/json'],
+    ]);
     $body = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
     curl_close($ch);
+
+    if ($err || $body === false) {
+        return ['code' => 0, 'body' => "CURL ERROR: {$err}"];
+    }
 
     return ['code' => $code, 'body' => trim($body)];
 }
 
-function loadSecretsFromRedis(): array
+function loadSecretsFromRedis(float $timeout): array
 {
     $redis = new Redis;
     try {
-        $redis->connect(REDIS_HOST, REDIS_PORT, 2);
+        $redis->connect(REDIS_HOST, REDIS_PORT, $timeout);
         $redis->auth(REDIS_PASSWORD);
         $redis->select(REDIS_DB);
         $redis->ping();
@@ -105,7 +145,7 @@ function buildPassword(string $clientId, string $username, string $secret): stri
 // ---------- 主流程 ----------
 echo '📦 从 Redis db='.REDIS_DB.' 加载设备密钥（key 格式: '.SECRET_PREFIX."*）\n\n";
 
-$secrets = loadSecretsFromRedis();
+$secrets = loadSecretsFromRedis($timeout);
 
 if (empty($secrets)) {
     echo '❌ Redis 里没有找到任何 '.SECRET_PREFIX."* 密钥\n";
@@ -115,7 +155,7 @@ if (empty($secrets)) {
 
 echo "🎯 EdgeAuth Verify | Base: {$baseUrl}\n";
 echo "   协议: b64Sign|timestamp|nonce | HMAC-SHA256\n";
-echo '   加载了 '.count($secrets)." 个设备密钥\n\n";
+echo '   加载了 '.count($secrets)." 个设备密钥 | 超时: {$timeout}s\n\n";
 
 $passed = 0;
 $failed = 0;
@@ -136,20 +176,20 @@ function test(string $name, bool $condition, string $detail = ''): void
 
 // ---------- Test 1: /health ----------
 echo "━━━ Test 1: /health ━━━\n";
-$res = httpGet($baseUrl.'/health');
+$res = httpGet($baseUrl.'/health', $timeout);
 test('/health 返回 200', $res['code'] === 200, "got {$res['code']}");
 test('/health 响应非空', ! empty($res['body']), 'empty body');
 echo "\n";
 
 // ---------- Test 2: /metrics ----------
 echo "━━━ Test 2: /metrics ━━━\n";
-$res = httpGet($baseUrl.'/metrics');
+$res = httpGet($baseUrl.'/metrics', $timeout);
 test('/metrics 返回 200', $res['code'] === 200, "got {$res['code']}");
 echo "\n";
 
 // ---------- Test 3: 空字段 ----------
 echo "━━━ Test 3: 空字段认证拒绝 ━━━\n";
-$res = httpPost($baseUrl.'/auth', ['clientid' => '', 'username' => '', 'password' => '']);
+$res = httpPost($baseUrl.'/auth', ['clientid' => '', 'username' => '', 'password' => ''], $timeout);
 test('空字段 → 401', $res['code'] === 401, "got {$res['code']}");
 echo "\n";
 
@@ -159,7 +199,7 @@ $fakeId = 'nonexistent_'.uniqid();
 $res = httpPost($baseUrl.'/auth', [
     'clientid' => $fakeId, 'username' => 'nobody',
     'password' => 'fakesig|'.time().'|'.bin2hex(random_bytes(4)),
-]);
+], $timeout);
 test('不存在设备 → 401', $res['code'] === 401, "got {$res['code']}");
 echo "\n";
 
@@ -174,7 +214,7 @@ $fakeB64 = rtrim(strtr(base64_encode(hash_hmac('sha256', $fakePayload, 'wrong_se
 $res = httpPost($baseUrl.'/auth', [
     'clientid' => $clientId, 'username' => $username,
     'password' => $fakeB64.'|'.$fakeTs.'|'.$fakeNonce,
-]);
+], $timeout);
 test('错误密钥 → 401', $res['code'] === 401, "got {$res['code']}");
 echo "\n";
 
@@ -187,7 +227,7 @@ foreach ($secrets as $key => $secret) {
     $password = buildPassword($clientId, $username, $secret);
     $res = httpPost($baseUrl.'/auth', [
         'clientid' => $clientId, 'username' => $username, 'password' => $password,
-    ]);
+    ], $timeout);
     test("{$key} → 200", $res['code'] === 200,
         "got {$res['code']}, body: ".substr($res['body'], 0, 80));
 }
@@ -208,7 +248,7 @@ $oldPwd = $oldB64.'|'.$oldTs.'|'.$oldNonce;
 
 $res = httpPost($baseUrl.'/auth', [
     'clientid' => $clientId, 'username' => $username, 'password' => $oldPwd,
-]);
+], $timeout);
 test('过期时间戳 → 401（时间窗口 ±300s）', $res['code'] === 401, "got {$res['code']}");
 echo "\n";
 

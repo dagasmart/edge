@@ -1,5 +1,5 @@
 <?php
-// bootstrap.php
+declare(strict_types=1);
 
 // ---------- 1. 加载 .env ----------
 $envFile = __DIR__ . '/../.env';

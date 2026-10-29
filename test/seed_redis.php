@@ -1,5 +1,7 @@
 #!/usr/bin/env php
 <?php
+declare(strict_types=1);
+
 /**
  * EdgeAuth Redis 密钥种子工具
  *
@@ -11,6 +13,7 @@
  *   php seed_redis.php --dry-run              # 只打印，不实际写入
  *   php seed_redis.php --force                # 强制覆盖已存在的密钥
  *   php seed_redis.php --host 127.0.0.1 --port 16379 --db 2 --password xxx
+ *   php seed_redis.php --timeout 5.0          # 自定义 Redis 连接超时（秒，支持小数）
  *
  * Redis key 格式：device:secret:{clientid}:{username}   ← 冒号，不替换
  *
@@ -32,6 +35,7 @@ $options = [
     'port'      => 16379,
     'password'  => 'uApDVQD7',
     'db'        => 2,
+    'timeout'   => 2.0,   // Redis 连接超时（秒，支持小数）
     'help'      => false,
 ];
 
@@ -56,6 +60,9 @@ for ($i = 1; $i < $argc; $i++) {
         case '--db':
             $options['db'] = (int)($argv[++$i] ?? $options['db']);
             break;
+        case '--timeout':
+            $options['timeout'] = (float)($argv[++$i] ?? 2.0);
+            break;
         case '-h':
         case '--help':
             $options['help'] = true;
@@ -76,12 +83,14 @@ EdgeAuth Redis 密钥种子工具
   --port <port>     Redis 端口（默认 16379）
   --password <pwd>  Redis 密码（默认 uApDVQD7）
   --db <num>        Redis 数据库（默认 2）
+  --timeout <sec>   Redis 连接超时秒数，支持小数（默认 2.0）
   -h, --help        显示此帮助
 
 密钥来源: 脚本内置（与 DB edge_authorize.secret 保持一致）
 示例:
   php seed_redis.php --dry-run
   php seed_redis.php --force --host 10.0.0.5 --port 6379
+  php seed_redis.php --timeout 5.0
 
 HELP;
     exit(0);
@@ -107,11 +116,11 @@ if (empty($secrets)) {
 
 // ===================== 连接 Redis =====================
 
-echo "🔌 连接 Redis {$options['host']}:{$options['port']} db={$options['db']} ...\n";
+echo "🔌 连接 Redis {$options['host']}:{$options['port']} db={$options['db']} (timeout={$options['timeout']}s) ...\n";
 
 $redis = new Redis();
 try {
-    $redis->connect($options['host'], $options['port'], 2);
+    $redis->connect($options['host'], $options['port'], $options['timeout']);
     if ($options['password'] !== '') {
         $redis->auth($options['password']);
     }
