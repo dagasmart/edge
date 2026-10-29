@@ -314,10 +314,15 @@ function concurrencyRelease(): void
 function concurrencyStats(): array
 {
     global $globalConcurrency, $concurrencyMax;
+    // ★ 防御：$globalConcurrency 未初始化时返回零值结构
     if ($globalConcurrency === null) {
         return ['max' => $concurrencyMax, 'used' => 0, 'free' => $concurrencyMax];
     }
-    $free = $globalConcurrency->getLength();
+    try {
+        $free = $globalConcurrency->getLength();
+    } catch (Throwable) {
+        $free = 0;
+    }
 
     return [
         'max' => $concurrencyMax,
@@ -349,10 +354,16 @@ function deviceConcurrencyAcquire(string $clientId): ?string
     global $__edge_device_semaphores, $__edge_device_sem_max;
 
     if (! isset($__edge_device_semaphores[$clientId])) {
-        $ch = new Channel($__edge_device_sem_max);
-        for ($i = 0; $i < $__edge_device_sem_max; $i++) {
-            $ch->push(1, 1);
+        try {
+            $ch = new Channel($__edge_device_sem_max);
+            for ($i = 0; $i < $__edge_device_sem_max; $i++) {
+                $ch->push(1, 1);
+            }
+        } catch (Throwable $e) {
+            fwrite(STDERR, '[device-acquire] channel create failed: '.$e->getMessage().PHP_EOL);
+            return null;
         }
+        // ★ 校验 Channel 实例有效才写入桶
         $__edge_device_semaphores[$clientId] = [
             'channel' => $ch,
             'last_used' => time(),
@@ -363,7 +374,13 @@ function deviceConcurrencyAcquire(string $clientId): ?string
     // 这样 cleanup 的语义是"最后一次请求完成后的空闲时间"
 
     try {
-        $got = $__edge_device_semaphores[$clientId]['channel']->pop(1);
+        // ★ 防御：桶存在但 channel 已损坏
+        $bucket = $__edge_device_semaphores[$clientId];
+        if (! isset($bucket['channel']) || ! $bucket['channel'] instanceof Channel) {
+            unset($__edge_device_semaphores[$clientId]);
+            return null;
+        }
+        $got = $bucket['channel']->pop(1);
 
         return $got ? $clientId : null;
     } catch (Throwable) {
@@ -380,10 +397,16 @@ function deviceConcurrencyRelease(?string $clientId): void
     }
 
     try {
-        $__edge_device_semaphores[$clientId]['channel']->push(1, 1);
+        // ★ 防御：channel 已损坏则不 push，直接清理
+        $bucket = $__edge_device_semaphores[$clientId];
+        if (! isset($bucket['channel']) || ! $bucket['channel'] instanceof Channel) {
+            unset($__edge_device_semaphores[$clientId]);
+            return;
+        }
+        $bucket['channel']->push(1, 1);
         $__edge_device_semaphores[$clientId]['last_used'] = time();
     } catch (Throwable) {
-        // 桶满忽略
+        // 桶满或已损坏，忽略
     }
 }
 
@@ -396,25 +419,33 @@ function deviceConcurrencyCleanup(): void
 
     static $lastCleanup = 0;
     $now = time();
-    // ---------------------------------------------------------------------------
-    // 节流间隔说明（按需调整），默认60s：                                              |
-    // | 方案         | 间隔 | 理由                                                 |
-    // |-------------|------|-----------------------------------------------------|
-    // | 太保守       | 60s  | 别清理太频繁，过期桶最多多活 60s                          |
+
+    // ★ 防御：全局桶未初始化时直接返回
+    if (! is_array($__edge_device_semaphores)) {
+        return;
+    }
+
+    // ----------------------------------------------------------------------------
+    // 节流间隔说明（按需调整）：
+    // | 方案         | 间隔 | 理由                                                   |
+    // |-------------|------|-------------------------------------------------------|
+    // | 太保守       | 60s  | 别清理太频繁，过期桶最多多活 60s                            |
     // | 保守但合理    | 10s  | 平衡频率和开销，过期桶最多多活 10s                        |
     // | ★ 推荐       | 5s   | handler 入口已在调，5s 节流即高流量也只每 5s 真正扫一次，   |
     // |             |      | 几乎零成本，过期桶最多多占 5s                            |
     // | 激进         | 1s   | 完全没问题，但 debugLog 可能刷得频繁                     |
-    // 当前取值：5s（推荐档）                                                         |
+    // 当前取值：5s（推荐档）
     // ----------------------------------------------------------------------------
-    if ($now - $lastCleanup < 5) {  // ← 60 改 5
+    if ($now - $lastCleanup < 5) {
         return;
     }
     $lastCleanup = $now;
 
+    // ★ 先拷贝快照再遍历，避免遍历过程中 unset 自身导致协程安全问题
+    $snapshot = $__edge_device_semaphores;
     $removed = 0;
-    foreach ($__edge_device_semaphores as $cid => $bucket) {
-        if ($now - $bucket['last_used'] > $__edge_device_sem_ttl) {
+    foreach ($snapshot as $cid => $bucket) {
+        if (! isset($bucket['last_used']) || ($now - $bucket['last_used']) > $__edge_device_sem_ttl) {
             unset($__edge_device_semaphores[$cid]);
             $removed++;
         }
@@ -428,9 +459,24 @@ function deviceConcurrencyStats(): array
 {
     global $__edge_device_semaphores, $__edge_device_sem_max;
 
+    // ★ 防御：全局桶未初始化 / 非数组时返回空数组，防止 foreach(null)
+    if (! is_array($__edge_device_semaphores)) {
+        return [];
+    }
+
     $stats = [];
-    foreach ($__edge_device_semaphores as $cid => $bucket) {
-        $free = $bucket['channel']->getLength();
+    // ★ 先拷贝快照再遍历，避免 cleanup 并发 unset 导致数组指针异常
+    $snapshot = $__edge_device_semaphores;
+    foreach ($snapshot as $cid => $bucket) {
+        // ★ 跳过损坏桶（channel 已销毁或非 Channel 实例）
+        if (! isset($bucket['channel']) || ! $bucket['channel'] instanceof Channel) {
+            continue;
+        }
+        try {
+            $free = $bucket['channel']->getLength();
+        } catch (Throwable) {
+            $free = 0;
+        }
         $stats[$cid] = [
             'max' => $__edge_device_sem_max,
             'used' => $__edge_device_sem_max - $free,
@@ -495,8 +541,12 @@ function metricsInc(string $key, int $n = 1): void
 function metricsSnapshot(): array
 {
     global $metrics;
+    // ★ 双保险：即使 $metrics 为 null（极端情况），也返回空数组
+    if (! is_array($metrics)) {
+        return [];
+    }
 
-    return $metrics ?? [];
+    return $metrics;
 }
 
 /* =========================================================
@@ -578,17 +628,29 @@ function base64urlDecode(string $data): string|false
 if (! function_exists('respondJson')) {
     function respondJson($conn, $data, int $status = 200): void
     {
+        // ★ 防御：确保 $data 是可数组化的，避免 json_encode 抛异常
+        if (! is_array($data) && ! ($data instanceof JsonSerializable)) {
+            $data = ['error' => 'internal', 'msg' => 'invalid response data'];
+            $status = 500;
+        }
+
         $body = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if ($body === false) {
+            // ★ 记录原始错误原因，方便排查
+            fwrite(STDERR, '[respondJson] json_encode failed: '.json_last_error_msg().' data='.var_export($data, true).PHP_EOL);
             $body = '{"error":"json_encode_failed"}';
             $status = 500;
         }
 
-        $conn->respond(
-            $body,
-            $status,
-            ['Content-Type' => 'application/json; charset=utf-8']
-        );
+        try {
+            $conn->respond(
+                $body,
+                $status,
+                ['Content-Type' => 'application/json; charset=utf-8']
+            );
+        } catch (Throwable $e) {
+            fwrite(STDERR, '[respondJson] respond failed: '.$e->getMessage().PHP_EOL);
+        }
     }
 }
 
