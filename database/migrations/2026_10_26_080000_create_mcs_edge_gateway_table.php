@@ -22,7 +22,8 @@ return new class extends Migration
                     ->unique()
                     ->comment('服务名称');
 
-                $table->tinyText('code', 64)
+                // ✅ 修正：tinyText 不支持长度，改为 string
+                $table->string('code', 64)
                     ->comment('服务标识');
 
                 $table->ipAddress('ip')
@@ -63,12 +64,14 @@ return new class extends Migration
         }
     }
 
+    /**
+     * 回滚：直接 drop，不判断数据是否存在。
+     * 前置条件：config 迁移的 down() 已先拆除外键约束。
+     */
     public function down(): void
     {
         if (Schema::hasTable($this->name)) {
-            if (! DB::table($this->name)->exists()) {
-                Schema::dropIfExists($this->name);
-            }
+            Schema::dropIfExists($this->name);
         }
     }
 };

@@ -1,5 +1,7 @@
 <?php
+
 declare(strict_types=1);
+
 namespace DagaSmart\Edge\Console\Commands;
 
 use DagaSmart\Edge\Services\EdgeGatewayConfigService;
@@ -22,16 +24,22 @@ class EdgeConfigReloadCommand extends Command
         if ($pid) {
             $this->reloadByPid((int) $pid);
         } elseif (function_exists('posix_kill')) {
-            // 尝试从 pid 文件读取
             $pidFile = storage_path('edge-auth.pid');
             if (file_exists($pidFile)) {
-                $pid = (int) trim(file_get_contents($pidFile));
-                $this->reloadByPid($pid);
+                $pid = (int) trim((string) file_get_contents($pidFile));
+                if ($pid <= 0) {
+                    $this->warn('pid 文件内容无效，跳过 reload。');
+                } elseif (!posix_kill($pid, 0)) {
+                    $this->warn("PID {$pid} 已退出，清理过期 pid 文件。");
+                    @unlink($pidFile);
+                } else {
+                    $this->reloadByPid($pid);
+                }
             } else {
                 $this->warn('未指定 --pid 且未找到 ' . $pidFile . '，仅刷新配置缓存，未发信号。');
             }
         } else {
-            $this->warn('Windows 环境不支持信号，配置将在下次启动时生效。');
+            $this->warn('Windows 环境不支持 posix 信号，配置将在下次启动时生效。');
         }
 
         // 可选：刷新配置到缓存/常量
@@ -43,7 +51,7 @@ class EdgeConfigReloadCommand extends Command
             'keys' => count($resolved),
         ]);
 
-        $this->info('配置已重载，共 ' . count($resolved) . ' 项生效。');
+        $this->info('配置已重载，共 '.count($resolved).' 项生效。');
 
         return self::SUCCESS;
     }
@@ -52,11 +60,12 @@ class EdgeConfigReloadCommand extends Command
     {
         $signal = $this->option('signal') === 'USR1' ? SIGUSR1 : SIGHUP;
 
-        if (!posix_kill($pid, $signal)) {
+        if (! posix_kill($pid, $signal)) {
             $this->error("发送信号失败 (pid={$pid})，进程可能已退出。");
+
             return;
         }
 
-        $this->info("已向 EdgeAuth 主进程 {$pid} 发送 " . $this->option('signal') . " 信号。");
+        $this->info("已向 EdgeAuth 主进程 {$pid} 发送 ".$this->option('signal').' 信号。');
     }
 }

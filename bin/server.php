@@ -54,7 +54,7 @@ if (! defined('BACKLOG')) {
 }
 // 路由基准前缀
 if (! defined('AUTH_HTTP_PREFIX')) {
-    define('AUTH_HTTP_PREFIX', '/admin-api/extension/edge/gateway');
+    define('AUTH_HTTP_PREFIX', '/admin-api/extension/edge');
 }
 
 // ---------- 加载业务文件 ----------
@@ -163,19 +163,19 @@ while ($running) {
 
                 try {
                     switch ($path) {
-                        case '/admin-api/extension/edge/gateway/auth':
+                        case '/admin-api/extension/edge/auth':
                             handleAuth($conn, $req);
                             break;
 
-                        case '/admin-api/extension/edge/gateway/super':
+                        case '/admin-api/extension/edge/super':
                             handleSuper($conn, $req);
                             break;
 
-                        case '/admin-api/extension/edge/gateway/acl':
+                        case '/admin-api/extension/edge/acl':
                             handleAcl($conn, $req);
                             break;
 
-                        case '/admin-api/extension/edge/gateway/health':
+                        case '/admin-api/extension/edge/health':
                             $stats = redisPoolStats();
                             respondJson($conn, [
                                 'status' => ($stats['free'] ?? 0) > 0 ? 'ok' : 'degraded',
@@ -184,7 +184,7 @@ while ($running) {
                             ], 200);
                             break;
 
-                        case '/admin-api/extension/edge/gateway/metrics':
+                        case '/admin-api/extension/edge/metrics':
                             $m = metricsSnapshot();
                             $m['device_concurrency'] = deviceConcurrencyStats();
                             $m['global_concurrency'] = concurrencyStats();

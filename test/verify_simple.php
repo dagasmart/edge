@@ -9,30 +9,21 @@ declare(strict_types=1);
  * 协议：password = b64Sign|timestamp|nonce
  *
  * 用法：php extensions/edge/test/verify_simple.php [base_url] [--timeout <sec>]
- *
- *   base_url   网关基地址（默认 http://127.0.0.1:9503/admin-api/extension/edge/gateway）
- *   --timeout  统一超时秒数，同时作用于 Redis 连接与 cURL（默认 3.0）
- *
- * 示例：
- *   php verify_simple.php
- *   php verify_simple.php http://127.0.0.1:9503/admin-api/extension/edge/gateway --timeout 5.0
  */
+
 error_reporting(E_ALL);
 ini_set('display_errors', '1');
 
-// ---------- 参数解析（位置参数 + 命名参数） ----------
-
+// ---------- 参数解析 ----------
 $options = [
-    'base-url' => 'http://127.0.0.1:9503/admin-api/extension/edge/gateway',
+    'base-url' => 'http://127.0.0.1:9503/admin-api/extension/edge',
     'timeout'  => 3.0,
 ];
 
-// 第一个非命名参数视为 base_url
 for ($i = 1; $i < $argc; $i++) {
     if ($argv[$i] === '--timeout') {
         $options['timeout'] = (float)($argv[++$i] ?? 3.0);
     } elseif (strpos($argv[$i], '--') !== 0) {
-        // 第一个裸参数 = base_url
         $options['base-url'] = $argv[$i];
     }
 }
@@ -40,12 +31,12 @@ for ($i = 1; $i < $argc; $i++) {
 $baseUrl = $options['base-url'];
 $timeout = $options['timeout'];
 
-// ---------- Redis 配置（与 seed_redis.php / server.php 一致） ----------
+// ---------- Redis 配置 ----------
 const REDIS_HOST = '127.0.0.1';
 const REDIS_PORT = 16379;
 const REDIS_PASSWORD = 'uApDVQD7';
 const REDIS_DB = 2;
-const SECRET_PREFIX = 'device:secret:'; // ← 跟 seed_redis.php 对齐
+const SECRET_PREFIX = 'device:secret:';
 
 // ---------- 工具函数 ----------
 function httpPost(string $url, array $fields, float $timeout): array
@@ -108,26 +99,22 @@ function loadSecretsFromRedis(float $timeout): array
         exit(1);
     }
 
-    // 用 seed_redis.php 的 key 格式扫描
     $keys = $redis->keys(SECRET_PREFIX.'*');
     $devices = [];
 
     foreach ($keys as $fullKey) {
-        // device:secret:clientId:username → 提取 clientId 和 username
         $suffix = substr($fullKey, strlen(SECRET_PREFIX));
         $parts = explode(':', $suffix, 2);
         if (count($parts) === 2) {
             [$clientId, $username] = $parts;
             $secret = $redis->get($fullKey);
             if ($secret !== false) {
-                // 存成 clientId:username => secret
                 $devices[$clientId.':'.$username] = $secret;
             }
         }
     }
 
     $redis->close();
-
     return $devices;
 }
 
@@ -142,7 +129,56 @@ function buildPassword(string $clientId, string $username, string $secret): stri
     return $b64Sign.'|'.$timestamp.'|'.$nonce;
 }
 
-// ---------- 主流程 ----------
+// ---------- ✅ 新增：等待 Swow 端口就绪 ----------
+function waitForPort(string $host, int $port, float $maxWait): void
+{
+    $start = microtime(true);
+    $attempt = 0;
+    while (microtime(true) - $start < $maxWait) {
+        $fp = @fsockopen($host, $port, $errno, $errstr, 0.5);
+        if ($fp) {
+            fclose($fp);
+            if ($attempt > 0) {
+                echo "  ✅ 端口 {$host}:{$port} 就绪（等待了 ".round(microtime(true) - $start, 1)."s）\n\n";
+            }
+            return;
+        }
+        $attempt++;
+        usleep(200000); // 200ms
+    }
+    fwrite(STDERR, "⚠️  等待 {$host}:{$port} 超过 {$maxWait}s 未就绪，测试可能失败\n\n");
+}
+
+// ---------- ✅ 新增：Redis 连通性前置检查 ----------
+function checkRedis(float $timeout): void
+{
+    $redis = new Redis;
+    try {
+        $redis->connect(REDIS_HOST, REDIS_PORT, $timeout);
+        $redis->auth(REDIS_PASSWORD);
+        $redis->ping();
+        $redis->close();
+    } catch (Exception $e) {
+        fwrite(STDERR, '❌ Redis 不可达: '.$e->getMessage().PHP_EOL);
+        fwrite(STDERR, "   确认 Redis 在 ".REDIS_HOST.":".REDIS_PORT." 运行且密码正确\n");
+        exit(1);
+    }
+}
+
+// ==================== 主流程 ====================
+
+// 1. 等 Swow 就绪
+$urlParts = parse_url($baseUrl);
+$targetHost = $urlParts['host'] ?? '127.0.0.1';
+$targetPort = $urlParts['port'] ?? 9503;
+
+echo "⏳ 等待 Swow 服务就绪（{$targetHost}:{$targetPort}）...\n";
+waitForPort($targetHost, (int) $targetPort, 10.0);
+
+// 2. Redis 连通性检查
+checkRedis($timeout);
+
+// 3. 加载密钥
 echo '📦 从 Redis db='.REDIS_DB.' 加载设备密钥（key 格式: '.SECRET_PREFIX."*）\n\n";
 
 $secrets = loadSecretsFromRedis($timeout);
@@ -157,6 +193,7 @@ echo "🎯 EdgeAuth Verify | Base: {$baseUrl}\n";
 echo "   协议: b64Sign|timestamp|nonce | HMAC-SHA256\n";
 echo '   加载了 '.count($secrets)." 个设备密钥 | 超时: {$timeout}s\n\n";
 
+// ---------- 测试计数 ----------
 $passed = 0;
 $failed = 0;
 $total = 0;

@@ -19,7 +19,7 @@ class EdgeAuthorizeController extends AdminController
         $crud = $this->baseCRUD()
             ->filterTogglable(false)
             ->headerToolbar([
-                $this->createButton('dialog', 250),
+                $this->createButton('dialog', '250'),
                 ...$this->baseHeaderToolBar(),
             ])
             ->autoGenerateFilter()

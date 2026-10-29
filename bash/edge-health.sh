@@ -9,8 +9,8 @@ set -euo pipefail
 # =========================================================
 # 配置区
 # =========================================================
-HEALTH_URL="http://127.0.0.1:9503/admin-api/extension/edge/gateway/health"
-METRICS_URL="http://127.0.0.1:9503/admin-api/extension/edge/gateway/metrics"
+HEALTH_URL="http://127.0.0.1:9503/admin-api/extension/edge/health"
+METRICS_URL="http://127.0.0.1:9503/admin-api/extension/edge/metrics"
 PORT=9503
 TIMEOUT=3
 INTERVAL=5

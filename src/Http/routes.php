@@ -16,13 +16,13 @@ Route::group([
 ], function (Router $router) {
     // Route::get('edge', [Controllers\EdgeController::class, 'index']);
 
-    Route::post('edge/gateway/auth', [Controllers\EdgeGatewayController::class, 'auth'])
+    Route::post('edge/auth', [Controllers\EdgeController::class, 'auth'])
         ->withoutMiddleware([Permission::class, Authenticate::class, Middleware::class]);
 
-    Route::post('edge/gateway/super', [Controllers\EdgeGatewayController::class, 'super'])
+    Route::post('edge/super', [Controllers\EdgeController::class, 'super'])
         ->withoutMiddleware([Permission::class, Authenticate::class]);
 
-    Route::post('edge/gateway/acl', [Controllers\EdgeGatewayController::class, 'acl'])
+    Route::post('edge/acl', [Controllers\EdgeController::class, 'acl'])
         ->withoutMiddleware([Permission::class, Authenticate::class]);
 
     // resource必须放最后面

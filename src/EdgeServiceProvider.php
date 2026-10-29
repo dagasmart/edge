@@ -5,6 +5,8 @@ namespace DagaSmart\Edge;
 use DagaSmart\BizAdmin\Extend\ServiceProvider;
 use DagaSmart\BizAdmin\Renderers\Form;
 use DagaSmart\BizAdmin\Renderers\TextControl;
+use DagaSmart\Edge\Models\EdgeGatewayConfig;
+use DagaSmart\Edge\Observers\EdgeGatewayConfigObserver;
 use DagaSmart\Edge\Services\EdgeAclEngineService;
 use DagaSmart\Edge\Services\EdgeAuthSignerService;
 use Exception;
@@ -24,7 +26,7 @@ class EdgeServiceProvider extends ServiceProvider
         [
             'parent' => '边缘网关',
             'title' => '网关服务',
-            'url' => '/admin-api/extension/edge/gateway',
+            'url' => '/extension/edge/gateway',
             'url_type' => 1,
             'icon' => 'carbon:ibm-cloud-transit-gateway',
         ],
@@ -88,6 +90,11 @@ class EdgeServiceProvider extends ServiceProvider
             return new EdgeAclEngineService();
         });
 
+    }
+
+    public function boot(): void
+    {
+        EdgeGatewayConfig::observe(EdgeGatewayConfigObserver::class);
     }
 
     /** 批量注册配置文件 */

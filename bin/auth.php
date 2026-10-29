@@ -9,7 +9,7 @@ use Swow\Psr7\Server\ServerConnection;
  * ========================================================= */
 
 /**
- * POST /admin-api/extension/edge/gateway/auth
+ * POST /admin-api/extension/edge/auth
  */
 function handleAuth(ServerConnection $conn, ServerRequest $req): void
 {
@@ -128,7 +128,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 }
 
 /**
- * POST /admin-api/extension/edge/gateway/super
+ * POST /admin-api/extension/edge/super
  */
 function handleSuper(ServerConnection $conn, ServerRequest $req): void
 {
@@ -136,7 +136,7 @@ function handleSuper(ServerConnection $conn, ServerRequest $req): void
 }
 
 /**
- * POST /admin-api/extension/edge/gateway/acl
+ * POST /admin-api/extension/edge/acl
  */
 function handleAcl(ServerConnection $conn, ServerRequest $req): void
 {

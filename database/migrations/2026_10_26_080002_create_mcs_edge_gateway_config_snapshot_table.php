@@ -1,11 +1,6 @@
 <?php
 /**
  * 边缘网关配置变更快照表（审计追踪 + 按批次回滚）
- *
- * 关联删除规则：
- * - config_id 关联 mcs_edge_gateway_config.id
- * - 当 config 记录被删除时，snapshot 自动级联删除（cascadeOnDelete）
- * - 这保证了"配置不存在时快照也不存在"的完整性
  */
 
 use Illuminate\Database\Migrations\Migration;
@@ -20,7 +15,7 @@ return new class extends Migration
 
     public function up(): void
     {
-        if (!Schema::hasTable($this->name)) {
+        if (! Schema::hasTable($this->name)) {
             Schema::create($this->name, function (Blueprint $table) {
                 $table->comment('边缘网关配置变更快照表');
                 $table->id();
@@ -46,7 +41,6 @@ return new class extends Migration
                 $table->index('batch');
                 $table->index('snapshot_at');
 
-                // ✅ 核心：级联删除，config 没了 snapshot 跟着没
                 $table->foreign('config_id')
                     ->references('id')
                     ->on('mcs_edge_gateway_config')
@@ -67,52 +61,27 @@ return new class extends Migration
         $this->seedBaselineSnapshot();
     }
 
+    /**
+     * 回滚：拆外键 → 无条件 drop，不保留任何数据。
+     */
     public function down(): void
     {
-        // ✅ 修正：先确认没有孤儿数据再 drop
-        // cascadeOnDelete 意味着正常流程下 snapshot 会随 config 一起消失
-        // 这里只需安全 drop 表本身
-        if (Schema::hasTable($this->name)) {
-            // 防御性检查：如果 config 表已不存在但 snapshot 表还在（手动操作场景）
-            if (! Schema::hasTable('mcs_edge_gateway_config')) {
-                // config 表都没了，snapshot 肯定是孤儿数据，直接清
-                Schema::dropIfExists($this->name);
-                return;
-            }
-
-            // config 表存在时，检查是否有引用 config 中已不存在的快照
-            $orphanExists = DB::connection($this->connection)
-                ->table($this->name)
-                ->whereNotExists(function ($query) {
-                    $query->select(DB::raw(1))
-                        ->from('mcs_edge_gateway_config')
-                        ->whereRaw('mcs_edge_gateway_config.id = mcs_edge_gateway_config_snapshot.config_id');
-                })
-                ->exists();
-
-            if ($orphanExists) {
-                // 清理孤儿记录后再 drop
-                DB::connection($this->connection)
-                    ->table($this->name)
-                    ->whereNotExists(function ($query) {
-                        $query->select(DB::raw(1))
-                            ->from('mcs_edge_gateway_config')
-                            ->whereRaw('mcs_edge_gateway_config.id = mcs_edge_gateway_config_snapshot.config_id');
-                    })
-                    ->delete();
-            }
-
-            Schema::dropIfExists($this->name);
+        if (! Schema::hasTable($this->name)) {
+            return;
         }
+
+        // ✅ 先拆外键
+        Schema::table($this->name, function (Blueprint $table) {
+            $table->dropForeign(['config_id']);
+        });
+
+        // ✅ 无条件 drop，零残留
+        Schema::dropIfExists($this->name);
     }
 
-    /**
-     * 首次建表时生成 baseline 快照，作为回滚锚点。
-     * 后续增量快照由 SnapshotsConfig Trait + Observer 在业务层写入。
-     */
     private function seedBaselineSnapshot(): void
     {
-        if (!Schema::hasTable('mcs_edge_gateway_config')) {
+        if (! Schema::hasTable('mcs_edge_gateway_config')) {
             return;
         }
 
@@ -121,7 +90,6 @@ return new class extends Migration
         }
 
         $rows = DB::table('mcs_edge_gateway_config')->get();
-
         if ($rows->isEmpty()) {
             return;
         }
@@ -130,18 +98,18 @@ return new class extends Migration
 
         $data = $rows->map(function ($row) use ($now) {
             return [
-                'config_id'    => $row->id,
-                'config_key'   => $row->key,
-                'group'        => $row->group,
-                'value_before' => null,
-                'value_after'  => $row->value,
-                'type'         => $row->type,
-                'action'       => 'create',
-                'operator_id'  => null,
-                'operator_type'=> 'migration',
-                'reason'       => 'baseline snapshot on table creation',
-                'batch'        => 'baseline',
-                'snapshot_at'  => $now,
+                'config_id'     => $row->id,
+                'config_key'    => $row->key,
+                'group'         => $row->group,
+                'value_before'  => null,
+                'value_after'   => $row->value,
+                'type'          => $row->type,
+                'action'        => 'create',
+                'operator_id'   => null,
+                'operator_type' => 'migration',
+                'reason'        => 'baseline snapshot on table creation',
+                'batch'         => 'baseline',
+                'snapshot_at'   => $now,
             ];
         })->toArray();
 
