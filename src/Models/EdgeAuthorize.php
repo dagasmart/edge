@@ -12,19 +12,20 @@ use Illuminate\Support\Facades\Log;
  *
  * 负责：
  *  - 终端认证账号的存储
+ *  - password 字段自动 bcrypt 加密
  *  - secret 密钥的自动生成与时间戳维护
  *  - 模型事件驱动 Redis 密钥同步
  *
  * @property int         $id
- * @property string      $username      账号
- * @property string      $password      密码（hash 存储）
- * @property string      $client_id     终端 SN
- * @property bool        $active        是否启用
- * @property bool        $is_super      是否超管
- * @property string      $service       网关类型（nano / mqtt / emqx）
- * @property string      $secret        签名密钥
+ * @property string      $username        账号
+ * @property string      $password        密码（bcrypt hash 存储）
+ * @property string      $client_id       终端 SN
+ * @property bool        $active          是否启用
+ * @property bool        $is_super        是否超管
+ * @property string      $service         网关类型（nano / mqtt / emqx）
+ * @property string      $secret          签名密钥
  * @property Carbon|null $secret_change_at 密钥变更时间
- * @property string|null $remark        备注
+ * @property string|null $remark          备注
  */
 class EdgeAuthorize extends Model
 {
@@ -52,8 +53,6 @@ class EdgeAuthorize extends Model
 
     // ==================== Mutator ====================
 
-    // ==================== Mutator ====================
-
     /**
      * password 字段自动 bcrypt 加密
      *
@@ -63,7 +62,6 @@ class EdgeAuthorize extends Model
      */
     public function setPasswordAttribute($value): void
     {
-        // 空值不处理
         if ($value === null || $value === '') {
             $this->attributes['password'] = $value;
             return;
@@ -75,7 +73,6 @@ class EdgeAuthorize extends Model
             return;
         }
 
-        // 明文 → bcrypt hash
         $this->attributes['password'] = \Illuminate\Support\Facades\Hash::make($value);
     }
 
@@ -91,7 +88,7 @@ class EdgeAuthorize extends Model
             return;
         }
 
-        $original = $this->attributes['secret'] ?? null;
+        $original = $this->getOriginal('secret');
 
         if ($value !== null && $value !== '' && $value !== $original) {
             $this->attributes['secret'] = $value;
@@ -105,20 +102,14 @@ class EdgeAuthorize extends Model
 
     /**
      * Laravel 13 推荐在 booted() 中注册模型事件
-     * 不要用 boot() + new static()，避免内存问题
      */
     protected static function booted(): void
     {
-        /**
-         * saving 事件：
-         *  - 新增时 secret 为空 → 自动生成随机密钥
-         *  - 编辑时前端传了真实新值 → 覆盖
-         *  - 编辑时传了脱敏占位 → 忽略
-         *
-         * 时间戳由 setSecretAttribute() 统一维护，这里不重复处理
-         */
         static::saving(function (self $device) {
-            $input = request()->input('secret');
+            $input = null;
+            if (function_exists('request') && app()->has('request')) {
+                $input = request()->input('secret');
+            }
 
             // 新增：secret 为空，自动生成
             if (! $device->exists && empty($device->secret)) {
@@ -134,12 +125,6 @@ class EdgeAuthorize extends Model
             }
         });
 
-        /**
-         * saved 事件：
-         *  - 新增/编辑完成后，同步密钥到 Redis
-         *  - 如果设备被禁用，Redis 中的 key 会被删除
-         *  - 异常不影响主流程，仅记录日志
-         */
         static::saved(function (self $device) {
             try {
                 app(EdgeAuthorizeService::class)->syncRedisOnSave($device);
@@ -151,10 +136,6 @@ class EdgeAuthorize extends Model
             }
         });
 
-        /**
-         * deleted 事件：
-         *  - 删除数据库记录后，同步清理 Redis 中的密钥
-         */
         static::deleted(function (self $device) {
             try {
                 app(EdgeAuthorizeService::class)->removeRedisOnDelete($device);
@@ -171,14 +152,9 @@ class EdgeAuthorize extends Model
 
     /**
      * 生成密码学安全的随机密钥
-     *
-     * - 使用 random_bytes()（CSPRNG）
-     * - base64 编码后 44 字符，适合做 HMAC-SHA256 签名密钥
-     * - Laravel 13 / PHP 8.4+ 推荐写法
      */
     public static function generateSecret(): string
     {
         return base64_encode(random_bytes(32));
     }
-
 }

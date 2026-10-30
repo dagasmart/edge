@@ -5,21 +5,66 @@ use Swow\Psr7\Message\ServerRequest;
 use Swow\Psr7\Server\ServerConnection;
 
 /* =========================================================
- * EdgeAuth HTTP 路由处理
+ * EdgeAuth HTTP 路由处理 - 生产版
+ *
+ * 约定：
+ *   Redis key = device:secret:{client_id}:{username}
+ *   Redis val = bcrypt hash (与 Laravel DB password 字段一致)
+ *   password  = 明文密码
+ *   验证方式  = password_verify
  * ========================================================= */
+
+/**
+ * 从 Redis 获取设备 bcrypt hash
+ */
+function getDeviceSecret(string $clientId, string $username): ?string
+{
+    $key = 'device:secret:' . $clientId . ':' . $username;
+    $val = redisGet($key);
+
+    return ($val !== null && $val !== '') ? $val : null;
+}
+
+/**
+ * 认证设备
+ *
+ * @return array{ok:bool,reason:string}
+ */
+function authenticateDevice(string $clientId, string $username, string $password): array
+{
+    $hash = getDeviceSecret($clientId, $username);
+    if ($hash === null) {
+        return ['ok' => false, 'reason' => 'no secret'];
+    }
+
+    // bcrypt 验证（恒定时间，防时序攻击）
+    if (!password_verify($password, $hash)) {
+        return ['ok' => false, 'reason' => 'password mismatch'];
+    }
+
+    // 可选：自动升级哈希成本（如果以后调整了 bcrypt cost）
+    if (password_needs_rehash($hash, PASSWORD_BCRYPT)) {
+        $newHash = password_hash($password, PASSWORD_BCRYPT);
+        $key = 'device:secret:' . $clientId . ':' . $username;
+        redisSet($key, $newHash);
+    }
+
+    return ['ok' => true, 'reason' => 'ok'];
+}
 
 /**
  * POST /admin-api/extension/edge/auth
  */
 function handleAuth(ServerConnection $conn, ServerRequest $req): void
 {
-    // ---------- 请求体解析 ----------
+    // ---------- 请求解析 ----------
     $body = (string) $req->getBody();
     $contentType = strtolower($req->getHeaderLine('Content-Type'));
 
     if (str_contains($contentType, 'application/json')) {
         $data = json_decode($body, true) ?? [];
     } else {
+        $data = [];
         parse_str($body, $data);
     }
 
@@ -35,21 +80,18 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
     // ---------- 参数校验 ----------
     if ($clientId === '' || $username === '' || $password === '') {
-        debugLog('MISSING_FIELDS: ct='.$contentType.' body_len='.strlen($body));
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => '缺少参数 missing_fields'], 401);
-
+        respondJson($conn, [
+            'result' => 'deny',
+            'reason' => 'missing client_id / username / password'
+        ], 401);
         return;
     }
 
-    // ---------- 定期清理空闲设备桶 ----------
-    deviceConcurrencyCleanup();
-
-    // ---------- 全局并发控制 ----------
-    if (! concurrencyAcquire()) {
+    // ---------- 并发控制（全局） ----------
+    if (!concurrencyAcquire()) {
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 503);
-
         return;
     }
 
@@ -59,64 +101,51 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         concurrencyRelease();
         metricsInc('auth_fail');
         metricsInc('device_concurrency_exceeded');
-        debugLog('DEVICE OVERLOADED: '.$clientId.' (max='.MAX_CONCURRENCY_PER_DEVICE.')');
         respondJson($conn, [
             'result' => 'deny',
             'reason' => 'device_overloaded',
-            'detail' => 'max '.MAX_CONCURRENCY_PER_DEVICE.' concurrent requests per device',
+            'detail' => 'max ' . MAX_CONCURRENCY_PER_DEVICE . ' concurrent requests per device'
         ], 429);
-
         return;
     }
 
     // ---------- 限流 ----------
-    $rateKey = 'rate:'.$clientId;
+    $rateKey = 'rate:' . $clientId;
     if (rateLimited($rateKey)) {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 429);
-
         return;
     }
 
-    // ---------- 熔断检查 ----------
+    // ---------- 熔断 ----------
     if (isClientBlocked($clientId)) {
-        debugLog('BLOCKED: '.$clientId);
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'blocked'], 401);
-
         return;
     }
 
     try {
-        // ---------- HMAC 认证 ----------
-        $authenticated = hmacAuthenticate($clientId, $username, $password);
-        $reason = detachAuthReason();
+        // ---------- 认证 ----------
+        $result = authenticateDevice($clientId, $username, $password);
+        $authenticated = $result['ok'] ?? false;
+        $reason = $result['reason'] ?? 'unknown';
 
-        if (! $authenticated) {
-            $attackReasons = [
-                'signature mismatch',
-            ];
-
-            $shouldCountFail = in_array($reason, $attackReasons, true);
-
-            if ($shouldCountFail) {
+        if (!$authenticated) {
+            // 记录失败次数（用于熔断）
+            if (in_array($reason, ['password mismatch', 'no secret'], true)) {
                 recordClientFail($clientId);
-                debugLog('FAIL RECORDED: '.$clientId.' reason='.$reason);
-            } else {
-                debugLog('FAIL SKIPPED: '.$clientId.' reason='.$reason.' (not counted)');
             }
 
             metricsInc('auth_fail');
-            respondJson($conn, ['result' => 'deny'], 401);
-
+            respondJson($conn, ['result' => 'deny', 'reason' => $reason], 401);
             return;
         }
 
-        // ---------- 认证通过 ----------
+        // ---------- 认证成功 ----------
         metricsInc('auth_ok');
         resetRate($rateKey);
         respondJson($conn, ['result' => 'allow'], 200);

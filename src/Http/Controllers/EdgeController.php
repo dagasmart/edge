@@ -2,12 +2,12 @@
 declare(strict_types=1);
 namespace DagaSmart\Edge\Http\Controllers;
 
-use DagaSmart\Edge\Services\EdgeGatewayService;
+use DagaSmart\Edge\Services\EdgeService;
 use Illuminate\Http\Request;
 
 class EdgeController extends AdminController
 {
-    protected string $serviceName = EdgeGatewayService::class;
+    protected string $serviceName = EdgeService::class;
 
     /**
      * 边缘网关 客户端认证

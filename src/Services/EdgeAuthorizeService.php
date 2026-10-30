@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+
 namespace DagaSmart\Edge\Services;
 
 use DagaSmart\Edge\Models\EdgeAuthorize;
@@ -9,6 +10,11 @@ use Illuminate\Support\Facades\Log;
 /**
  * 网关-服务类
  * 对接 NanoMQ HTTP 认证 / 超级用户 / ACL 鉴权
+ *
+ * 认证方式：bcrypt 密码比对
+ *   - DB 字段：EdgeAuthorize::$password（Hash::make 生成）
+ *   - Redis key：device:secret:{client_id}:{username}（存同一个 bcrypt 哈希）
+ *   - Swow 端用 password_verify 比对
  */
 class EdgeAuthorizeService extends AdminService
 {
@@ -28,33 +34,25 @@ class EdgeAuthorizeService extends AdminService
             return null;
         }
 
-        $query = EdgeAuthorize::query()
+        $user = EdgeAuthorize::query()
             ->where('username', $username)
-            ->where('active', true);
-
-        if (! empty($service)) {
-            $query->where('service', $service);
-        }
-
-        $user = $query->first();
+            ->where('active', true)
+            ->when($service, fn ($q) => $q->where('service', $service))
+            ->first();
 
         if (! $user) {
             Log::channel('edge')->warning('EdgeGateway auth: user not found', [
                 'username' => $username,
-                'service' => $service,
+                'service'  => $service,
                 'clientid' => $clientid,
             ]);
 
             return null;
         }
 
-        // ---- HMAC 签名路径 ----
-        if ($this->isHmacSignature($password)) {
-            $valid = $this->verifyHmacSignature($clientid, $username, $password);
-            if ($valid) {
-                return $user;
-            }
-            Log::channel('edge')->warning('EdgeGateway auth: HMAC verify failed', [
+        $hash = $user->password;
+        if (! is_string($hash) || $hash === '' || ! Hash::check($password, $hash)) {
+            Log::channel('edge')->warning('EdgeGateway auth: password mismatch', [
                 'username' => $username,
                 'clientid' => $clientid,
             ]);
@@ -62,103 +60,7 @@ class EdgeAuthorizeService extends AdminService
             return null;
         }
 
-        // ---- 明文密码 Hash 比对 ----
-        if (Hash::check($password, $user->password)) {
-            return $user;
-        }
-
-        Log::channel('edge')->warning('EdgeGateway auth: password mismatch', [
-            'username' => $username,
-            'clientid' => $clientid,
-        ]);
-
-        return null;
-    }
-
-
-    // ==================== 内部工具 ====================
-
-    /**
-     * 判断 password 是否为 HMAC 签名格式
-     */
-    protected function isHmacSignature(string $password): bool
-    {
-        $parts = explode('|', $password);
-
-        return count($parts) === 3 && strlen($parts[0]) > 0 && is_numeric($parts[1]);
-    }
-
-    /**
-     * HMAC 签名校验
-     */
-    protected function verifyHmacSignature(?string $clientid, string $username, string $password): bool
-    {
-        if (empty($clientid)) {
-            return false;
-        }
-
-        $parts = explode('|', $password, 3);
-        $b64Sign = $parts[0];
-        $timestamp = $parts[1];
-        $nonce = $parts[2];
-
-        // 时间窗口 ±300s
-        if (abs(time() - (int) $timestamp) > 300) {
-            Log::channel('edge')->warning('EdgeGateway acl: timestamp expired', [
-                'timestamp' => $timestamp,
-                'now' => time(),
-            ]);
-
-            return false;
-        }
-
-        $redisKey = "device:secret:{$clientid}:{$username}";
-
-        $secret = $this->getSecretFromNativeRedis($clientid, $username);
-
-        if (empty($secret)) {
-            Log::channel('edge')->warning('EdgeGateway acl: secret not found in Redis', [
-                'key' => $redisKey,
-            ]);
-
-            return false;
-        }
-
-        $payload = "{$clientid}|{$username}|{$timestamp}|{$nonce}";
-        $rawSign = hash_hmac('sha256', $payload, $secret, true);
-        $expected = rtrim(strtr(base64_encode($rawSign), '+/', '-_'), '=');
-
-        if (! hash_equals($expected, $b64Sign)) {
-            Log::channel('edge')->warning('EdgeGateway acl: signature mismatch', [
-                'clientid' => $clientid,
-                'username' => $username,
-            ]);
-
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
-     * Fallback：原生 Redis 取密钥
-     */
-    protected function getSecretFromNativeRedis(string $clientid, string $username): ?string
-    {
-        try {
-            $redis = new \Redis;
-            $redis->connect('127.0.0.1', 16379, 2);
-            $redis->auth('uApDVQD7');
-            $redis->select(2);
-
-            return $redis->get("device:secret:{$clientid}:{$username}") ?: null;
-        } catch (\Exception $e) {
-            Log::channel('edge')->error('EdgeGateway: native redis failed', [
-                'error' => $e->getMessage(),
-            ]);
-
-            return null;
-        }
+        return $user;
     }
 
     // ==================== 后台同步 Redis ====================
@@ -190,26 +92,27 @@ class EdgeAuthorizeService extends AdminService
                 return;
             }
 
-            $secret = $this->getSecretForDevice($device);
-            if ($secret === null || $secret === '') {
-                $redis->del($key);
-                Log::channel('edge')->warning('EdgeAuth Redis: secret not found, key removed', [
+            $hash = $device->password;
+
+            // 防御：不是合法 bcrypt 哈希则跳过，避免写脏数据
+            if (! is_string($hash) || $hash === '' || ! str_starts_with($hash, '$2y$')) {
+                Log::channel('edge')->warning('EdgeAuth Redis: invalid password hash, skip sync', [
                     'key' => $key,
                 ]);
 
                 return;
             }
 
-            $redis->set($key, $secret);
-            Log::channel('edge')->info('EdgeAuth Redis: key synced', [
-                'key' => $key,
+            $redis->set($key, $hash);
+
+            Log::channel('edge')->info('EdgeAuth Redis: key synced (bcrypt)', [
+                'key'     => $key,
                 'service' => $device->service,
-                'len' => strlen($secret),
             ]);
         } catch (\Exception $e) {
             Log::channel('edge')->error('EdgeAuth Redis: sync failed', [
                 'error' => $e->getMessage(),
-                'key' => $key,
+                'key'   => $key,
             ]);
         } finally {
             try {
@@ -236,14 +139,15 @@ class EdgeAuthorizeService extends AdminService
             $redis->auth('uApDVQD7');
             $redis->select(2);
             $redis->del($key);
+
             Log::channel('edge')->info('EdgeAuth Redis: key removed (deleted)', [
-                'key' => $key,
+                'key'     => $key,
                 'service' => $device->service,
             ]);
         } catch (\Exception $e) {
             Log::channel('edge')->error('EdgeAuth Redis: remove failed', [
                 'error' => $e->getMessage(),
-                'key' => $key,
+                'key'   => $key,
             ]);
         } finally {
             try {
@@ -251,26 +155,5 @@ class EdgeAuthorizeService extends AdminService
             } catch (\Exception $e) {
             }
         }
-    }
-
-    /**
-     * 获取设备 HMAC 密钥
-     *
-     * 唯一来源：DB 的 secret 字段（后台管理的权威来源）
-     * secrets.php 已废弃，不再作为兜底。
-     */
-    protected function getSecretForDevice(EdgeAuthorize $device): ?string
-    {
-        if (! empty($device->secret)) {
-            return $device->secret;
-        }
-
-        Log::channel('edge')->warning('EdgeAuth: device has no secret in DB', [
-            'client_id' => $device->client_id,
-            'username' => $device->username,
-            'id' => $device->id ?? null,
-        ]);
-
-        return null;
     }
 }

@@ -135,7 +135,7 @@ while ($running) {
                         $allowRatio = min(1.0, $uptime / 3.0 * 0.3);
                         if ($uptime < 3.0 && mt_rand(1, 100) / 100 > $allowRatio) {
                             respondJson($conn, [
-                                'result' => 'deny0',
+                                'result' => 'deny',
                                 'reason' => 'service_warming_up',
                                 'retry_after' => 1,
                             ], 503);
