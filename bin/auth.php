@@ -37,7 +37,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     if ($clientId === '' || $username === '' || $password === '') {
         debugLog('MISSING_FIELDS: ct='.$contentType.' body_len='.strlen($body));
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'missing_fields'], 401);
+        respondJson($conn, ['result' => 'deny1', 'reason' => '缺少参数 missing_fields'], 401);
 
         return;
     }
@@ -48,7 +48,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     // ---------- 全局并发控制 ----------
     if (! concurrencyAcquire()) {
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 503);
+        respondJson($conn, ['result' => 'deny2', 'reason' => 'overloaded'], 503);
 
         return;
     }
@@ -61,7 +61,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         metricsInc('device_concurrency_exceeded');
         debugLog('DEVICE OVERLOADED: '.$clientId.' (max='.MAX_CONCURRENCY_PER_DEVICE.')');
         respondJson($conn, [
-            'result' => 'deny',
+            'result' => 'deny3',
             'reason' => 'device_overloaded',
             'detail' => 'max '.MAX_CONCURRENCY_PER_DEVICE.' concurrent requests per device',
         ], 429);
@@ -75,7 +75,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 429);
+        respondJson($conn, ['result' => 'deny4', 'reason' => 'rate_limited'], 429);
 
         return;
     }
@@ -86,7 +86,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'blocked'], 401);
+        respondJson($conn, ['result' => 'deny5', 'reason' => 'blocked'], 401);
 
         return;
     }
@@ -111,7 +111,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             }
 
             metricsInc('auth_fail');
-            respondJson($conn, ['result' => 'deny'], 401);
+            respondJson($conn, ['result' => 'deny6'], 401);
 
             return;
         }
