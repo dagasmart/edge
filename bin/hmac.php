@@ -1,6 +1,7 @@
 <?php
 declare(strict_types=1);
 
+use DagaSmart\Edge\Support\HmacValidator;
 use Swow\Channel;
 use Swow\Coroutine;
 
@@ -14,7 +15,7 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
 
     $l1Key = 'secret:' . $clientId . ':' . $username;
 
-    $result = \DagaSmart\Edge\Support\HmacValidator::verify(
+    $result = HmacValidator::verify(
         $clientId,
         $username,
         $password,

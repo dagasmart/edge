@@ -32,7 +32,7 @@ class EdgeServiceProvider extends ServiceProvider
         ],
         [
             'parent' => '边缘网关',
-            'title' => '网关认证',
+            'title' => '终端认证',
             'url' => '/extension/edge/authorize',
             'url_type' => 1,
             'icon' => 'hugeicons:authorized',
@@ -100,6 +100,11 @@ class EdgeServiceProvider extends ServiceProvider
     /** 批量注册配置文件 */
     protected function registerConfigs(array $maps): void
     {
+        // ✅ 生产环境走 config:cache，直接跳过
+        if ($this->app->configurationIsCached()) {
+            return;
+        }
+
         foreach ($maps as $key => $file) {
             $path = __DIR__."/../config/{$file}";
             if (file_exists($path)) {

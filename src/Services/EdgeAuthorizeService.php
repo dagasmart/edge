@@ -113,14 +113,8 @@ class EdgeAuthorizeService extends AdminService
         }
 
         $redisKey = "device:secret:{$clientid}:{$username}";
-        $secret = null;
 
-        try {
-            $redis = app('redis')->connection('edge');
-            $secret = $redis->get($redisKey);
-        } catch (\Exception $e) {
-            $secret = $this->getSecretFromNativeRedis($clientid, $username);
-        }
+        $secret = $this->getSecretFromNativeRedis($clientid, $username);
 
         if (empty($secret)) {
             Log::channel('edge')->warning('EdgeGateway acl: secret not found in Redis', [
