@@ -160,8 +160,10 @@ class EdgeAuthSwowCommand extends Command
                 pcntl_async_signals(true);
             }
 
-            // ★ 不再设置 SIG_DFL —— 让 Swow\Signal 在 server.php 里接管
-            // ★ 父进程发 SIGTERM 时，子进程的 Swow 事件循环会收到并唤醒 Signal::wait()
+            // ★★★ 关键：解除 Swow 继承来的信号屏蔽，否则 posix_kill 发的 SIGTERM 会被内核丢弃 ★★★
+            if (function_exists('pcntl_sigprocmask')) {
+                pcntl_sigprocmask(SIG_UNBLOCK, [SIGTERM, SIGINT, SIGHUP]);
+            }
 
             $GLOBALS['worker_id'] = $workerId;
 
