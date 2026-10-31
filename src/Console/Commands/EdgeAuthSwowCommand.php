@@ -161,13 +161,17 @@ class EdgeAuthSwowCommand extends Command
             '--backlog=' . $this->backlog,
         ];
 
-        $fd = socket_export_stream($this->listenStream);
+        $env = [...getenv()];
 
-        $process = new Process($cmd, base_path());
-        $process->setEnv([
-            ...getenv(),
-            '__EDGE_LISTEN_FD' => (string) $fd,
-        ]);
+        // Linux：用 Socket 扩展拿真正的 int fd
+        if (function_exists('socket_get_fd')) {
+            $fd = socket_get_fd($this->listenStream);
+            if ($fd > 0) {
+                $env['__EDGE_LISTEN_FD'] = (string) $fd;
+            }
+        }
+
+        $process = new Process($cmd, base_path(), $env);
         $process->start();
 
         $pid = $process->getPid();

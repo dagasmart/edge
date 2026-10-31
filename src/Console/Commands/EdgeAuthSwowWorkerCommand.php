@@ -1,6 +1,8 @@
 <?php
+
 declare(strict_types=1);
-namespace DagaSmart\Edge\Console\Commands;
+
+namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
 
@@ -22,39 +24,44 @@ class EdgeAuthSwowWorkerCommand extends Command
 
         cli_set_process_title("edgeauth-worker-{$workerId}");
 
-        // ---------- 从环境变量拿到 master 传来的 listen fd ----------
-        $fd = (int) ($_ENV['__EDGE_LISTEN_FD'] ?? getenv('__EDGE_LISTEN_FD') ?: 0);
+        $fd = (int) ($_ENV['__EDGE_LISTEN_FD']
+            ?? getenv('__EDGE_LISTEN_FD')
+            ?: 0
+        );
 
         if ($fd <= 0) {
             $this->error('No __EDGE_LISTEN_FD received from master');
-
             return 1;
         }
 
-        // 把 fd 还原成 socket resource
-        $listenResource = socket_import_stream($fd);
+        // Linux：用 Socket 扩展从 int fd 还原 socket resource
+        if (! function_exists('socket_import_fd')) {
+            $this->error('socket_import_fd not available, cannot inherit fd');
+            return 1;
+        }
+
+        $listenResource = socket_import_fd($fd);
         if ($listenResource === false) {
-            $this->error("socket_import_stream failed for fd={$fd}");
-
+            $err = function_exists('socket_strerror')
+                ? socket_strerror(socket_last_error())
+                : 'unknown';
+            $this->error("socket_import_fd failed for fd={$fd}: {$err}");
             return 1;
         }
 
-        // 交给 server.php
         $GLOBALS['__edge_listen_resource'] = $listenResource;
-
-        $serverFile = base_path('extensions/edge/bin/server.php');
-        if (! is_file($serverFile)) {
-            $this->error("server.php not found: {$serverFile}");
-
-            return 1;
-        }
 
         $bootstrapFile = base_path('extensions/edge/bin/bootstrap.php');
         if (is_file($bootstrapFile)) {
             require_once $bootstrapFile;
         }
 
-        // server.php 会接管生命周期，这里不会返回
+        $serverFile = base_path('extensions/edge/bin/server.php');
+        if (! is_file($serverFile)) {
+            $this->error("server.php not found: {$serverFile}");
+            return 1;
+        }
+
         require $serverFile;
 
         return 0;
