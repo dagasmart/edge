@@ -125,8 +125,16 @@ if (function_exists('pcntl_signal')) {
 // ---------- 主循环 ----------
 while ($running) {
     try {
+        // ★ 关键：把 accept 超时设为 1 秒，让信号能及时打断阻塞
+        // （Swow\Server 的 accept 会尊重 recvMessageTimeout）
+        $server->setRecvMessageTimeout(1000);
         $conn = $server->acceptConnection();
     } catch (Throwable $e) {
+        // ★ 信号已把 $running 置 false，直接退出循环，不再 accept
+        if (! $running) {
+            break;
+        }
+
         $msg = $e->getMessage();
         if (! str_contains($msg, 'closed') && ! str_contains($msg, 'reset') && ! str_contains($msg, 'timed out')) {
             fwrite(STDERR, '[accept] '.$msg.PHP_EOL);
@@ -191,7 +199,7 @@ while ($running) {
                             handleAcl($conn, $req);
                             break;
 
-                            // ---------- 健康检查（三态，实时感知）----------
+                        // ---------- 健康检查（三态，实时感知）----------
                         case '/admin-api/extension/edge/health':
                             $stats = redisPoolStats();
                             $uptime = microtime(true) - $startTime;

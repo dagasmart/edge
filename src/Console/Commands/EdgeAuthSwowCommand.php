@@ -1,5 +1,6 @@
 <?php
 declare(strict_types=1);
+
 namespace DagaSmart\Edge\Console\Commands;
 
 use Illuminate\Console\Command;
@@ -10,14 +11,17 @@ class EdgeAuthSwowCommand extends Command
     protected $signature = 'edge:auth-swow
                             {--workers=4 : Number of worker processes}
                             {--port=9503 : Listen port (REUSEPORT)}';
+
     protected $description = 'Start Swow MQTT HMAC Auth Server for NanoMQ (multi-worker with fork)';
 
     /** @var array<int, int> pid => worker_id 映射 */
     protected array $children = [];
 
+    protected bool $stopping = false;
+
     public function handle(): int
     {
-        if (!extension_loaded('swow')) {
+        if (! extension_loaded('swow')) {
             $this->error('Swow extension not loaded.');
             return self::FAILURE;
         }
@@ -26,20 +30,18 @@ class EdgeAuthSwowCommand extends Command
         error_reporting(E_ALL);
         ini_set('display_errors', '1');
 
-        register_shutdown_function(function () {
+        register_shutdown_function(static function (): void {
             $e = error_get_last();
-            if ($e !== null && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
-                fwrite(STDERR, sprintf(
-                    "FATAL: %s in %s:%d\n",
-                    $e['message'], $e['file'], $e['line']
-                ));
+            if ($e !== null && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
+                fwrite(STDERR, sprintf("FATAL: %s in %s:%d\n", $e['message'], $e['file'], $e['line']));
             }
         });
 
-        set_exception_handler(function (Throwable $e) {
+        set_exception_handler(static function (Throwable $e): void {
             fwrite(STDERR, sprintf(
                 "UNCAUGHT: %s: %s in %s:%d\n%s\n",
-                get_class($e), $e->getMessage(),
+                get_class($e),
+                $e->getMessage(),
                 $e['file'] ?? $e->getFile(),
                 $e['line'] ?? $e->getLine(),
                 $e->getTraceAsString()
@@ -47,20 +49,25 @@ class EdgeAuthSwowCommand extends Command
         });
 
         $workers = (int) $this->option('workers');
-        $port    = (int) $this->option('port');
+        $port = (int) $this->option('port');
 
-        if (!defined('AUTH_PORT')) {
+        if ($workers < 1) {
+            $this->error('workers must be >= 1');
+            return self::FAILURE;
+        }
+
+        if (! defined('AUTH_PORT')) {
             define('AUTH_PORT', $port);
         }
 
         $serverFile = base_path('extensions/edge/bin/server.php');
-        if (!is_file($serverFile)) {
+        if (! is_file($serverFile)) {
             $this->error("Server file not found: {$serverFile}");
             return self::FAILURE;
         }
 
         // ========== 降级判断（唯一入口） ==========
-        if (!extension_loaded('pcntl') || strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+        if (! extension_loaded('pcntl') || strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
             if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
                 $this->warn('Windows detected, running in single-process mode (no fork).');
             } else {
@@ -76,34 +83,35 @@ class EdgeAuthSwowCommand extends Command
         }
 
         // ========== Linux + pcntl：fork 多 worker ==========
-        $this->info("Starting Edge Auth Server...");
-        $this->info("Laravel base_path: " . base_path());
-        $this->info("PHP " . PHP_VERSION . " | Swow " . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
+        $this->info('Starting Edge Auth Server...');
+        $this->info('Laravel base_path: ' . base_path());
+        $this->info('PHP ' . PHP_VERSION . ' | Swow ' . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
         $this->info("Port: {$port} | Workers: {$workers} | Mode: REUSEPORT fork");
         $this->info("Server file: {$serverFile}");
 
         pcntl_async_signals(true);
 
-        pcntl_signal(SIGTERM, function () {
+        pcntl_signal(SIGTERM, function (): void {
             $this->stopAllChildren('SIGTERM');
         });
 
-        pcntl_signal(SIGINT, function () {
+        pcntl_signal(SIGINT, function (): void {
             $this->stopAllChildren('SIGINT');
         });
 
-        pcntl_signal(SIGHUP, function () {
+        pcntl_signal(SIGHUP, function (): void {
             $this->info('SIGHUP received, reloading workers...');
             $this->stopAllChildren('SIGHUP', true);
         });
 
         for ($i = 1; $i <= $workers; $i++) {
             $this->spawnWorker($i, $serverFile);
+            usleep(100000); // 错开启动，避免 Redis 池同时预热冲击
         }
 
         $this->info("All {$workers} workers forked. Parent pid=" . getmypid());
 
-        while (count($this->children) > 0) {
+        while ($this->children !== []) {
             $pid = pcntl_waitpid(-1, $status, WNOHANG);
 
             if ($pid > 0) {
@@ -118,21 +126,24 @@ class EdgeAuthSwowCommand extends Command
                     $this->warn("Worker {$workerId} (pid={$pid}) killed by signal {$sig}");
                 }
 
-                if (!$this->stopping) {
-                    $newWorkerId = $workerId === '?' ? count($this->children) + 1 : $workerId;
-                    $this->warn("Restarting worker {$newWorkerId}...");
-                    $this->spawnWorker((int) $newWorkerId, $serverFile);
+                // ★ 非停止状态自动拉起（带重启频率限制）
+                if (! $this->stopping) {
+                    $newWorkerId = is_numeric($workerId) ? (int) $workerId : (count($this->children) + 1);
+                    if ($this->shouldRestart($newWorkerId)) {
+                        $this->warn("Restarting worker {$newWorkerId}...");
+                        $this->spawnWorker($newWorkerId, $serverFile);
+                    } else {
+                        $this->error("Worker {$newWorkerId} exceeded restart limit, not restarting");
+                    }
                 }
             }
 
-            usleep(500000);
+            usleep(200000);
         }
 
         $this->info('Parent process exiting.');
         return self::SUCCESS;
     }
-
-    protected bool $stopping = false;
 
     protected function spawnWorker(int $workerId, string $serverFile): void
     {
@@ -144,12 +155,21 @@ class EdgeAuthSwowCommand extends Command
         }
 
         if ($pid === 0) {
+            // ========== 子进程 ==========
             cli_set_process_title("edgeauth-worker-{$workerId}");
+
+            // ★ 关键：子进程必须显式开启异步信号，否则 SIGTERM 无法打断阻塞调用
+            if (function_exists('pcntl_async_signals')) {
+                pcntl_async_signals(true);
+            }
+
             pcntl_signal(SIGTERM, SIG_DFL);
             pcntl_signal(SIGINT, SIG_DFL);
             pcntl_signal(SIGHUP, SIG_DFL);
 
-            // ---------- 关键：手动加载 bootstrap ----------
+            // ★ 传给 server.php 当前 worker 编号
+            $GLOBALS['worker_id'] = $workerId;
+
             $bootstrapFile = base_path('extensions/edge/bin/bootstrap.php');
             if (is_file($bootstrapFile)) {
                 require_once $bootstrapFile;
@@ -158,7 +178,7 @@ class EdgeAuthSwowCommand extends Command
                 exit(1);
             }
 
-            if (!defined('AUTH_PORT')) {
+            if (! defined('AUTH_PORT')) {
                 define('AUTH_PORT', (int) $this->option('port'));
             }
 
@@ -166,6 +186,7 @@ class EdgeAuthSwowCommand extends Command
             exit(0);
         }
 
+        // ========== 父进程 ==========
         $this->children[$pid] = $workerId;
         $this->info("Worker {$workerId} forked, pid={$pid}");
     }
@@ -180,8 +201,9 @@ class EdgeAuthSwowCommand extends Command
             posix_kill($pid, SIGTERM);
         }
 
+        // ★ 给 5 秒优雅退出窗口
         $deadline = time() + 5;
-        while (count($this->children) > 0 && time() < $deadline) {
+        while ($this->children !== [] && time() < $deadline) {
             $pid = pcntl_waitpid(-1, $status, WNOHANG);
             if ($pid > 0) {
                 $workerId = $this->children[$pid];
@@ -191,12 +213,13 @@ class EdgeAuthSwowCommand extends Command
             usleep(100000);
         }
 
+        // ★ 残留进程 SIGKILL
         foreach ($this->children as $pid => $workerId) {
             $this->warn("Worker {$workerId} (pid={$pid}) did not exit in time, sending SIGKILL");
             posix_kill($pid, SIGKILL);
         }
 
-        while (count($this->children) > 0) {
+        while ($this->children !== []) {
             $pid = pcntl_waitpid(-1, $status);
             if ($pid > 0) {
                 $workerId = $this->children[$pid];
@@ -213,5 +236,21 @@ class EdgeAuthSwowCommand extends Command
             $this->info('All workers stopped. Parent exiting.');
             exit(0);
         }
+    }
+
+    /** 重启频率限制：60 秒内最多重启 10 次，防止雪崩 */
+    protected array $restartLog = [];
+
+    protected function shouldRestart(int $workerId): bool
+    {
+        $now = time();
+        $this->restartLog[$workerId] = array_filter(
+            $this->restartLog[$workerId] ?? [],
+            static fn (int $ts): bool => $now - $ts < 60
+        );
+
+        $this->restartLog[$workerId][] = $now;
+
+        return count($this->restartLog[$workerId]) <= 10;
     }
 }
