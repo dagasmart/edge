@@ -88,6 +88,8 @@ fwrite(STDOUT, '[EdgeAuth] Init took '.round($initTime, 2).'s'.PHP_EOL);
 
 // ---------- Server ----------
 $server = new Server;
+$serverRef = &$server; // 让信号协程能 close 它
+
 $server->setTcpNodelay(true)
     ->setTcpKeepAlive(true, 60)
     ->setRecvMessageTimeout(30000);
@@ -109,10 +111,11 @@ if (! $isWindows && $workerId > 0) {
     usleep((int) ($delay * 1000000));
 }
 
-// ---------- 优雅退出：Swow\Signal 协程接管（每个信号单独协程）----------
+// ---------- 优雅退出：Swow\Signal 协程接管 ----------
+// 关键：$server 必须传引用，close() 才能打断主循环的 accept
 $running = true;
 
-$signalCallback = static function (int $signo) use (&$running): void {
+$signalHandler = static function (int $signo) use (&$running, &$server): void {
     $name = match ($signo) {
         SIGTERM => 'SIGTERM',
         SIGINT => 'SIGINT',
@@ -120,22 +123,28 @@ $signalCallback = static function (int $signo) use (&$running): void {
     };
     fwrite(STDOUT, "[EdgeAuth] {$name} received via Swow\Signal, shutting down" . PHP_EOL);
     $running = false;
+
+    // ★ 强制关闭 server，打断主循环的 accept 阻塞
+    try {
+        $server->close();
+    } catch (Throwable) {
+    }
 };
 
-Coroutine::run(static function () use ($signalCallback): void {
+Coroutine::run(static function () use ($signalHandler): void {
     try {
         Signal::wait(SIGTERM);
     } catch (Throwable) {
     }
-    $signalCallback(SIGTERM);
+    $signalHandler(SIGTERM);
 });
 
-Coroutine::run(static function () use ($signalCallback): void {
+Coroutine::run(static function () use ($signalHandler): void {
     try {
         Signal::wait(SIGINT);
     } catch (Throwable) {
     }
-    $signalCallback(SIGINT);
+    $signalHandler(SIGINT);
 });
 
 // ---------- 主循环 ----------
@@ -147,6 +156,11 @@ while ($running) {
     } catch (Throwable $e) {
         // ★ 信号已把 $running 置 false，直接退出循环，不再 accept
         if (! $running) {
+            break;
+        }
+
+        // close() 会抛 closed 异常，也直接退出
+        if (str_contains($e->getMessage(), 'closed')) {
             break;
         }
 
