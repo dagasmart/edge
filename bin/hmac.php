@@ -2,19 +2,20 @@
 
 declare(strict_types=1);
 
+use Dagasmart\Edge\Support\EdgeAuthContext;
 use DagaSmart\Edge\Support\HmacValidator;
 use Swow\Channel;
 use Swow\Coroutine;
 
 /* =========================================================
- * HMAC 认证入口（Swow 侧）
+ * HMAC 认证入口（Swow 侧）—— 方案 A
  * ========================================================= */
 
 function hmacAuthenticate(string $clientId, string $username, string $password): bool
 {
-    debugLog('ENTER clientId=['.$clientId.'] username=['.$username.'] pw_len='.strlen($password));
+    debugLog('ENTER clientId=[' . $clientId . '] username=[' . $username . '] pw_len=' . strlen($password));
 
-    $l1Key = 'secret:'.$clientId.':'.$username;
+    $l1Key = 'secret:' . $clientId . ':' . $username;
 
     $result = HmacValidator::verify(
         $clientId,
@@ -24,10 +25,9 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
         // ★ secretResolver：自己管缓存，只用固定 key，不做 old 前缀猜测
         function (string $key) use ($l1Key, $clientId, $username): ?string {
             // 只响应 Validator 拼好的正式 key，忽略任何 old: 前缀的调用
-            $expect = 'device:secret:'.$clientId.':'.$username;
+            $expect = 'device:secret:' . $clientId . ':' . $username;
             if ($key !== $expect) {
-                debugLog('secretResolver IGNORED key=['.$key.'] (not canonical)');
-
+                debugLog('secretResolver IGNORED key=[' . $key . '] (not canonical)');
                 return null;
             }
             $secret = localCacheGet($l1Key);
@@ -37,7 +37,7 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
             $secret = redisGet($expect);
             if (is_string($secret) && $secret !== '') {
                 localCacheSet($l1Key, $secret, LOCAL_CACHE_TTL);
-                debugLog('secretResolver CACHED clientId=['.$clientId.']');
+                debugLog('secretResolver CACHED clientId=[' . $clientId . ']');
             }
 
             return $secret;
@@ -54,22 +54,24 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
     );
 
     if (($result['valid'] ?? false) === false) {
-        attachAuthReason($result['reason'] ?? 'unknown');
-        debugLog('REJECT: '.($result['reason'] ?? 'unknown'));
+        // ▼▼▼ 改用 EdgeAuthContext ▼▼▼
+        EdgeAuthContext::setAuthReason($result['reason'] ?? 'unknown');
+        // ▲▲▲ 替换结束 ▲▲▲
+        debugLog('REJECT: ' . ($result['reason'] ?? 'unknown'));
 
         return false;
     }
 
     $nonce = $result['nonce'];
     $timestamp = $result['timestamp'];
-    debugLog('validator PASS → nonce=['.$nonce.'] timestamp=['.$timestamp.']');
+    debugLog('validator PASS → nonce=[' . $nonce . '] timestamp=[' . $timestamp . ']');
 
     $chR = new Channel(1);
     $chN = new Channel(1);
 
     Coroutine::run(static function () use ($clientId, $chR): void {
         try {
-            $chR->push((bool) redisExists('device:revoke:'.$clientId), 2000);
+            $chR->push((bool) redisExists('device:revoke:' . $clientId), 2000);
         } catch (Throwable) {
             $chR->push(false, 2000);
         }
@@ -77,10 +79,10 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
 
     Coroutine::run(static function () use ($clientId, $username, $nonce, $chN): void {
         try {
-            $nk = 'device:nonce:'.$clientId.':'.$username;
+            $nk = 'device:nonce:' . $clientId . ':' . $username;
             $existing = redisGet($nk);
             if ($existing === $nonce) {
-                debugLog('nonce REPLAY detected for '.$nk);
+                debugLog('nonce REPLAY detected for ' . $nk);
                 $chN->push(false, 2000);
 
                 return;
@@ -91,7 +93,7 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
                 redisDel($nk);
             }
             $ok = redisSetex($nk, $ttl, $nonce);
-            debugLog('nonce WRITE nk=['.$nk.'] ok='.($ok ? 'true' : 'false'));
+            debugLog('nonce WRITE nk=[' . $nk . '] ok=' . ($ok ? 'true' : 'false'));
             $chN->push($ok, 2000);
         } catch (Throwable) {
             $chN->push(false, 2000);
@@ -102,44 +104,28 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
         $r = $chR->pop(2000);
         $n = $chN->pop(2000);
     } catch (Throwable) {
-        attachAuthReason('sub-coroutine timeout');
+        // ▼▼▼ 改用 EdgeAuthContext ▼▼▼
+        EdgeAuthContext::setAuthReason('sub-coroutine timeout');
+        // ▲▲▲ 替换结束 ▲▲▲
 
         return false;
     }
 
-    if ($r || ! $n) {
-        attachAuthReason($r ? 'revoked' : 'nonce_replay_or_set_failed');
-        debugLog('REJECT: revoked='.var_export($r, true).' nonce_ok='.var_export($n, true));
+    if ($r || !$n) {
+        // ▼▼▼ 改用 EdgeAuthContext ▼▼▼
+        EdgeAuthContext::setAuthReason($r ? 'revoked' : 'nonce_replay_or_set_failed');
+        // ▲▲▲ 替换结束 ▲▲▲
+        debugLog('REJECT: revoked=' . var_export($r, true) . ' nonce_ok=' . var_export($n, true));
 
         return false;
     }
 
-    debugLog('ACCEPT: '.$clientId);
+    debugLog('ACCEPT: ' . $clientId);
 
     return true;
 }
 
 /* =========================================================
- * 协程上下文工具
+ * 注意：attachAuthReason / detachAuthReason 已废弃
+ * 统一使用 Dagasmart\Edge\Support\EdgeAuthContext
  * ========================================================= */
-
-function attachAuthReason(string $reason): void
-{
-    if (! class_exists('Swow\Coroutine')) {
-        return;
-    }
-    $cid = Coroutine::getCurrent()->getId();
-    $GLOBALS['_auth_reason'][$cid] = $reason;
-}
-
-function detachAuthReason(): string
-{
-    if (! class_exists('Swow\Coroutine')) {
-        return '';
-    }
-    $cid = Coroutine::getCurrent()->getId();
-    $reason = $GLOBALS['_auth_reason'][$cid] ?? '';
-    unset($GLOBALS['_auth_reason'][$cid]);
-
-    return $reason;
-}

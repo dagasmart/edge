@@ -1,6 +1,8 @@
 <?php
+
 declare(strict_types=1);
 
+use Dagasmart\Edge\Support\EdgeAuthContext;
 use Swow\Coroutine;
 use Swow\Psr7\Server\Server;
 use Swow\Socket;
@@ -8,18 +10,42 @@ use Swow\Socket;
 require_once __DIR__.'/bootstrap.php';
 
 // ---------- 配置常量 ----------
-if (! defined('AUTH_PORT')) { define('AUTH_PORT', 9503); }
-if (! defined('REDIS_HOST')) { define('REDIS_HOST', '127.0.0.1'); }
-if (! defined('REDIS_PORT')) { define('REDIS_PORT', 16379); }
-if (! defined('REDIS_PASSWORD')) { define('REDIS_PASSWORD', 'uApDVQD7'); }
-if (! defined('REDIS_DB')) { define('REDIS_DB', 2); }
-if (! defined('REDIS_POOL_SIZE')) { define('REDIS_POOL_SIZE', 512); }
-if (! defined('MAX_CONCURRENCY')) { define('MAX_CONCURRENCY', 20000); }
-if (! defined('MAX_CONCURRENCY_PER_DEVICE')) { define('MAX_CONCURRENCY_PER_DEVICE', 2); }
-if (! defined('LOCAL_CACHE_TTL')) { define('LOCAL_CACHE_TTL', 60); }
-if (! defined('TIME_DRIFT')) { define('TIME_DRIFT', 300); }
-if (! defined('BACKLOG')) { define('BACKLOG', 4096); }
-if (! defined('AUTH_HTTP_PREFIX')) { define('AUTH_HTTP_PREFIX', '/admin-api/extension/edge'); }
+if (! defined('AUTH_PORT')) {
+    define('AUTH_PORT', 9503);
+}
+if (! defined('REDIS_HOST')) {
+    define('REDIS_HOST', '127.0.0.1');
+}
+if (! defined('REDIS_PORT')) {
+    define('REDIS_PORT', 16379);
+}
+if (! defined('REDIS_PASSWORD')) {
+    define('REDIS_PASSWORD', 'uApDVQD7');
+}
+if (! defined('REDIS_DB')) {
+    define('REDIS_DB', 2);
+}
+if (! defined('REDIS_POOL_SIZE')) {
+    define('REDIS_POOL_SIZE', 512);
+}
+if (! defined('MAX_CONCURRENCY')) {
+    define('MAX_CONCURRENCY', 20000);
+}
+if (! defined('MAX_CONCURRENCY_PER_DEVICE')) {
+    define('MAX_CONCURRENCY_PER_DEVICE', 2);
+}
+if (! defined('LOCAL_CACHE_TTL')) {
+    define('LOCAL_CACHE_TTL', 60);
+}
+if (! defined('TIME_DRIFT')) {
+    define('TIME_DRIFT', 300);
+}
+if (! defined('BACKLOG')) {
+    define('BACKLOG', 4096);
+}
+if (! defined('AUTH_HTTP_PREFIX')) {
+    define('AUTH_HTTP_PREFIX', '/admin-api/extension/edge');
+}
 
 // ---------- 加载业务文件 ----------
 require_once __DIR__.'/helper.php';
@@ -76,10 +102,10 @@ fwrite(STDOUT, '[EdgeAuth] Listening on 0.0.0.0:'.AUTH_PORT
 
 // ---------- Worker 错峰就绪 ----------
 $workerId = $GLOBALS['worker_id'] ?? 0;
-if (!$isWindows && $workerId > 0) {
+if (! $isWindows && $workerId > 0) {
     $delay = $workerId * 0.5;
     fwrite(STDOUT, "[EdgeAuth] Worker {$workerId} warm-up delay: {$delay}s".PHP_EOL);
-    usleep((int)($delay * 1000000));
+    usleep((int) ($delay * 1000000));
 }
 
 // ---------- 优雅退出 ----------
@@ -105,6 +131,7 @@ while ($running) {
         if (! str_contains($msg, 'closed') && ! str_contains($msg, 'reset') && ! str_contains($msg, 'timed out')) {
             fwrite(STDERR, '[accept] '.$msg.PHP_EOL);
         }
+
         continue;
     }
 
@@ -122,7 +149,7 @@ while ($running) {
                 }
 
                 // ★★★ 冷启动门禁：渐进放行 ★★★
-                if (!$ready) {
+                if (! $ready) {
                     $uptime = microtime(true) - $startTime;
 
                     // ★ 实时判断池子是否满 80%
@@ -139,6 +166,7 @@ while ($running) {
                                 'reason' => 'service_warming_up',
                                 'retry_after' => 1,
                             ], 503);
+
                             continue;
                         }
                     }
@@ -163,7 +191,7 @@ while ($running) {
                             handleAcl($conn, $req);
                             break;
 
-                        // ---------- 健康检查（三态，实时感知）----------
+                            // ---------- 健康检查（三态，实时感知）----------
                         case '/admin-api/extension/edge/health':
                             $stats = redisPoolStats();
                             $uptime = microtime(true) - $startTime;
@@ -171,7 +199,7 @@ while ($running) {
                                 ? ($stats['free'] / REDIS_POOL_SIZE)
                                 : 0;
 
-                            if (!$ready) {
+                            if (! $ready) {
                                 respondJson($conn, [
                                     'status' => 'warming',
                                     'phase' => 'cold_start',
@@ -258,6 +286,18 @@ while ($running) {
                 fwrite(STDERR, '[coroutine-fatal] '.$msg.PHP_EOL);
             }
         } finally {
+            try {
+                $authedUsername = EdgeAuthContext::getUsername();
+                $authedClientId = EdgeAuthContext::getClientId();
+                if ($authedUsername !== null && $authedClientId !== null) {
+                    releaseUserOnline($authedUsername, $authedClientId);
+                }
+            } catch (Throwable $e) {
+                fwrite(STDERR, '[release-online] '.$e->getMessage().PHP_EOL);
+            } finally {
+                EdgeAuthContext::clear();
+            }
+
             try {
                 $conn->close();
             } catch (Throwable) {
