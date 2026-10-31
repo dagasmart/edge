@@ -1,261 +1,236 @@
 <?php
-
 declare(strict_types=1);
-
 namespace DagaSmart\Edge\Console\Commands;
 
 use Illuminate\Console\Command;
-use Throwable;
+use Symfony\Component\Process\Process;
 
 class EdgeAuthSwowCommand extends Command
 {
     protected $signature = 'edge:auth-swow
-                            {--workers=4 : Number of worker processes}
-                            {--port=9503 : Listen port (SO_REUSEPORT)}';
+        {--workers=4 : Worker 进程数}
+        {--port=9503 : 监听端口}
+        {--max-restarts=100 : 单个 worker 最大重启次数（0=不限）}
+        {--restart-window=60 : 重启计数窗口秒数}
+        {--backlog=4096 : listen backlog}';
 
-    protected $description = 'Start Swow MQTT HMAC Auth Server for NanoMQ (per-worker REUSEPORT fork model)';
+    protected $description = '启动 Edge Auth Swow Server（master-fd 继承模型）';
 
-    /** @var array<int, int> pid => worker_id */
+    protected int $port;
+    protected int $workers;
+    protected int $backlog;
+    protected string $serverFile;
+    protected string $bootstrapFile;
+
+    /** @var array<int,int> pid => workerId */
     protected array $children = [];
 
-    protected bool $stopping = false;
+    /** @var array<int,int> workerId => restart timestamps */
+    protected array $restartCounts = [];
+
+    protected int $restartWindow;
+    protected int $maxRestarts;
+    protected int $nextWorkerId = 1;
+
+    protected $listenStream;
 
     public function handle(): int
     {
-        if (! extension_loaded('swow')) {
-            $this->error('Swow extension not loaded.');
-            return self::FAILURE;
+        $this->port = (int) $this->option('port');
+        $this->workers = (int) $this->option('workers');
+        $this->backlog = (int) $this->option('backlog');
+        $this->maxRestarts = (int) $this->option('max-restarts');
+        $this->restartWindow = (int) $this->option('restart-window');
+
+        $base = base_path();
+        $this->serverFile = $base . '/extensions/edge/bin/server.php';
+        $this->bootstrapFile = $base . '/extensions/edge/bin/bootstrap.php';
+
+        if (! is_file($this->serverFile)) {
+            $this->error("server.php not found: {$this->serverFile}");
+
+            return 1;
         }
 
-        if (! extension_loaded('pcntl')) {
-            $this->warn('pcntl not loaded, fallback to single-process mode.');
-            return $this->runSingleWorker();
+        // ---------- master 建 listen socket ----------
+        $this->listenStream = socket_create_listen($this->port, $this->backlog);
+        if ($this->listenStream === false) {
+            $err = function_exists('socket_strerror')
+                ? socket_strerror(socket_last_error())
+                : 'socket_listen failed';
+            $this->error("master socket_listen failed: {$err}");
+
+            return 1;
         }
 
-        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
-            $this->warn('Windows detected, fallback to single-process mode.');
-            return $this->runSingleWorker();
-        }
+        socket_set_option($this->listenStream, SOL_SOCKET, SO_REUSEADDR, 1);
+        socket_set_nonblock($this->listenStream);
 
-        // ---------- 错误兜底 ----------
-        error_reporting(E_ALL);
-        ini_set('display_errors', '1');
+        $isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
 
-        register_shutdown_function(static function (): void {
-            $e = error_get_last();
-            if ($e !== null && in_array($e['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR], true)) {
-                fwrite(STDERR, sprintf(
-                    "FATAL: %s in %s:%d\n",
-                    $e['message'],
-                    $e['file'],
-                    $e['line']
-                ));
+        $this->info('Starting Edge Auth Server (master-fd inheritance model)...');
+        $this->line("Laravel base_path: {$base}");
+        $this->line('PHP ' . PHP_VERSION);
+        $this->line("Port: {$this->port} | Workers: {$this->workers} | Mode: master-fd");
+        $this->line("OS: " . PHP_OS . ($isWindows ? ' (Windows, single-process fallback)' : ''));
+        $this->line("Server file: {$this->serverFile}");
+
+        // ---------- Windows 降级：单进程直接跑 server.php ----------
+        if ($isWindows) {
+            $this->warn('Windows detected: pcntl not available, running in single-process mode.');
+            $this->warn('For production multi-worker, deploy to Linux.');
+
+            $GLOBALS['worker_id'] = 1;
+            $GLOBALS['__edge_listen_resource'] = $this->listenStream;
+
+            if (is_file($this->bootstrapFile)) {
+                require_once $this->bootstrapFile;
             }
-        });
 
-        set_exception_handler(static function (Throwable $e): void {
-            fwrite(STDERR, sprintf(
-                "UNCAUGHT: %s: %s in %s:%d\n%s\n",
-                get_class($e),
-                $e->getMessage(),
-                $e['file'] ?? $e->getFile(),
-                $e['line'] ?? $e->getLine(),
-                $e->getTraceAsString()
-            ));
-        });
+            require $this->serverFile;
 
-        $workers = (int) $this->option('workers');
-        $port = (int) $this->option('port');
-
-        if ($workers < 1) {
-            $this->error('workers must be >= 1');
-            return self::FAILURE;
+            return 0;
         }
 
-        if (! defined('AUTH_PORT')) {
-            define('AUTH_PORT', $port);
+        // ---------- Linux：注册信号处理 ----------
+        if (function_exists('pcntl_async_signals')) {
+            pcntl_async_signals(true);
         }
 
-        $serverFile = base_path('extensions/edge/bin/server.php');
-        if (! is_file($serverFile)) {
-            $this->error("Server file not found: {$serverFile}");
-            return self::FAILURE;
+        if (function_exists('pcntl_signal')) {
+            pcntl_signal(SIGTERM, function (): void {
+                $this->shutdown('SIGTERM');
+            });
+            pcntl_signal(SIGINT, function (): void {
+                $this->shutdown('SIGINT');
+            });
         }
 
-        // ---------- master 不建 socket，只 fork ----------
-        $this->info('Starting Edge Auth Server (per-worker REUSEPORT model)...');
-        $this->info('Laravel base_path: ' . base_path());
-        $this->info('PHP ' . PHP_VERSION . ' | Swow ' . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
-        $this->info("Port: {$port} | Workers: {$workers} | Mode: per-worker SO_REUSEPORT");
-        $this->info("Server file: {$serverFile}");
-
-        pcntl_async_signals(true);
-        pcntl_signal(SIGTERM, fn () => $this->stopAllChildren('SIGTERM'));
-        pcntl_signal(SIGINT, fn () => $this->stopAllChildren('SIGINT'));
-        pcntl_signal(SIGHUP, function (): void {
-            $this->info('SIGHUP received, reloading workers...');
-            $this->stopAllChildren('SIGHUP', true);
-        });
-
-        // ---------- fork workers ----------
-        for ($i = 1; $i <= $workers; $i++) {
-            $this->spawnWorker($i, $serverFile);
+        // ---------- 启动初始 worker ----------
+        for ($i = 0; $i < $this->workers; $i++) {
+            $this->spawnWorker();
+            usleep(100_000);
         }
 
-        $this->info("All {$workers} workers forked. Parent pid=" . getmypid());
+        $this->line("All {$this->workers} workers forked. Parent pid=" . getmypid());
 
-        // ---------- master 事件循环 ----------
-        while ($this->children !== []) {
-            $pid = pcntl_waitpid(-1, $status, WNOHANG);
+        // ---------- master 守护循环 ----------
+        while (true) {
+            if (function_exists('pcntl_waitpid')) {
+                $status = 0;
+                $pid = pcntl_waitpid(-1, $status, WNOHANG);
 
-            if ($pid > 0) {
-                $workerId = $this->children[$pid] ?? '?';
-                unset($this->children[$pid]);
+                if ($pid > 0) {
+                    $workerId = $this->children[$pid] ?? null;
+                    unset($this->children[$pid]);
 
-                if (pcntl_wifexited($status)) {
-                    $code = pcntl_wexitstatus($status);
-                    $this->warn("Worker {$workerId} (pid={$pid}) exited with code {$code}");
-                } elseif (pcntl_wifsignaled($status)) {
-                    $sig = pcntl_wtermsig($status);
-                    $this->warn("Worker {$workerId} (pid={$pid}) killed by signal {$sig}");
-                }
+                    if ($workerId !== null) {
+                        $exitCode = pcntl_wexitstatus($status);
+                        $this->line("Worker {$workerId} (pid={$pid}) exited with code {$exitCode}");
 
-                // ★ 非停止状态自动拉起
-                if (! $this->stopping) {
-                    $newWorkerId = is_numeric($workerId) ? (int) $workerId : count($this->children) + 1;
-                    $this->warn("Restarting worker {$newWorkerId}...");
-                    $this->spawnWorker($newWorkerId, $serverFile);
+                        if ($this->shouldRestart($workerId)) {
+                            $this->line("Restarting worker {$workerId}...");
+                            $this->spawnWorker($workerId);
+                        } else {
+                            $this->warn("Worker {$workerId} exceeded restart limit, not restarting");
+                        }
+                    }
                 }
             }
 
-            usleep(200000);
-        }
+            if (empty($this->children)) {
+                $this->line('All workers exited. Parent exiting.');
 
-        $this->info('Parent process exiting.');
-        return self::SUCCESS;
+                return 0;
+            }
+
+            usleep(100_000);
+        }
     }
 
-    /**
-     * fork 一个 worker
-     * 关键点：worker 内自己创建 REUSEPORT socket
-     */
-    protected function spawnWorker(int $workerId, string $serverFile): void
+    protected function spawnWorker(?int $workerId = null): void
     {
-        $pid = pcntl_fork();
+        $workerId = $workerId ?? $this->nextWorkerId++;
 
-        if ($pid === -1) {
-            $this->error("Failed to fork worker {$workerId}");
-            return;
-        }
+        $cmd = [
+            PHP_BINARY,
+            'artisan',
+            'edge:auth-swow:worker',
+            '--port=' . $this->port,
+            '--worker-id=' . $workerId,
+            '--backlog=' . $this->backlog,
+        ];
 
-        if ($pid === 0) {
-            // ========== 子进程 ==========
-            pcntl_signal(SIGTERM, SIG_DFL);
-            pcntl_signal(SIGINT, SIG_DFL);
-            pcntl_signal(SIGHUP, SIG_DFL);
+        $fd = socket_export_stream($this->listenStream);
 
-            cli_set_process_title("edgeauth-worker-{$workerId}");
+        $process = new Process($cmd, base_path());
+        $process->setEnv([
+            ...getenv(),
+            '__EDGE_LISTEN_FD' => (string) $fd,
+        ]);
+        $process->start();
 
-            // ★ worker_id 传给 server.php
-            $GLOBALS['worker_id'] = $workerId;
-
-            // ★ 每个 worker 自己加载 bootstrap
-            $bootstrapFile = base_path('extensions/edge/bin/bootstrap.php');
-            if (is_file($bootstrapFile)) {
-                require_once $bootstrapFile;
-            } else {
-                fwrite(STDERR, "FATAL: bootstrap.php not found at {$bootstrapFile}" . PHP_EOL);
-                exit(1);
-            }
-
-            if (! defined('AUTH_PORT')) {
-                define('AUTH_PORT', (int) $this->option('port'));
-            }
-
-            // ★ server.php 内会自己建 REUSEPORT socket + listen
-            require $serverFile;
-            exit(0);
-        }
-
-        // ========== 父进程 ==========
+        $pid = $process->getPid();
         $this->children[$pid] = $workerId;
-        $this->info("Worker {$workerId} forked, pid={$pid}");
+        $this->line("Worker {$workerId} forked, pid={$pid}");
     }
 
-    protected function stopAllChildren(string $signalName, bool $reload = false): void
+    protected function shouldRestart(int $workerId): bool
     {
-        $this->stopping = true;
-        $this->info("{$signalName} received, stopping all workers...");
+        if ($this->maxRestarts <= 0) {
+            return true;
+        }
+
+        $now = time();
+        $entries = $this->restartCounts[$workerId] ?? [];
+        $entries = array_filter($entries, fn (int $t) => $now - $t < $this->restartWindow);
+        $entries[] = $now;
+
+        $this->restartCounts[$workerId] = $entries;
+
+        return count($entries) <= $this->maxRestarts;
+    }
+
+    protected function shutdown(string $signal): void
+    {
+        $this->line("{$signal} received, stopping all workers...");
 
         foreach ($this->children as $pid => $workerId) {
-            $this->info("Sending SIGTERM to worker {$workerId} (pid={$pid})");
-            posix_kill($pid, SIGTERM);
-        }
-
-        $deadline = time() + 5;
-        while ($this->children !== [] && time() < $deadline) {
-            $pid = pcntl_waitpid(-1, $status, WNOHANG);
-            if ($pid > 0) {
-                $workerId = $this->children[$pid];
-                unset($this->children[$pid]);
-                $this->info("Worker {$workerId} (pid={$pid}) exited gracefully");
-            }
-            usleep(100000);
-        }
-
-        foreach ($this->children as $pid => $workerId) {
-            $this->warn("Worker {$workerId} (pid={$pid}) did not exit in time, sending SIGKILL");
-            posix_kill($pid, SIGKILL);
-        }
-
-        while ($this->children !== []) {
-            $pid = pcntl_waitpid(-1, $status);
-            if ($pid > 0) {
-                $workerId = $this->children[$pid];
-                unset($this->children[$pid]);
-                $this->info("Worker {$workerId} (pid={$pid}) force-killed");
+            $this->line("Sending SIGTERM to worker {$workerId} (pid={$pid})");
+            if (function_exists('posix_kill')) {
+                posix_kill($pid, SIGTERM);
             }
         }
 
-        $this->stopping = false;
-
-        if ($reload) {
-            $this->info('Reload complete. Workers will be respawned by main loop.');
-        } else {
-            $this->info('All workers stopped. Parent exiting.');
-            exit(0);
-        }
-    }
-
-    /**
-     * 单进程降级模式
-     */
-    protected function runSingleWorker(): int
-    {
-        $port = (int) $this->option('port');
-
-        if (! defined('AUTH_PORT')) {
-            define('AUTH_PORT', $port);
+        $timeout = 5;
+        $start = time();
+        while (! empty($this->children) && (time() - $start) < $timeout) {
+            if (function_exists('pcntl_waitpid')) {
+                $status = 0;
+                $pid = pcntl_waitpid(-1, $status, WNOHANG);
+                if ($pid > 0) {
+                    $workerId = $this->children[$pid] ?? null;
+                    unset($this->children[$pid]);
+                    if ($workerId !== null) {
+                        $this->line("Worker {$workerId} (pid={$pid}) exited gracefully");
+                    }
+                }
+            }
+            usleep(100_000);
         }
 
-        $serverFile = base_path('extensions/edge/bin/server.php');
-        if (! is_file($serverFile)) {
-            $this->error("Server file not found: {$serverFile}");
-            return self::FAILURE;
+        foreach ($this->children as $pid => $workerId) {
+            $this->line("Force killing worker {$workerId} (pid={$pid})");
+            if (function_exists('posix_kill')) {
+                posix_kill($pid, SIGKILL);
+            }
         }
 
-        $this->info("Starting Edge Auth Server on port {$port} (single worker)...");
-        $this->info('Laravel base_path: ' . base_path());
-        $this->info('PHP ' . PHP_VERSION . ' | Swow ' . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
-
-        $GLOBALS['worker_id'] = 0;
-
-        $bootstrapFile = base_path('extensions/edge/bin/bootstrap.php');
-        if (is_file($bootstrapFile)) {
-            require_once $bootstrapFile;
+        if (is_resource($this->listenStream)) {
+            socket_close($this->listenStream);
         }
 
-        require $serverFile;
-        return self::SUCCESS;
+        $this->line('All workers stopped. Parent exiting.');
+        exit(0);
     }
 }
