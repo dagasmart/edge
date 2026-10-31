@@ -2,82 +2,150 @@
 
 declare(strict_types=1);
 
+use Dagasmart\Edge\Support\EdgeAuthContext;
 use Swow\Coroutine;
-use Swow\Signal;
+use Swow\Psr7\Server\Server;
 use Swow\Socket;
-use Swow\SocketException;
+
+require_once __DIR__.'/bootstrap.php';
 
 // ---------- 配置常量 ----------
-const AUTH_PORT = 9503;
-const AUTH_HTTP_PREFIX = '/admin-api/extension/edge';
-const REDIS_POOL_SIZE = 512;
-const REDIS_POOL_PROBE = 3;
-const REDIS_POOL_TIMEOUT = 2.0;
-const REDIS_POOL_FILL_INTERVAL = 10000; // 10ms，微秒
-const REDIS_RETRY_INTERVAL = 100000;    // 100ms，微秒
-const CONCURRENCY_LIMIT = 4000;
-const DEVICE_CONCURRENCY_LIMIT = 16;
-const LOCAL_CACHE_SIZE = 5000;
-const LOCAL_CACHE_TTL = 30;
-const METRICS_RESET_INTERVAL = 300;
-const SESSION_TTL = 3600;
-const AUTH_TIMEOUT = 3.0;
-const SUPER_TIMEOUT = 3.0;
-const ACL_TIMEOUT = 3.0;
+if (! defined('AUTH_PORT')) {
+    define('AUTH_PORT', 9503);
+}
+if (! defined('REDIS_HOST')) {
+    define('REDIS_HOST', '127.0.0.1');
+}
+if (! defined('REDIS_PORT')) {
+    define('REDIS_PORT', 16379);
+}
+if (! defined('REDIS_PASSWORD')) {
+    define('REDIS_PASSWORD', 'uApDVQD7');
+}
+if (! defined('REDIS_DB')) {
+    define('REDIS_DB', 2);
+}
+if (! defined('REDIS_POOL_SIZE')) {
+    define('REDIS_POOL_SIZE', 512);
+}
+if (! defined('MAX_CONCURRENCY')) {
+    define('MAX_CONCURRENCY', 20000);
+}
+if (! defined('MAX_CONCURRENCY_PER_DEVICE')) {
+    define('MAX_CONCURRENCY_PER_DEVICE', 2);
+}
+if (! defined('LOCAL_CACHE_TTL')) {
+    define('LOCAL_CACHE_TTL', 60);
+}
+if (! defined('TIME_DRIFT')) {
+    define('TIME_DRIFT', 300);
+}
+if (! defined('BACKLOG')) {
+    define('BACKLOG', 4096);
+}
+if (! defined('AUTH_HTTP_PREFIX')) {
+    define('AUTH_HTTP_PREFIX', '/admin-api/extension/edge');
+}
 
-// ---------- 全局状态 ----------
-$running = true;
-$ready = false;
-$poolReady = false;
+// ---------- 加载业务文件 ----------
+require_once __DIR__.'/helper.php';
+require_once __DIR__.'/hmac.php';
+require_once __DIR__.'/auth.php';
+
+// ---------- 初始化 ----------
+$ready = false;              // 冷启动门禁
+$poolReady = false;          // Redis 池就绪标记（实时更新）
 $startTime = microtime(true);
 
-// ---------- 信号处理：只置标志，不依赖二次 wait ----------
-// 用循环 wait，确保每次信号都能被消费
-Coroutine::run(static function () use (&$running): void {
-    while ($running) {
-        try {
-            Signal::wait([SIGTERM, SIGINT]);
-        } catch (Throwable) {
-            break;
-        }
+try {
+    fwrite(STDOUT, '[EdgeAuth] Redis pool: '.REDIS_POOL_SIZE.'-'.REDIS_DB.PHP_EOL);
+    redisPoolInit(REDIS_POOL_SIZE, REDIS_DB);
+    $st = redisPoolStats();
+    fwrite(STDOUT, '[EdgeAuth] Redis pool: '.$st['free'].'/'.$st['total'].PHP_EOL);
+} catch (Throwable $e) {
+    fwrite(STDERR, '[EdgeAuth] Redis DEGRADED: '.$e->getMessage().PHP_EOL);
+}
+
+localCacheInit();
+
+// ★ 冷启动：先以 1/5 容量启动信号量
+$initialConcurrency = max(10, (int) ceil(MAX_CONCURRENCY / 5));
+concurrencyInit($initialConcurrency);
+
+// ★ 后台渐进扩容到满容量
+if ($initialConcurrency < MAX_CONCURRENCY) {
+    concurrencyProgressiveExpand(MAX_CONCURRENCY, 10, 300);
+}
+
+deviceConcurrencyInit(MAX_CONCURRENCY_PER_DEVICE, 300);
+
+// ---------- 冷启动：不阻塞等待，靠门禁 + health 实时感知 ----------
+$initTime = microtime(true) - $startTime;
+fwrite(STDOUT, '[EdgeAuth] Server READY (cold start, Redis pool filling in background)'.PHP_EOL);
+fwrite(STDOUT, '[EdgeAuth] Pool: 3 probed, background filling to '.REDIS_POOL_SIZE.' total'.PHP_EOL);
+fwrite(STDOUT, '[EdgeAuth] Init took '.round($initTime, 2).'s'.PHP_EOL);
+
+// ---------- Server ----------
+$server = new Server;
+$server->setTcpNodelay(true)
+    ->setTcpKeepAlive(true, 60)
+    ->setRecvMessageTimeout(30000);
+
+$isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+$bindFlags = $isWindows ? Socket::BIND_FLAG_NONE : Socket::BIND_FLAG_REUSEPORT;
+
+$server->bind('0.0.0.0', AUTH_PORT, $bindFlags)
+    ->listen(BACKLOG);
+
+fwrite(STDOUT, '[EdgeAuth] Listening on 0.0.0.0:'.AUTH_PORT
+    .($isWindows ? ' (single-process, no REUSEPORT)' : ' (REUSEPORT)').PHP_EOL);
+
+// ---------- Worker 错峰就绪 ----------
+$workerId = $GLOBALS['worker_id'] ?? 0;
+if (! $isWindows && $workerId > 0) {
+    $delay = $workerId * 0.5;
+    fwrite(STDOUT, "[EdgeAuth] Worker {$workerId} warm-up delay: {$delay}s".PHP_EOL);
+    usleep((int) ($delay * 1000000));
+}
+
+// ---------- 优雅退出 ----------
+$running = true;
+if (function_exists('pcntl_signal')) {
+    pcntl_async_signals(true);
+    pcntl_signal(SIGTERM, function () use (&$running): void {
+        fwrite(STDOUT, '[EdgeAuth] SIGTERM received, shutting down'.PHP_EOL);
         $running = false;
-        // 不要 break，让协程退出循环自然结束
-    }
-});
+    });
+    pcntl_signal(SIGINT, function () use (&$running): void {
+        fwrite(STDOUT, '[EdgeAuth] SIGINT received, shutting down'.PHP_EOL);
+        $running = false;
+    });
+}
 
-// ---------- 启动服务器 ----------
-$server = new Socket(Socket::TYPE_TCP);
-$server->setReusePort(true)->bind('0.0.0.0', AUTH_PORT)->listen();
-
-fwrite(STDOUT, '[EdgeAuth] Listening on 0.0.0.0:'.AUTH_PORT.' (REUSEPORT)'.PHP_EOL);
-
-// ---------- 主循环：用 try/catch 接 close() 抛出的异常 ----------
+// ---------- 主循环 ----------
 while ($running) {
     try {
+        // ★ 关键：把 accept 超时设为 1 秒，让信号能及时打断阻塞
+        // （Swow\Server 的 accept 会尊重 recvMessageTimeout）
+        $server->setRecvMessageTimeout(1000);
         $conn = $server->acceptConnection();
-    } catch (SocketException $e) {
-        // close() 被调用时 accept 会抛异常，这里统一处理
+    } catch (Throwable $e) {
+        // ★ 信号已把 $running 置 false，直接退出循环，不再 accept
         if (! $running) {
-            fwrite(STDOUT, '[EdgeAuth] Server closed, exiting main loop'.PHP_EOL);
             break;
         }
-        // 非关闭导致的异常，记录并继续
+
         $msg = $e->getMessage();
-        if (! str_contains($msg, 'closed') && ! str_contains($msg, 'reset')) {
+        if (! str_contains($msg, 'closed') && ! str_contains($msg, 'reset') && ! str_contains($msg, 'timed out')) {
             fwrite(STDERR, '[accept] '.$msg.PHP_EOL);
         }
-        continue;
-    } catch (Throwable $e) {
-        if (! $running) {
-            break;
-        }
-        fwrite(STDERR, '[accept-fatal] '.$e->getMessage().PHP_EOL);
+
         continue;
     }
 
-    Coroutine::run(static function () use ($conn, &$ready, &$poolReady, $startTime, &$running): void {
+    Coroutine::run(static function () use ($conn, &$ready, &$poolReady, $startTime): void {
         try {
-            while ($running) {
+            while (true) {
                 try {
                     $req = $conn->recvHttpRequest();
                 } catch (Throwable $e) {
@@ -88,14 +156,17 @@ while ($running) {
                     break;
                 }
 
+                // ★★★ 冷启动门禁：渐进放行 ★★★
                 if (! $ready) {
                     $uptime = microtime(true) - $startTime;
 
+                    // ★ 实时判断池子是否满 80%
                     if (redisPoolIsReady(0.8)) {
                         $ready = true;
                         $poolReady = true;
                         fwrite(STDOUT, '[EdgeAuth] Pool reached 80%, gate OPEN'.PHP_EOL);
                     } else {
+                        // 池子未满：按时间比例放行
                         $allowRatio = min(1.0, $uptime / 3.0 * 0.3);
                         if ($uptime < 3.0 && mt_rand(1, 100) / 100 > $allowRatio) {
                             respondJson($conn, [
@@ -103,6 +174,7 @@ while ($running) {
                                 'reason' => 'service_warming_up',
                                 'retry_after' => 1,
                             ], 503);
+
                             continue;
                         }
                     }
@@ -126,10 +198,14 @@ while ($running) {
                         case '/admin-api/extension/edge/acl':
                             handleAcl($conn, $req);
                             break;
+
+                        // ---------- 健康检查（三态，实时感知）----------
                         case '/admin-api/extension/edge/health':
                             $stats = redisPoolStats();
                             $uptime = microtime(true) - $startTime;
-                            $poolRatio = REDIS_POOL_SIZE > 0 ? ($stats['free'] / REDIS_POOL_SIZE) : 0;
+                            $poolRatio = REDIS_POOL_SIZE > 0
+                                ? ($stats['free'] / REDIS_POOL_SIZE)
+                                : 0;
 
                             if (! $ready) {
                                 respondJson($conn, [
@@ -174,12 +250,14 @@ while ($running) {
                                 ], 200);
                             }
                             break;
+
                         case '/admin-api/extension/edge/metrics':
                             $m = metricsSnapshot();
                             $m['device_concurrency'] = deviceConcurrencyStats();
                             $m['global_concurrency'] = concurrencyStats();
                             respondJson($conn, $m, 200);
                             break;
+
                         default:
                             respondJson($conn, [
                                 'service' => 'EdgeAuth',
@@ -234,16 +312,6 @@ while ($running) {
             }
         }
     });
-}
-
-// ---------- 优雅关闭：关闭监听 socket，打断 accept，等待连接处理完 ----------
-$server->close();
-
-// 给正在处理的协程一点时间完成
-$waitStart = microtime(true);
-while (microtime(true) - $waitStart < 2.0) {
-    // 短暂让出 CPU，让协程有机会完成
-    Coroutine::yield();
 }
 
 fwrite(STDOUT, '[EdgeAuth] shutdown gracefully'.PHP_EOL);
