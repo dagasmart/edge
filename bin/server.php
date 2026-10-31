@@ -109,19 +109,33 @@ if (! $isWindows && $workerId > 0) {
     usleep((int) ($delay * 1000000));
 }
 
-// ---------- 优雅退出：Swow\Signal 协程接管，替代 pcntl_signal ----------
+// ---------- 优雅退出：Swow\Signal 协程接管（每个信号单独协程）----------
 $running = true;
 
-Coroutine::run(static function () use (&$running): void {
-    while ($running) {
-        try {
-            Signal::wait([SIGTERM, SIGINT]);
-        } catch (Throwable) {
-            break;
-        }
-        fwrite(STDOUT, '[EdgeAuth] SIGTERM received via Swow\Signal, shutting down'.PHP_EOL);
-        $running = false;
+$signalCallback = static function (int $signo) use (&$running): void {
+    $name = match ($signo) {
+        SIGTERM => 'SIGTERM',
+        SIGINT => 'SIGINT',
+        default => "signal {$signo}",
+    };
+    fwrite(STDOUT, "[EdgeAuth] {$name} received via Swow\Signal, shutting down" . PHP_EOL);
+    $running = false;
+};
+
+Coroutine::run(static function () use ($signalCallback): void {
+    try {
+        Signal::wait(SIGTERM);
+    } catch (Throwable) {
     }
+    $signalCallback(SIGTERM);
+});
+
+Coroutine::run(static function () use ($signalCallback): void {
+    try {
+        Signal::wait(SIGINT);
+    } catch (Throwable) {
+    }
+    $signalCallback(SIGINT);
 });
 
 // ---------- 主循环 ----------
