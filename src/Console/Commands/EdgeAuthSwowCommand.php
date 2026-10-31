@@ -26,7 +26,6 @@ class EdgeAuthSwowCommand extends Command
             return self::FAILURE;
         }
 
-        // ---------- 错误兜底 ----------
         error_reporting(E_ALL);
         ini_set('display_errors', '1');
 
@@ -66,7 +65,7 @@ class EdgeAuthSwowCommand extends Command
             return self::FAILURE;
         }
 
-        // ========== 降级判断（唯一入口） ==========
+        // ========== 降级判断 ==========
         if (! extension_loaded('pcntl') || strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
             if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
                 $this->warn('Windows detected, running in single-process mode (no fork).');
@@ -82,7 +81,7 @@ class EdgeAuthSwowCommand extends Command
             return self::SUCCESS;
         }
 
-        // ========== Linux + pcntl：fork 多 worker ==========
+        // ========== Linux + pcntl ==========
         $this->info('Starting Edge Auth Server...');
         $this->info('Laravel base_path: ' . base_path());
         $this->info('PHP ' . PHP_VERSION . ' | Swow ' . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
@@ -106,7 +105,7 @@ class EdgeAuthSwowCommand extends Command
 
         for ($i = 1; $i <= $workers; $i++) {
             $this->spawnWorker($i, $serverFile);
-            usleep(100000); // 错开启动，避免 Redis 池同时预热冲击
+            usleep(100000);
         }
 
         $this->info("All {$workers} workers forked. Parent pid=" . getmypid());
@@ -126,7 +125,6 @@ class EdgeAuthSwowCommand extends Command
                     $this->warn("Worker {$workerId} (pid={$pid}) killed by signal {$sig}");
                 }
 
-                // ★ 非停止状态自动拉起（带重启频率限制）
                 if (! $this->stopping) {
                     $newWorkerId = is_numeric($workerId) ? (int) $workerId : (count($this->children) + 1);
                     if ($this->shouldRestart($newWorkerId)) {
@@ -155,19 +153,16 @@ class EdgeAuthSwowCommand extends Command
         }
 
         if ($pid === 0) {
-            // ========== 子进程 ==========
             cli_set_process_title("edgeauth-worker-{$workerId}");
 
-            // ★ 关键：子进程必须显式开启异步信号，否则 SIGTERM 无法打断阻塞调用
+            // ★ 子进程开启异步信号（Swow\Signal 需要）
             if (function_exists('pcntl_async_signals')) {
                 pcntl_async_signals(true);
             }
 
-            pcntl_signal(SIGTERM, SIG_DFL);
-            pcntl_signal(SIGINT, SIG_DFL);
-            pcntl_signal(SIGHUP, SIG_DFL);
+            // ★ 不再设置 SIG_DFL —— 让 Swow\Signal 在 server.php 里接管
+            // ★ 父进程发 SIGTERM 时，子进程的 Swow 事件循环会收到并唤醒 Signal::wait()
 
-            // ★ 传给 server.php 当前 worker 编号
             $GLOBALS['worker_id'] = $workerId;
 
             $bootstrapFile = base_path('extensions/edge/bin/bootstrap.php');
@@ -186,7 +181,6 @@ class EdgeAuthSwowCommand extends Command
             exit(0);
         }
 
-        // ========== 父进程 ==========
         $this->children[$pid] = $workerId;
         $this->info("Worker {$workerId} forked, pid={$pid}");
     }
@@ -201,8 +195,8 @@ class EdgeAuthSwowCommand extends Command
             posix_kill($pid, SIGTERM);
         }
 
-        // ★ 给 5 秒优雅退出窗口
-        $deadline = time() + 5;
+        // 3 秒足够：accept 超时 1s + 清理协程
+        $deadline = time() + 3;
         while ($this->children !== [] && time() < $deadline) {
             $pid = pcntl_waitpid(-1, $status, WNOHANG);
             if ($pid > 0) {
@@ -213,7 +207,6 @@ class EdgeAuthSwowCommand extends Command
             usleep(100000);
         }
 
-        // ★ 残留进程 SIGKILL
         foreach ($this->children as $pid => $workerId) {
             $this->warn("Worker {$workerId} (pid={$pid}) did not exit in time, sending SIGKILL");
             posix_kill($pid, SIGKILL);
@@ -238,7 +231,6 @@ class EdgeAuthSwowCommand extends Command
         }
     }
 
-    /** 重启频率限制：60 秒内最多重启 10 次，防止雪崩 */
     protected array $restartLog = [];
 
     protected function shouldRestart(int $workerId): bool

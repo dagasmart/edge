@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Dagasmart\Edge\Support\EdgeAuthContext;
 use Swow\Coroutine;
 use Swow\Psr7\Server\Server;
+use Swow\Signal;
 use Swow\Socket;
 
 require_once __DIR__.'/bootstrap.php';
@@ -53,8 +54,8 @@ require_once __DIR__.'/hmac.php';
 require_once __DIR__.'/auth.php';
 
 // ---------- 初始化 ----------
-$ready = false;              // 冷启动门禁
-$poolReady = false;          // Redis 池就绪标记（实时更新）
+$ready = false;
+$poolReady = false;
 $startTime = microtime(true);
 
 try {
@@ -68,18 +69,15 @@ try {
 
 localCacheInit();
 
-// ★ 冷启动：先以 1/5 容量启动信号量
 $initialConcurrency = max(10, (int) ceil(MAX_CONCURRENCY / 5));
 concurrencyInit($initialConcurrency);
 
-// ★ 后台渐进扩容到满容量
 if ($initialConcurrency < MAX_CONCURRENCY) {
     concurrencyProgressiveExpand(MAX_CONCURRENCY, 10, 300);
 }
 
 deviceConcurrencyInit(MAX_CONCURRENCY_PER_DEVICE, 300);
 
-// ---------- 冷启动：不阻塞等待，靠门禁 + health 实时感知 ----------
 $initTime = microtime(true) - $startTime;
 fwrite(STDOUT, '[EdgeAuth] Server READY (cold start, Redis pool filling in background)'.PHP_EOL);
 fwrite(STDOUT, '[EdgeAuth] Pool: 3 probed, background filling to '.REDIS_POOL_SIZE.' total'.PHP_EOL);
@@ -89,7 +87,7 @@ fwrite(STDOUT, '[EdgeAuth] Init took '.round($initTime, 2).'s'.PHP_EOL);
 $server = new Server;
 $server->setTcpNodelay(true)
     ->setTcpKeepAlive(true, 60)
-    ->setRecvMessageTimeout(30000);
+    ->setRecvMessageTimeout(1000);
 
 $isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
 $bindFlags = $isWindows ? Socket::BIND_FLAG_NONE : Socket::BIND_FLAG_REUSEPORT;
@@ -108,29 +106,37 @@ if (! $isWindows && $workerId > 0) {
     usleep((int) ($delay * 1000000));
 }
 
-// ---------- 优雅退出 ----------
+// ---------- ★ Swow 原生信号监听（替代 pcntl_signal）----------
 $running = true;
-if (function_exists('pcntl_signal')) {
-    pcntl_async_signals(true);
-    pcntl_signal(SIGTERM, function () use (&$running): void {
-        fwrite(STDOUT, '[EdgeAuth] SIGTERM received, shutting down'.PHP_EOL);
-        $running = false;
-    });
-    pcntl_signal(SIGINT, function () use (&$running): void {
-        fwrite(STDOUT, '[EdgeAuth] SIGINT received, shutting down'.PHP_EOL);
-        $running = false;
-    });
-}
+
+Coroutine::run(static function () use (&$running): void {
+    try {
+        // 阻塞等待 SIGTERM 或 SIGINT，Swow 事件循环内可靠触发
+        Signal::wait(SIGTERM);
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[signal-wait] '.$e->getMessage().PHP_EOL);
+    }
+
+    fwrite(STDOUT, '[EdgeAuth] SIGTERM received via Swow\Signal, shutting down'.PHP_EOL);
+    $running = false;
+});
+
+Coroutine::run(static function () use (&$running): void {
+    try {
+        Signal::wait(SIGINT);
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[signal-wait] '.$e->getMessage().PHP_EOL);
+    }
+
+    fwrite(STDOUT, '[EdgeAuth] SIGINT received via Swow\Signal, shutting down'.PHP_EOL);
+    $running = false;
+});
 
 // ---------- 主循环 ----------
 while ($running) {
     try {
-        // ★ 关键：把 accept 超时设为 1 秒，让信号能及时打断阻塞
-        // （Swow\Server 的 accept 会尊重 recvMessageTimeout）
-        $server->setRecvMessageTimeout(1000);
         $conn = $server->acceptConnection();
     } catch (Throwable $e) {
-        // ★ 信号已把 $running 置 false，直接退出循环，不再 accept
         if (! $running) {
             break;
         }
@@ -156,17 +162,14 @@ while ($running) {
                     break;
                 }
 
-                // ★★★ 冷启动门禁：渐进放行 ★★★
                 if (! $ready) {
                     $uptime = microtime(true) - $startTime;
 
-                    // ★ 实时判断池子是否满 80%
                     if (redisPoolIsReady(0.8)) {
                         $ready = true;
                         $poolReady = true;
                         fwrite(STDOUT, '[EdgeAuth] Pool reached 80%, gate OPEN'.PHP_EOL);
                     } else {
-                        // 池子未满：按时间比例放行
                         $allowRatio = min(1.0, $uptime / 3.0 * 0.3);
                         if ($uptime < 3.0 && mt_rand(1, 100) / 100 > $allowRatio) {
                             respondJson($conn, [
@@ -199,7 +202,6 @@ while ($running) {
                             handleAcl($conn, $req);
                             break;
 
-                        // ---------- 健康检查（三态，实时感知）----------
                         case '/admin-api/extension/edge/health':
                             $stats = redisPoolStats();
                             $uptime = microtime(true) - $startTime;
