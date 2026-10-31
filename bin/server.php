@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Dagasmart\Edge\Support\EdgeAuthContext;
 use Swow\Coroutine;
 use Swow\Psr7\Server\Server;
+use Swow\Signal;
 use Swow\Socket;
 
 require_once __DIR__.'/bootstrap.php';
@@ -108,25 +109,25 @@ if (! $isWindows && $workerId > 0) {
     usleep((int) ($delay * 1000000));
 }
 
-// ---------- 优雅退出 ----------
+// ---------- 优雅退出：Swow\Signal 协程接管，替代 pcntl_signal ----------
 $running = true;
-if (function_exists('pcntl_signal')) {
-    pcntl_async_signals(true);
-    pcntl_signal(SIGTERM, function () use (&$running): void {
-        fwrite(STDOUT, '[EdgeAuth] SIGTERM received, shutting down'.PHP_EOL);
+
+Coroutine::run(static function () use (&$running): void {
+    while ($running) {
+        try {
+            Signal::wait([SIGTERM, SIGINT]);
+        } catch (Throwable) {
+            break;
+        }
+        fwrite(STDOUT, '[EdgeAuth] SIGTERM received via Swow\Signal, shutting down'.PHP_EOL);
         $running = false;
-    });
-    pcntl_signal(SIGINT, function () use (&$running): void {
-        fwrite(STDOUT, '[EdgeAuth] SIGINT received, shutting down'.PHP_EOL);
-        $running = false;
-    });
-}
+    }
+});
 
 // ---------- 主循环 ----------
 while ($running) {
     try {
-        // ★ 关键：把 accept 超时设为 1 秒，让信号能及时打断阻塞
-        // （Swow\Server 的 accept 会尊重 recvMessageTimeout）
+        // ★ accept 超时 1 秒，信号协程置 $running=false 后最多等 1 秒即可退出
         $server->setRecvMessageTimeout(1000);
         $conn = $server->acceptConnection();
     } catch (Throwable $e) {

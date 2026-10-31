@@ -155,13 +155,14 @@ class EdgeAuthSwowCommand extends Command
         if ($pid === 0) {
             cli_set_process_title("edgeauth-worker-{$workerId}");
 
-            // ★ 子进程开启异步信号（Swow\Signal 需要）
             if (function_exists('pcntl_async_signals')) {
                 pcntl_async_signals(true);
             }
 
-            // ★ 不再设置 SIG_DFL —— 让 Swow\Signal 在 server.php 里接管
-            // ★ 父进程发 SIGTERM 时，子进程的 Swow 事件循环会收到并唤醒 Signal::wait()
+            // ★ 解除 Swow 继承的信号屏蔽，让 posix_kill 的 SIGTERM 能到达子进程
+            if (function_exists('pcntl_sigprocmask')) {
+                pcntl_sigprocmask(SIG_UNBLOCK, [SIGTERM, SIGINT, SIGHUP]);
+            }
 
             $GLOBALS['worker_id'] = $workerId;
 
