@@ -78,6 +78,13 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         $data['password'] ?? $data['signature'] ?? $data['token'] ?? ''
     ));
 
+    error_log(sprintf(
+        '[auth-debug] clientid=%s username=%s password_len=%d',
+        $clientId,
+        $username,
+        strlen($password),
+    ));
+
     // ---------- 参数校验 ----------
     if ($clientId === '' || $username === '' || $password === '') {
         metricsInc('auth_fail');
