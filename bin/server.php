@@ -7,7 +7,10 @@ use Swow\Coroutine;
 use Swow\Psr7\Server\Server;
 use Swow\Socket;
 
-require_once __DIR__.'/bootstrap.php';
+$bootstrap = __DIR__.'/bootstrap.php';
+if (is_file($bootstrap) && ! function_exists('redisConnect')) {
+    require_once $bootstrap;
+}
 
 // ---------- 配置常量 ----------
 if (! defined('AUTH_PORT')) {

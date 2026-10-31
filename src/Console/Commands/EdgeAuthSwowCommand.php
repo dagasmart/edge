@@ -1,5 +1,7 @@
 <?php
+
 declare(strict_types=1);
+
 namespace DagaSmart\Edge\Console\Commands;
 
 use Illuminate\Console\Command;
@@ -10,6 +12,7 @@ class EdgeAuthSwowCommand extends Command
     protected $signature = 'edge:auth-swow
                             {--workers=4 : Number of worker processes}
                             {--port=9503 : Listen port (REUSEPORT)}';
+
     protected $description = 'Start Swow MQTT HMAC Auth Server for NanoMQ (multi-worker with fork)';
 
     /** @var array<int, int> pid => worker_id 映射 */
@@ -17,8 +20,9 @@ class EdgeAuthSwowCommand extends Command
 
     public function handle(): int
     {
-        if (!extension_loaded('swow')) {
+        if (! extension_loaded('swow')) {
             $this->error('Swow extension not loaded.');
+
             return self::FAILURE;
         }
 
@@ -47,20 +51,21 @@ class EdgeAuthSwowCommand extends Command
         });
 
         $workers = (int) $this->option('workers');
-        $port    = (int) $this->option('port');
+        $port = (int) $this->option('port');
 
-        if (!defined('AUTH_PORT')) {
+        if (! defined('AUTH_PORT')) {
             define('AUTH_PORT', $port);
         }
 
         $serverFile = base_path('extensions/edge/bin/server.php');
-        if (!is_file($serverFile)) {
+        if (! is_file($serverFile)) {
             $this->error("Server file not found: {$serverFile}");
+
             return self::FAILURE;
         }
 
         // ========== 降级判断（唯一入口） ==========
-        if (!extension_loaded('pcntl') || strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+        if (! extension_loaded('pcntl') || strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
             if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
                 $this->warn('Windows detected, running in single-process mode (no fork).');
             } else {
@@ -68,17 +73,18 @@ class EdgeAuthSwowCommand extends Command
             }
 
             $this->info("Starting Edge Auth Server on port {$port} (single worker)...");
-            $this->info('Laravel base_path: ' . base_path());
-            $this->info('PHP ' . PHP_VERSION . ' | Swow ' . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
+            $this->info('Laravel base_path: '.base_path());
+            $this->info('PHP '.PHP_VERSION.' | Swow '.(defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
 
             require $serverFile;
+
             return self::SUCCESS;
         }
 
         // ========== Linux + pcntl：fork 多 worker ==========
-        $this->info("Starting Edge Auth Server...");
-        $this->info("Laravel base_path: " . base_path());
-        $this->info("PHP " . PHP_VERSION . " | Swow " . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
+        $this->info('Starting Edge Auth Server...');
+        $this->info('Laravel base_path: '.base_path());
+        $this->info('PHP '.PHP_VERSION.' | Swow '.(defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
         $this->info("Port: {$port} | Workers: {$workers} | Mode: REUSEPORT fork");
         $this->info("Server file: {$serverFile}");
 
@@ -101,7 +107,7 @@ class EdgeAuthSwowCommand extends Command
             $this->spawnWorker($i, $serverFile);
         }
 
-        $this->info("All {$workers} workers forked. Parent pid=" . getmypid());
+        $this->info("All {$workers} workers forked. Parent pid=".getmypid());
 
         while (count($this->children) > 0) {
             $pid = pcntl_waitpid(-1, $status, WNOHANG);
@@ -118,7 +124,7 @@ class EdgeAuthSwowCommand extends Command
                     $this->warn("Worker {$workerId} (pid={$pid}) killed by signal {$sig}");
                 }
 
-                if (!$this->stopping) {
+                if (! $this->stopping) {
                     $newWorkerId = $workerId === '?' ? count($this->children) + 1 : $workerId;
                     $this->warn("Restarting worker {$newWorkerId}...");
                     $this->spawnWorker((int) $newWorkerId, $serverFile);
@@ -129,6 +135,7 @@ class EdgeAuthSwowCommand extends Command
         }
 
         $this->info('Parent process exiting.');
+
         return self::SUCCESS;
     }
 
@@ -140,6 +147,7 @@ class EdgeAuthSwowCommand extends Command
 
         if ($pid === -1) {
             $this->error("Failed to fork worker {$workerId}");
+
             return;
         }
 
@@ -149,7 +157,16 @@ class EdgeAuthSwowCommand extends Command
             pcntl_signal(SIGINT, SIG_DFL);
             pcntl_signal(SIGHUP, SIG_DFL);
 
-            if (!defined('AUTH_PORT')) {
+            // ---------- 关键：手动加载 bootstrap ----------
+            $bootstrapFile = base_path('extensions/edge/bin/bootstrap.php');
+            if (is_file($bootstrapFile)) {
+                require_once $bootstrapFile;
+            } else {
+                fwrite(STDERR, "FATAL: bootstrap.php not found at {$bootstrapFile}".PHP_EOL);
+                exit(1);
+            }
+
+            if (! defined('AUTH_PORT')) {
                 define('AUTH_PORT', (int) $this->option('port'));
             }
 
