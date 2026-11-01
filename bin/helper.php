@@ -1,7 +1,9 @@
 <?php
+
 declare(strict_types=1);
 
 use Swow\Channel;
+use Swow\Coroutine;
 
 /* =========================================================
  * Redis 连接池（Swow Channel 真协程池）
@@ -45,6 +47,7 @@ function redisPoolInit(int $size = 256, int $db = 2): void
                 $authOk = $redis->auth($redisPassword);
                 if (! $authOk) {
                     fwrite(STDERR, '[redis] AUTH FAILED for '.$redisHost.':'.$redisPort.' (password length='.strlen($redisPassword).')'.PHP_EOL);
+
                     continue;
                 }
             }
@@ -52,6 +55,7 @@ function redisPoolInit(int $size = 256, int $db = 2): void
                 $selectOk = $redis->select($redisDb);
                 if (! $selectOk) {
                     fwrite(STDERR, '[redis] SELECT DB '.$redisDb.' FAILED'.PHP_EOL);
+
                     continue;
                 }
             }
@@ -67,7 +71,7 @@ function redisPoolInit(int $size = 256, int $db = 2): void
     // ★ 后台协程逐步填充剩余连接（每 10ms 一个，不打爆 Redis）
     if ($ok > 0 && $size > $probeSize) {
         $remaining = $size - $probeSize;
-        Swow\Coroutine::run(static function () use ($remaining, $probeSize): void {
+        Coroutine::run(static function () use ($remaining): void {
             global $redisPool, $redisHost, $redisPort, $redisPassword, $redisDb;
             $filled = 0;
             for ($i = 0; $i < $remaining; $i++) {
@@ -104,6 +108,7 @@ function redisPoolPop(float $timeout = 1.0): ?Redis
     }
     try {
         $ms = (int) ($timeout * 1000);
+
         return $redisPool->pop($ms);
     } catch (Throwable) {
         return null;
@@ -119,6 +124,7 @@ function redisPoolPush(Redis $conn): void
     try {
         $conn->ping();
         $redisPool->push($conn);
+
         return;
     } catch (Throwable) {
         // dead, recreate
@@ -161,6 +167,7 @@ function redisGet(string $key): mixed
 {
     return withRedis(static function (Redis $conn) use ($key): mixed {
         $val = $conn->get($key);
+
         return $val !== false ? (string) $val : null;
     });
 }
@@ -215,8 +222,10 @@ function localCacheGet(string $key): mixed
     $entry = $localCache[$key];
     if (($entry['expires'] ?? 0) < time()) {
         unset($localCache[$key]);
+
         return null;
     }
+
     return $entry['value'];
 }
 
@@ -238,6 +247,7 @@ function localCacheSet(string $key, mixed $value, int $ttl): void
 function localCacheStats(): int
 {
     global $localCache;
+
     return $localCache !== null ? $localCache->count() : 0;
 }
 
@@ -251,6 +261,7 @@ function redisPoolStats(): array
     if ($redisPool === null) {
         return ['total' => 0, 'free' => 0];
     }
+
     return [
         'total' => $redisPoolSize,
         'free' => $redisPool->getLength(),
@@ -272,6 +283,7 @@ function redisPoolIsReady(float $minRatio = 0.8): bool
     } catch (Throwable) {
         return false;
     }
+
     return $free >= ($redisPoolSize * $minRatio);
 }
 
@@ -284,6 +296,7 @@ function redisPoolWaitReady(int $timeoutSec = 10, float $minRatio = 0.8): bool
         }
         usleep(200000);
     }
+
     return redisPoolIsReady($minRatio);
 }
 
@@ -308,18 +321,22 @@ function concurrencyInit(int $max): void
 function concurrencyProgressiveExpand(int $targetSize, int $steps = 10, int $stepMs = 300): void
 {
     global $globalConcurrency, $concurrencyMax;
+
     $current = $concurrencyMax;
     if ($current >= $targetSize) {
         return;
     }
+
     $toAdd = $targetSize - $current;
     $perStep = max(1, (int) ceil($toAdd / $steps));
 
-    Swow\Coroutine::run(static function () use ($perStep, $toAdd, $targetSize, $stepMs): void {
+    Coroutine::run(static function () use ($perStep, $toAdd, $targetSize, $steps, $stepMs): void {
         global $globalConcurrency, $concurrencyMax;
+
         $added = 0;
-        for ($step = 0; $step < 10; $step++) {
+        for ($step = 0; $step < $steps; $step++) {
             usleep($stepMs * 1000);
+
             $batch = min($perStep, $toAdd - $added);
             for ($i = 0; $i < $batch; $i++) {
                 try {
@@ -327,13 +344,15 @@ function concurrencyProgressiveExpand(int $targetSize, int $steps = 10, int $ste
                     $added++;
                     $concurrencyMax++;
                 } catch (Throwable) {
-                    break;
+                    return; // 直接结束协程，不再继续扩容
                 }
             }
+
             if ($added >= $toAdd) {
                 break;
             }
         }
+
         fwrite(STDOUT, "[EdgeAuth] Concurrency fully opened: {$targetSize}".PHP_EOL);
     });
 }
@@ -346,6 +365,7 @@ function concurrencyAcquire(float $timeout = 2.0): bool
     }
     try {
         $ms = (int) ($timeout * 1000);
+
         return (bool) $globalConcurrency->pop($ms > 0 ? $ms : 1);
     } catch (Throwable) {
         return false;
@@ -376,6 +396,7 @@ function concurrencyStats(): array
     } catch (Throwable) {
         $free = 0;
     }
+
     return [
         'max' => $concurrencyMax,
         'used' => $concurrencyMax - $free,
@@ -409,6 +430,7 @@ function deviceConcurrencyAcquire(string $clientId): ?string
             }
         } catch (Throwable $e) {
             fwrite(STDERR, '[device-acquire] channel create failed: '.$e->getMessage().PHP_EOL);
+
             return null;
         }
         $__edge_device_semaphores[$clientId] = [
@@ -420,9 +442,11 @@ function deviceConcurrencyAcquire(string $clientId): ?string
         $bucket = $__edge_device_semaphores[$clientId];
         if (! isset($bucket['channel']) || ! $bucket['channel'] instanceof Channel) {
             unset($__edge_device_semaphores[$clientId]);
+
             return null;
         }
         $got = $bucket['channel']->pop(1);
+
         return $got ? $clientId : null;
     } catch (Throwable) {
         return null;
@@ -439,6 +463,7 @@ function deviceConcurrencyRelease(?string $clientId): void
         $bucket = $__edge_device_semaphores[$clientId];
         if (! isset($bucket['channel']) || ! $bucket['channel'] instanceof Channel) {
             unset($__edge_device_semaphores[$clientId]);
+
             return;
         }
         $bucket['channel']->push(1, 1);
@@ -496,6 +521,7 @@ function deviceConcurrencyStats(): array
             'free' => $free,
         ];
     }
+
     return $stats;
 }
 
@@ -510,7 +536,7 @@ function deviceConcurrencyStats(): array
  */
 function isClientBlocked(string $clientId): bool
 {
-    $blocked = redisGet('block:' . $clientId);
+    $blocked = redisGet('block:'.$clientId);
     if ($blocked === null) {
         return false;
     }
@@ -518,7 +544,7 @@ function isClientBlocked(string $clientId): bool
     // 刷新封禁 TTL，压制持续重试
     try {
         withRedis(static function (Redis $conn) use ($clientId): void {
-            $conn->expire('block:' . $clientId, 600);
+            $conn->expire('block:'.$clientId, 600);
         });
     } catch (Throwable) {
     }
@@ -533,7 +559,7 @@ function isClientBlocked(string $clientId): bool
  */
 function recordClientFail(string $clientId): void
 {
-    $key = 'fail:' . $clientId;
+    $key = 'fail:'.$clientId;
     withRedis(static function (Redis $conn) use ($key, $clientId): void {
         $script = 'local c = redis.call("INCR", KEYS[1])
 if c == 1 then redis.call("EXPIRE", KEYS[1], ARGV[1]) end
@@ -542,8 +568,8 @@ return c';
 
         if ($c >= 5) {
             $ttl = min(3600, 60 * (2 ** min($c - 5, 6)));
-            $conn->setex('block:' . $clientId, $ttl, (string) $c);
-            fwrite(STDERR, '[block] ' . $clientId . ' (fail count=' . $c . ', ttl=' . $ttl . 's)' . PHP_EOL);
+            $conn->setex('block:'.$clientId, $ttl, (string) $c);
+            fwrite(STDERR, '[block] '.$clientId.' (fail count='.$c.', ttl='.$ttl.'s)'.PHP_EOL);
         }
     });
 }
@@ -573,6 +599,7 @@ function metricsInc(string $key, int $n = 1): void
 function metricsSnapshot(): array
 {
     global $metrics;
+
     return is_array($metrics) ? $metrics : [];
 }
 
@@ -589,6 +616,7 @@ function rateLimited(string $key): bool
             $script = 'local c = redis.call("INCR", KEYS[1])
 if c == 1 then redis.call("EXPIRE", KEYS[1], ARGV[1]) end
 return c > tonumber(ARGV[2])';
+
             return (bool) $conn->eval($script, [$key, $window, $max], 1);
         });
     } catch (Throwable) {
@@ -629,6 +657,7 @@ function base64urlDecode(string $data): string|false
     if ($pad > 0) {
         $b64 .= str_repeat('=', 4 - $pad);
     }
+
     return base64_decode($b64, true);
 }
 
@@ -641,14 +670,14 @@ if (! function_exists('respondJson')) {
         }
         $body = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if ($body === false) {
-            fwrite(STDERR, '[respondJson] json_encode failed: ' . json_last_error_msg() . PHP_EOL);
+            fwrite(STDERR, '[respondJson] json_encode failed: '.json_last_error_msg().PHP_EOL);
             $body = '{"error":"json_encode_failed"}';
             $status = 500;
         }
         try {
             $conn->respond($body, $status, ['Content-Type' => 'application/json; charset=utf-8']);
         } catch (Throwable $e) {
-            fwrite(STDERR, '[respondJson] respond failed: ' . $e->getMessage() . PHP_EOL);
+            fwrite(STDERR, '[respondJson] respond failed: '.$e->getMessage().PHP_EOL);
         }
     }
 }
@@ -659,6 +688,6 @@ if (! function_exists('debugLog')) {
         if (! defined('DEBUG') || DEBUG !== true) {
             return;
         }
-        fwrite(STDERR, '[EdgeAuth] ' . $msg . PHP_EOL);
+        fwrite(STDERR, '[EdgeAuth] '.$msg.PHP_EOL);
     }
 }
