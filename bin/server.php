@@ -44,6 +44,9 @@ if (! defined('TIME_DRIFT')) {
 if (! defined('BACKLOG')) {
     define('BACKLOG', 4096);
 }
+if (! defined('ACCEPT_TIMEOUT_MS')) {
+    define('ACCEPT_TIMEOUT_MS', 1000);
+}
 if (! defined('AUTH_HTTP_PREFIX')) {
     define('AUTH_HTTP_PREFIX', '/admin-api/extension/edge');
 }
@@ -54,8 +57,8 @@ require_once __DIR__.'/hmac.php';
 require_once __DIR__.'/auth.php';
 
 // ---------- 初始化 ----------
-$ready = false;              // 冷启动门禁
-$poolReady = false;          // Redis 池就绪标记（实时更新）
+$ready = false;
+$poolReady = false;
 $startTime = microtime(true);
 
 try {
@@ -69,18 +72,15 @@ try {
 
 localCacheInit();
 
-// ★ 冷启动：先以 1/5 容量启动信号量
 $initialConcurrency = max(10, (int) ceil(MAX_CONCURRENCY / 5));
 concurrencyInit($initialConcurrency);
 
-// ★ 后台渐进扩容到满容量
 if ($initialConcurrency < MAX_CONCURRENCY) {
     concurrencyProgressiveExpand(MAX_CONCURRENCY, 10, 300);
 }
 
 deviceConcurrencyInit(MAX_CONCURRENCY_PER_DEVICE, 300);
 
-// ---------- 冷启动：不阻塞等待，靠门禁 + health 实时感知 ----------
 $initTime = microtime(true) - $startTime;
 fwrite(STDOUT, '[EdgeAuth] Server READY (cold start, Redis pool filling in background)'.PHP_EOL);
 fwrite(STDOUT, '[EdgeAuth] Pool: 3 probed, background filling to '.REDIS_POOL_SIZE.' total'.PHP_EOL);
@@ -88,11 +88,11 @@ fwrite(STDOUT, '[EdgeAuth] Init took '.round($initTime, 2).'s'.PHP_EOL);
 
 // ---------- Server ----------
 $server = new Server;
-$serverRef = &$server; // 让信号协程能 close 它
+$serverRef = &$server;
 
 $server->setTcpNodelay(true)
     ->setTcpKeepAlive(true, 60)
-    ->setRecvMessageTimeout(30000);
+    ->setRecvMessageTimeout(ACCEPT_TIMEOUT_MS);
 
 $isWindows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
 $bindFlags = $isWindows ? Socket::BIND_FLAG_NONE : Socket::BIND_FLAG_REUSEPORT;
@@ -111,8 +111,7 @@ if (! $isWindows && $workerId > 0) {
     usleep((int) ($delay * 1000000));
 }
 
-// ---------- 优雅退出：Swow\Signal 协程接管 ----------
-// 关键：$server 必须传引用，close() 才能打断主循环的 accept
+// ---------- 优雅退出 ----------
 $running = true;
 
 $signalHandler = static function (int $signo) use (&$running, &$server): void {
@@ -124,7 +123,6 @@ $signalHandler = static function (int $signo) use (&$running, &$server): void {
     fwrite(STDOUT, "[EdgeAuth] {$name} received via Swow\Signal, shutting down" . PHP_EOL);
     $running = false;
 
-    // ★ 强制关闭 server，打断主循环的 accept 阻塞
     try {
         $server->close();
     } catch (Throwable) {
@@ -150,16 +148,12 @@ Coroutine::run(static function () use ($signalHandler): void {
 // ---------- 主循环 ----------
 while ($running) {
     try {
-        // ★ accept 超时 1 秒，信号协程置 $running=false 后最多等 1 秒即可退出
-        $server->setRecvMessageTimeout(1000);
         $conn = $server->acceptConnection();
     } catch (Throwable $e) {
-        // ★ 信号已把 $running 置 false，直接退出循环，不再 accept
         if (! $running) {
             break;
         }
 
-        // close() 会抛 closed 异常，也直接退出
         if (str_contains($e->getMessage(), 'closed')) {
             break;
         }
@@ -185,17 +179,15 @@ while ($running) {
                     break;
                 }
 
-                // ★★★ 冷启动门禁：渐进放行 ★★★
+                // ---------- 冷启动门禁 ----------
                 if (! $ready) {
                     $uptime = microtime(true) - $startTime;
 
-                    // ★ 实时判断池子是否满 80%
                     if (redisPoolIsReady(0.8)) {
                         $ready = true;
                         $poolReady = true;
                         fwrite(STDOUT, '[EdgeAuth] Pool reached 80%, gate OPEN'.PHP_EOL);
                     } else {
-                        // 池子未满：按时间比例放行
                         $allowRatio = min(1.0, $uptime / 3.0 * 0.3);
                         if ($uptime < 3.0 && mt_rand(1, 100) / 100 > $allowRatio) {
                             respondJson($conn, [
@@ -228,7 +220,6 @@ while ($running) {
                             handleAcl($conn, $req);
                             break;
 
-                        // ---------- 健康检查（三态，实时感知）----------
                         case '/admin-api/extension/edge/health':
                             $stats = redisPoolStats();
                             $uptime = microtime(true) - $startTime;
