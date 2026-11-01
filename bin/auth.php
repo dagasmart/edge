@@ -8,6 +8,7 @@ use Swow\Psr7\Server\ServerConnection;
 
 /* =========================================================
  * EdgeAuth HTTP 路由处理 - 方案 A（bcrypt + HMAC 双路径）
+ * 在线锁：username 维度 Set 多 slot，支持推送端+消费端同时在线
  * ========================================================= */
 
 function getDeviceSecret(string $clientId, string $username): ?string
@@ -39,24 +40,21 @@ function authenticateDevice(string $clientId, string $username, string $password
 }
 
 /* =========================================================
- * 单点登录互斥（Lua 原子抢占 / 原子释放）
+ * 单点登录：Set 多 slot，同 username 多 clientid 同时在线
  * ========================================================= */
 
+/**
+ * 注册在线 slot（原子 SADD + EXPIRE）
+ * 同 username 下每个 clientid 独立占一个 slot，互不干扰
+ */
 function acquireUserOnline(string $username, string $clientId, int $ttl = 300): bool
 {
     $key = 'auth:online:' . $username;
 
     $script = <<<'LUA'
-local cur = redis.call('GET', KEYS[1])
-if cur == false then
-    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-    return 1
-end
-if cur == ARGV[1] then
-    redis.call('EXPIRE', KEYS[1], ARGV[2])
-    return 1
-end
-return 0
+redis.call('SADD', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[2])
+return 1
 LUA;
 
     try {
@@ -72,13 +70,18 @@ LUA;
     }
 }
 
+/**
+ * 释放在线 slot（原子 SREM，只删自己的）
+ * Set 空了自动清理 key
+ */
 function releaseUserOnline(string $username, string $clientId): void
 {
     $key = 'auth:online:' . $username;
 
     $script = <<<'LUA'
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-    return redis.call('DEL', KEYS[1])
+redis.call('SREM', KEYS[1], ARGV[1])
+if redis.call('SCARD', KEYS[1]) == 0 then
+    redis.call('DEL', KEYS[1])
 end
 return 0
 LUA;
@@ -91,6 +94,23 @@ LUA;
         );
     } catch (Throwable $e) {
         fwrite(STDERR, '[releaseUserOnline] ' . $e->getMessage() . PHP_EOL);
+    }
+}
+
+/**
+ * 查询同 username 当前在线 clientid 列表（调试/运维用）
+ */
+function getUserOnlineClients(string $username): array
+{
+    $key = 'auth:online:' . $username;
+
+    try {
+        return withRedis(static function (Redis $conn) use ($key): array {
+            $members = $conn->sMembers($key);
+            return is_array($members) ? $members : [];
+        });
+    } catch (Throwable) {
+        return [];
     }
 }
 
@@ -216,13 +236,12 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             }
         }
 
+        // ★ Set 多 slot：同 username 允许多 clientid 同时在线
         if (! acquireUserOnline($username, $clientId, 300)) {
             metricsInc('auth_fail');
-            metricsInc('auth_conflict');
             respondJson($conn, [
                 'result' => 'deny',
-                'reason' => 'already_logged_in',
-                'detail' => '同一账号已在其他设备登录',
+                'reason' => 'online_slot_failed',
             ], 401);
 
             return;
@@ -249,7 +268,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
 
-        // ★ 释放在线锁（只删自己的，Lua 原子）
+        // ★ 释放在线 slot（只删自己的，Lua 原子）
         try {
             $authedUsername = EdgeAuthContext::getUsername();
             $authedClientId = EdgeAuthContext::getClientId();
