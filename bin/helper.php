@@ -153,16 +153,13 @@ function withRedis(callable $fn): mixed
 }
 
 /* =========================================================
- * 业务 Redis 操作 —— 每次操作前强制 select(db)
+ * 业务 Redis 操作 —— 不再逐次 select(db)
+ * 连接已在创建/重建时完成 SELECT，热路径零开销
  * ========================================================= */
 
 function redisGet(string $key): mixed
 {
-    global $redisDb;
-    return withRedis(static function (Redis $conn) use ($key, $redisDb): mixed {
-        if ($redisDb > 0) {
-            $conn->select($redisDb);
-        }
+    return withRedis(static function (Redis $conn) use ($key): mixed {
         $val = $conn->get($key);
         return $val !== false ? (string) $val : null;
     });
@@ -170,44 +167,28 @@ function redisGet(string $key): mixed
 
 function redisSetex(string $key, int $ttl, string $value): bool
 {
-    global $redisDb;
-    return withRedis(static function (Redis $conn) use ($key, $ttl, $value, $redisDb): bool {
-        if ($redisDb > 0) {
-            $conn->select($redisDb);
-        }
+    return withRedis(static function (Redis $conn) use ($key, $ttl, $value): bool {
         return (bool) $conn->setex($key, $ttl, $value);
     });
 }
 
 function redisExists(string $key): bool
 {
-    global $redisDb;
-    return withRedis(static function (Redis $conn) use ($key, $redisDb): bool {
-        if ($redisDb > 0) {
-            $conn->select($redisDb);
-        }
+    return withRedis(static function (Redis $conn) use ($key): bool {
         return (bool) $conn->exists($key);
     });
 }
 
 function redisDel(string ...$keys): int
 {
-    global $redisDb;
-    return withRedis(static function (Redis $conn) use ($keys, $redisDb): int {
-        if ($redisDb > 0) {
-            $conn->select($redisDb);
-        }
+    return withRedis(static function (Redis $conn) use ($keys): int {
         return $conn->del(...$keys);
     });
 }
 
 function redisSetNxEx(string $key, string $value, int $ttl): bool
 {
-    global $redisDb;
-    return withRedis(static function (Redis $conn) use ($key, $value, $ttl, $redisDb): bool {
-        if ($redisDb > 0) {
-            $conn->select($redisDb);
-        }
+    return withRedis(static function (Redis $conn) use ($key, $value, $ttl): bool {
         return (bool) $conn->set($key, $value, ['NX', 'EX' => $ttl]);
     });
 }
@@ -567,6 +548,10 @@ return c';
     });
 }
 
+/* =========================================================
+ * Metrics 埋点
+ * ========================================================= */
+
 $metrics = [
     'auth_total' => 0,
     'auth_ok' => 0,
@@ -574,6 +559,7 @@ $metrics = [
     'cache_hit' => 0,
     'redis_pool_exhausted' => 0,
     'device_concurrency_exceeded' => 0,
+    'auth_conflict' => 0,
 ];
 
 function metricsInc(string $key, int $n = 1): void
@@ -590,9 +576,10 @@ function metricsSnapshot(): array
     return is_array($metrics) ? $metrics : [];
 }
 
-/**
+/* =========================================================
  * 滑动窗口限流（Lua 原子 INCR+EXPIRE）
- */
+ * ========================================================= */
+
 function rateLimited(string $key): bool
 {
     $max = defined('RATE_MAX') ? RATE_MAX : 10;
@@ -613,10 +600,6 @@ function hitRate(string $key, int $ttl = 60): int
 {
     try {
         return withRedis(static function (Redis $conn) use ($key): int {
-            global $redisDb;
-            if ($redisDb > 0) {
-                $conn->select($redisDb);
-            }
             return (int) $conn->incr($key);
         });
     } catch (Throwable) {
@@ -628,16 +611,16 @@ function resetRate(string $key): void
 {
     try {
         withRedis(static function (Redis $conn) use ($key): void {
-            global $redisDb;
-            if ($redisDb > 0) {
-                $conn->select($redisDb);
-            }
             $conn->del($key);
         });
     } catch (Throwable) {
         // ignore
     }
 }
+
+/* =========================================================
+ * 工具函数
+ * ========================================================= */
 
 function base64urlDecode(string $data): string|false
 {

@@ -39,32 +39,35 @@ function authenticateDevice(string $clientId, string $username, string $password
 }
 
 /* =========================================================
- * 单点登录互斥
+ * 单点登录互斥（Lua 原子抢占）
  * ========================================================= */
 
 function acquireUserOnline(string $username, string $clientId, int $ttl = 300): bool
 {
     $key = 'auth:online:' . $username;
 
-    $existing = redisGet($key);
-    if ($existing !== null) {
-        if ($existing === $clientId) {
-            redisSetex($key, $ttl, $clientId);
+    $script = <<<'LUA'
+local cur = redis.call('GET', KEYS[1])
+if cur == false then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    return 1
+end
+if cur == ARGV[1] then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+    return 1
+end
+return 0
+LUA;
 
-            return true;
-        }
-
+    try {
+        $ret = withRedis(static function (Redis $conn) use ($key, $clientId, $ttl) {
+            return $conn->eval($script, [$key, $clientId, $ttl], 1);
+        });
+        return (bool) $ret;
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[acquireUserOnline] ' . $e->getMessage() . PHP_EOL);
         return false;
     }
-
-    $ok = redisSetNxEx($key, $clientId, $ttl);
-    if ($ok) {
-        return true;
-    }
-
-    $existing = redisGet($key);
-
-    return $existing === $clientId;
 }
 
 function releaseUserOnline(string $username, string $clientId): void
@@ -231,6 +234,19 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     } finally {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
+
+        // ★ 释放在线锁（只删自己的）
+        try {
+            $authedUsername = EdgeAuthContext::getUsername();
+            $authedClientId = EdgeAuthContext::getClientId();
+            if ($authedUsername !== null && $authedClientId !== null) {
+                releaseUserOnline($authedUsername, $authedClientId);
+            }
+        } catch (Throwable $e) {
+            fwrite(STDERR, '[release-online] ' . $e->getMessage() . PHP_EOL);
+        } finally {
+            EdgeAuthContext::clear();
+        }
     }
 }
 
