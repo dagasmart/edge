@@ -14,20 +14,25 @@ Route::group([
         Middleware::class,
     ],
 ], function (Router $router) {
-    // Route::get('edge', [Controllers\EdgeController::class, 'index']);
 
-    Route::post('edge/auth', [Controllers\EdgeController::class, 'auth'])
+    $router->group([
+        'prefix' => 'edge',
+    ], function (Router $router) {
+
+        Route::post('auth', [Controllers\EdgeController::class, 'auth'])
         ->withoutMiddleware([Permission::class, Authenticate::class, Middleware::class]);
 
-    Route::post('edge/super', [Controllers\EdgeController::class, 'super'])
-        ->withoutMiddleware([Permission::class, Authenticate::class]);
+        Route::post('super', [Controllers\EdgeController::class, 'super'])
+            ->withoutMiddleware([Permission::class, Authenticate::class]);
 
-    Route::post('edge/acl', [Controllers\EdgeController::class, 'acl'])
-        ->withoutMiddleware([Permission::class, Authenticate::class]);
+        Route::post('acl', [Controllers\EdgeController::class, 'acl'])
+            ->withoutMiddleware([Permission::class, Authenticate::class]);
 
-    // resource必须放最后面
-    $router->resource('edge/gateway', Controllers\EdgeGatewayController::class);
-    $router->resource('edge/authorize', Controllers\EdgeAuthorizeController::class);
+        // resource必须放最后面
+        $router->resource('gateway', Controllers\EdgeGatewayController::class);
+        $router->resource('authorize', Controllers\EdgeAuthorizeController::class);
+
+    });
 });
 
 // 免登录无限制

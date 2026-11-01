@@ -1,6 +1,6 @@
 <?php
 declare(strict_types=1);
-namespace App\Console\Commands;
+namespace DagaSmart\Edge\Console\Commands;
 
 use DagaSmart\Edge\Facades\EdgeAuth;
 use Illuminate\Console\Command;
