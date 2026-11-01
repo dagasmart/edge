@@ -13,7 +13,7 @@ use Swow\Psr7\Server\ServerConnection;
 
 function getDeviceSecret(string $clientId, string $username): ?string
 {
-    $key = 'device:secret:' . $clientId . ':' . $username;
+    $key = 'device:secret:'.$clientId.':'.$username;
     $val = redisGet($key);
 
     return ($val !== null && $val !== '') ? $val : null;
@@ -32,7 +32,7 @@ function authenticateDevice(string $clientId, string $username, string $password
 
     if (password_needs_rehash($hash, PASSWORD_BCRYPT)) {
         $newHash = password_hash($password, PASSWORD_BCRYPT);
-        $key = 'device:secret:' . $clientId . ':' . $username;
+        $key = 'device:secret:'.$clientId.':'.$username;
         redisSetex($key, 0, $newHash);
     }
 
@@ -50,8 +50,8 @@ function acquireUserOnline(
     int $ttl = 300,
     int $retryWindow = 30
 ): bool {
-    $key = 'auth:online:' . $username;
-    $retryKey = 'auth:retry:' . $username . ':' . $clientId;
+    $key = 'auth:online:'.$username;
+    $retryKey = 'auth:retry:'.$username.':'.$clientId;
 
     $script = <<<'LUA'
 local cur = redis.call('GET', KEYS[1])
@@ -111,15 +111,16 @@ LUA;
 
         return $ret === 1;
     } catch (Throwable $e) {
-        fwrite(STDERR, '[acquireUserOnline] ' . $e->getMessage() . PHP_EOL);
+        fwrite(STDERR, '[acquireUserOnline] '.$e->getMessage().PHP_EOL);
+
         return false;
     }
 }
 
 function releaseUserOnline(string $username, string $clientId): void
 {
-    $key = 'auth:online:' . $username;
-    $retryKey = 'auth:retry:' . $username . ':' . $clientId;
+    $key = 'auth:online:'.$username;
+    $retryKey = 'auth:retry:'.$username.':'.$clientId;
 
     $script = <<<'LUA'
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -136,7 +137,7 @@ LUA;
             }
         );
     } catch (Throwable $e) {
-        fwrite(STDERR, '[releaseUserOnline] ' . $e->getMessage() . PHP_EOL);
+        fwrite(STDERR, '[releaseUserOnline] '.$e->getMessage().PHP_EOL);
     }
 }
 
@@ -170,6 +171,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     if ($clientId === '' || $username === '') {
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'missing client_id / username'], 200);
+
         return;
     }
 
@@ -180,18 +182,21 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             'reason' => 'client_blocked',
             'retry_after' => 600,
         ], 200);
+
         return;
     }
 
     if ($password === '' && $signature === '') {
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'missing password or signature'], 200);
+
         return;
     }
 
     if (! concurrencyAcquire()) {
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 200);
+
         return;
     }
 
@@ -203,17 +208,19 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         respondJson($conn, [
             'result' => 'deny',
             'reason' => 'device_overloaded',
-            'detail' => 'max ' . MAX_CONCURRENCY_PER_DEVICE . ' concurrent requests per device',
+            'detail' => 'max '.MAX_CONCURRENCY_PER_DEVICE.' concurrent requests per device',
         ], 200);
+
         return;
     }
 
-    $rateKey = 'rate:' . $clientId;
+    $rateKey = 'rate:'.$clientId;
     if (rateLimited($rateKey)) {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 200);
+
         return;
     }
 
@@ -227,6 +234,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
                 recordClientFail($clientId);
                 metricsInc('auth_fail');
                 respondJson($conn, ['result' => 'deny', 'reason' => $reason], 200);
+
                 return;
             }
             $reason = 'ok';
@@ -241,6 +249,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
                 }
                 metricsInc('auth_fail');
                 respondJson($conn, ['result' => 'deny', 'reason' => $reason], 200);
+
                 return;
             }
         }
@@ -255,13 +264,14 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
                 'detail' => '同一账号已在其他设备登录',
                 'retry_after' => 30,
             ], 200);
+
             return;
         }
 
         resetRate($rateKey);
         try {
             withRedis(static function (Redis $conn) use ($clientId): void {
-                $conn->del('fail:' . $clientId, 'block:' . $clientId);
+                $conn->del('fail:'.$clientId, 'block:'.$clientId);
             });
         } catch (Throwable) {
         }
@@ -282,7 +292,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
                 releaseUserOnline($authedUsername, $authedClientId);
             }
         } catch (Throwable $e) {
-            fwrite(STDERR, '[release-online] ' . $e->getMessage() . PHP_EOL);
+            fwrite(STDERR, '[release-online] '.$e->getMessage().PHP_EOL);
         } finally {
             EdgeAuthContext::clear();
         }
