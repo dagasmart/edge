@@ -8,7 +8,7 @@ use Swow\Psr7\Server\ServerConnection;
 
 /* =========================================================
  * EdgeAuth HTTP 路由处理 - 方案 A（bcrypt + HMAC 双路径）
- * 在线锁：username 维度 Set 多 slot，支持推送端+消费端同时在线
+ * 在线锁：严格单点登录 + 冲突静默窗口（防互踢重试风暴）
  * ========================================================= */
 
 function getDeviceSecret(string $clientId, string $username): ?string
@@ -40,77 +40,103 @@ function authenticateDevice(string $clientId, string $username, string $password
 }
 
 /* =========================================================
- * 单点登录：Set 多 slot，同 username 多 clientid 同时在线
+ * 严格单点登录（Lua 原子，后登录 deny 不踢前）
+ * 返回值：true=允许, false=拒绝（含静默期内的快速拒绝）
  * ========================================================= */
 
-/**
- * 注册在线 slot（原子 SADD + EXPIRE）
- * 同 username 下每个 clientid 独立占一个 slot，互不干扰
- */
-function acquireUserOnline(string $username, string $clientId, int $ttl = 300): bool
-{
+function acquireUserOnline(
+    string $username,
+    string $clientId,
+    int $ttl = 300,
+    int $retryWindow = 30
+): bool {
     $key = 'auth:online:' . $username;
+    $retryKey = 'auth:retry:' . $username . ':' . $clientId;
 
     $script = <<<'LUA'
-redis.call('SADD', KEYS[1], ARGV[1])
-redis.call('EXPIRE', KEYS[1], ARGV[2])
-return 1
+local cur = redis.call('GET', KEYS[1])
+
+-- 无人占用：抢占
+if cur == false then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    redis.call('DEL', KEYS[2])
+    return 1
+end
+
+-- 自己已占用：续期
+if cur == ARGV[1] then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+    redis.call('DEL', KEYS[2])
+    return 1
+end
+
+-- 别人占用：检查静默窗口
+local retrying = redis.call('GET', KEYS[2])
+if retrying ~= false then
+    return -1  -- 静默中，快速拒绝
+end
+
+-- 首次冲突：设置静默窗口
+redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
+return 0
 LUA;
 
     try {
         $ret = withRedis(
-            static function (Redis $conn) use ($key, $clientId, $ttl, $script): bool {
-                return (bool) $conn->eval($script, [$key, $clientId, $ttl], 1);
+            static function (Redis $conn) use (
+                $key,
+                $retryKey,
+                $clientId,
+                $ttl,
+                $retryWindow,
+                $script
+            ): int {
+                return (int) $conn->eval(
+                    $script,
+                    [$key, $retryKey, $clientId, $ttl, $retryWindow],
+                    2
+                );
             }
         );
-        return $ret;
+
+        if ($ret === -1) {
+            // 静默期内，记一次日志即可，不打 metrics 避免刷屏
+            fwrite(STDERR, sprintf(
+                '[acquireUserOnline] silent-window clientid=%s username=%s%s',
+                $clientId,
+                $username,
+                PHP_EOL
+            ));
+        }
+
+        return $ret === 1;
     } catch (Throwable $e) {
         fwrite(STDERR, '[acquireUserOnline] ' . $e->getMessage() . PHP_EOL);
         return false;
     }
 }
 
-/**
- * 释放在线 slot（原子 SREM，只删自己的）
- * Set 空了自动清理 key
- */
 function releaseUserOnline(string $username, string $clientId): void
 {
     $key = 'auth:online:' . $username;
+    $retryKey = 'auth:retry:' . $username . ':' . $clientId;
 
     $script = <<<'LUA'
-redis.call('SREM', KEYS[1], ARGV[1])
-if redis.call('SCARD', KEYS[1]) == 0 then
+if redis.call('GET', KEYS[1]) == ARGV[1] then
     redis.call('DEL', KEYS[1])
 end
+redis.call('DEL', KEYS[2])
 return 0
 LUA;
 
     try {
         withRedis(
-            static function (Redis $conn) use ($key, $clientId, $script): void {
-                $conn->eval($script, [$key, $clientId], 1);
+            static function (Redis $conn) use ($key, $retryKey, $clientId, $script): void {
+                $conn->eval($script, [$key, $retryKey, $clientId], 2);
             }
         );
     } catch (Throwable $e) {
         fwrite(STDERR, '[releaseUserOnline] ' . $e->getMessage() . PHP_EOL);
-    }
-}
-
-/**
- * 查询同 username 当前在线 clientid 列表（调试/运维用）
- */
-function getUserOnlineClients(string $username): array
-{
-    $key = 'auth:online:' . $username;
-
-    try {
-        return withRedis(static function (Redis $conn) use ($key): array {
-            $members = $conn->sMembers($key);
-            return is_array($members) ? $members : [];
-        });
-    } catch (Throwable) {
-        return [];
     }
 }
 
@@ -143,40 +169,29 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
     if ($clientId === '' || $username === '') {
         metricsInc('auth_fail');
-        respondJson($conn, [
-            'result' => 'deny',
-            'reason' => 'missing client_id / username',
-        ], 401);
-
+        respondJson($conn, ['result' => 'deny', 'reason' => 'missing client_id / username'], 200);
         return;
     }
 
-    // ★ 入口级拦截：已封禁客户端不占并发、不查 secret、不走限流
     if (isClientBlocked($clientId)) {
         metricsInc('auth_fail');
         respondJson($conn, [
             'result' => 'deny',
             'reason' => 'client_blocked',
             'retry_after' => 600,
-        ], 429);
-
+        ], 200);
         return;
     }
 
     if ($password === '' && $signature === '') {
         metricsInc('auth_fail');
-        respondJson($conn, [
-            'result' => 'deny',
-            'reason' => 'missing password or signature',
-        ], 401);
-
+        respondJson($conn, ['result' => 'deny', 'reason' => 'missing password or signature'], 200);
         return;
     }
 
     if (! concurrencyAcquire()) {
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 503);
-
+        respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 200);
         return;
     }
 
@@ -189,8 +204,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             'result' => 'deny',
             'reason' => 'device_overloaded',
             'detail' => 'max ' . MAX_CONCURRENCY_PER_DEVICE . ' concurrent requests per device',
-        ], 429);
-
+        ], 200);
         return;
     }
 
@@ -199,8 +213,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 429);
-
+        respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 200);
         return;
     }
 
@@ -209,16 +222,13 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
         if ($useHmac) {
             $authenticated = hmacAuthenticate($clientId, $username, $signature);
-
             if (! $authenticated) {
                 $reason = EdgeAuthContext::getAuthReason() ?: 'hmac_failed';
                 recordClientFail($clientId);
                 metricsInc('auth_fail');
-                respondJson($conn, ['result' => 'deny', 'reason' => $reason], 401);
-
+                respondJson($conn, ['result' => 'deny', 'reason' => $reason], 200);
                 return;
             }
-
             $reason = 'ok';
         } else {
             $result = authenticateDevice($clientId, $username, $password);
@@ -230,24 +240,24 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
                     recordClientFail($clientId);
                 }
                 metricsInc('auth_fail');
-                respondJson($conn, ['result' => 'deny', 'reason' => $reason], 401);
-
+                respondJson($conn, ['result' => 'deny', 'reason' => $reason], 200);
                 return;
             }
         }
 
-        // ★ Set 多 slot：同 username 允许多 clientid 同时在线
-        if (! acquireUserOnline($username, $clientId, 300)) {
+        // ★ 严格单点 + 静默窗口
+        if (! acquireUserOnline($username, $clientId, 300, 30)) {
             metricsInc('auth_fail');
+            metricsInc('auth_conflict');
             respondJson($conn, [
                 'result' => 'deny',
-                'reason' => 'online_slot_failed',
-            ], 401);
-
+                'reason' => 'already_logged_in',
+                'detail' => '同一账号已在其他设备登录',
+                'retry_after' => 30,
+            ], 200);
             return;
         }
 
-        // ★ 认证成功：清除失败/封禁计数，防止偶发输错被误封
         resetRate($rateKey);
         try {
             withRedis(static function (Redis $conn) use ($clientId): void {
@@ -259,16 +269,12 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         EdgeAuthContext::setAuth($username, $clientId);
 
         metricsInc('auth_ok');
-        respondJson($conn, [
-            'result' => 'allow',
-            'reason' => $reason,
-        ], 200);
+        respondJson($conn, ['result' => 'allow', 'reason' => $reason], 200);
 
     } finally {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
 
-        // ★ 释放在线 slot（只删自己的，Lua 原子）
         try {
             $authedUsername = EdgeAuthContext::getUsername();
             $authedClientId = EdgeAuthContext::getClientId();
