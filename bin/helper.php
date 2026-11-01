@@ -96,8 +96,6 @@ function redisPoolInit(int $size = 256, int $db = 2): void
     }
 }
 
-// ---------- 以下全部与你原始 helper.php 一致，一字不改 ----------
-
 function redisPoolPop(float $timeout = 1.0): ?Redis
 {
     global $redisPool;
@@ -157,7 +155,6 @@ function withRedis(callable $fn): mixed
 /* =========================================================
  * 业务 Redis 操作 —— 每次操作前强制 select(db)
  * ========================================================= */
-// （与你原始 helper.php 完全一致：redisGet/redisSetex/redisExists/redisDel/redisSetNxEx）
 
 function redisGet(string $key): mixed
 {
@@ -218,7 +215,6 @@ function redisSetNxEx(string $key, string $value, int $ttl): bool
 /* =========================================================
  * L1 本地缓存
  * ========================================================= */
-// （与你原始 helper.php 完全一致）
 
 /** @var ArrayObject|null $localCache */
 $localCache = null;
@@ -298,10 +294,6 @@ function redisPoolIsReady(float $minRatio = 0.8): bool
     return $free >= ($redisPoolSize * $minRatio);
 }
 
-/**
- * 阻塞等待 Redis 池填充到指定比例（带超时）
- * @return bool true=就绪, false=超时
- */
 function redisPoolWaitReady(int $timeoutSec = 10, float $minRatio = 0.8): bool
 {
     $deadline = time() + $timeoutSec;
@@ -332,7 +324,6 @@ function concurrencyInit(int $max): void
     fwrite(STDOUT, '[EdgeAuth] Concurrency: Swow\Channel semaphore (max='.$max.')'.PHP_EOL);
 }
 
-// ★ 新增：并发信号量渐进扩容
 function concurrencyProgressiveExpand(int $targetSize, int $steps = 10, int $stepMs = 300): void
 {
     global $globalConcurrency, $concurrencyMax;
@@ -353,7 +344,7 @@ function concurrencyProgressiveExpand(int $targetSize, int $steps = 10, int $ste
                 try {
                     $globalConcurrency->push(1, 1);
                     $added++;
-                    $concurrencyMax++; // 同步更新上限标记
+                    $concurrencyMax++;
                 } catch (Throwable) {
                     break;
                 }
@@ -413,10 +404,7 @@ function concurrencyStats(): array
 
 /* =========================================================
  * 设备级并发分桶限流
- * （与你原始 helper.php 完全一致）
  * ========================================================= */
-// ... $__edge_device_semaphores / deviceConcurrencyInit / Acquire / Release / Cleanup / Stats
-// （完整保留你 user_doc 3 中的实现，此处不重复）
 
 $__edge_device_semaphores = [];
 $__edge_device_sem_max = 5;
@@ -531,31 +519,50 @@ function deviceConcurrencyStats(): array
 }
 
 /* =========================================================
- * 客户端失败熔断 / 指标 / 限流 / Base64 / respondJson / debugLog
- * （与你原始 helper.php 完全一致，一字不改）
+ * 客户端失败熔断 —— 入口级拦截 + 指数退避
  * ========================================================= */
 
+/**
+ * 检查客户端是否被封禁
+ *
+ * 命中后刷新 TTL，防止暴力请求耗尽封禁窗口后立刻重试
+ */
 function isClientBlocked(string $clientId): bool
 {
-    $v = redisGet('block:'.$clientId);
-    return $v !== null;
+    $blocked = redisGet('block:' . $clientId);
+    if ($blocked === null) {
+        return false;
+    }
+
+    // 刷新封禁 TTL，压制持续重试
+    try {
+        withRedis(static function (Redis $conn) use ($clientId): void {
+            $conn->expire('block:' . $clientId, 600);
+        });
+    } catch (Throwable) {
+    }
+
+    return true;
 }
 
+/**
+ * 记录认证失败，达到阈值即封禁（指数退避）
+ *
+ * 5 次失败即封禁：60s → 120s → 240s → 480s → 960s → 封顶 1h
+ */
 function recordClientFail(string $clientId): void
 {
-    $key = 'fail:'.$clientId;
+    $key = 'fail:' . $clientId;
     withRedis(static function (Redis $conn) use ($key, $clientId): void {
-        global $redisDb;
-        if ($redisDb > 0) {
-            $conn->select($redisDb);
-        }
         $script = 'local c = redis.call("INCR", KEYS[1])
 if c == 1 then redis.call("EXPIRE", KEYS[1], ARGV[1]) end
 return c';
         $c = (int) $conn->eval($script, [$key, 300], 1);
-        if ($c >= 20) {
-            $conn->setex('block:'.$clientId, 600, '1');
-            fwrite(STDERR, '[block] '.$clientId.' (fail count='.$c.')'.PHP_EOL);
+
+        if ($c >= 5) {
+            $ttl = min(3600, 60 * (2 ** min($c - 5, 6)));
+            $conn->setex('block:' . $clientId, $ttl, (string) $c);
+            fwrite(STDERR, '[block] ' . $clientId . ' (fail count=' . $c . ', ttl=' . $ttl . 's)' . PHP_EOL);
         }
     });
 }
@@ -583,21 +590,19 @@ function metricsSnapshot(): array
     return is_array($metrics) ? $metrics : [];
 }
 
+/**
+ * 滑动窗口限流（Lua 原子 INCR+EXPIRE）
+ */
 function rateLimited(string $key): bool
 {
     $max = defined('RATE_MAX') ? RATE_MAX : 10;
     $window = defined('RATE_TTL') ? RATE_TTL : 60;
     try {
         return withRedis(static function (Redis $conn) use ($key, $max, $window): bool {
-            global $redisDb;
-            if ($redisDb > 0) {
-                $conn->select($redisDb);
-            }
-            $c = $conn->incr($key);
-            if ($c === 1) {
-                $conn->expire($key, $window);
-            }
-            return $c > $max;
+            $script = 'local c = redis.call("INCR", KEYS[1])
+if c == 1 then redis.call("EXPIRE", KEYS[1], ARGV[1]) end
+return c > tonumber(ARGV[2])';
+            return (bool) $conn->eval($script, [$key, $window, $max], 1);
         });
     } catch (Throwable) {
         return false;
@@ -653,14 +658,14 @@ if (! function_exists('respondJson')) {
         }
         $body = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if ($body === false) {
-            fwrite(STDERR, '[respondJson] json_encode failed: '.json_last_error_msg().PHP_EOL);
+            fwrite(STDERR, '[respondJson] json_encode failed: ' . json_last_error_msg() . PHP_EOL);
             $body = '{"error":"json_encode_failed"}';
             $status = 500;
         }
         try {
             $conn->respond($body, $status, ['Content-Type' => 'application/json; charset=utf-8']);
         } catch (Throwable $e) {
-            fwrite(STDERR, '[respondJson] respond failed: '.$e->getMessage().PHP_EOL);
+            fwrite(STDERR, '[respondJson] respond failed: ' . $e->getMessage() . PHP_EOL);
         }
     }
 }
@@ -668,9 +673,9 @@ if (! function_exists('respondJson')) {
 if (! function_exists('debugLog')) {
     function debugLog(string $msg): void
     {
-        if (defined('DEBUG') && DEBUG === false) {
+        if (! defined('DEBUG') || DEBUG !== true) {
             return;
         }
-        fwrite(STDERR, '[EdgeAuth] '.$msg.PHP_EOL);
+        fwrite(STDERR, '[EdgeAuth] ' . $msg . PHP_EOL);
     }
 }

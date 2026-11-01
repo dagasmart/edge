@@ -8,16 +8,11 @@ use Swow\Psr7\Server\ServerConnection;
 
 /* =========================================================
  * EdgeAuth HTTP 路由处理 - 方案 A（bcrypt + HMAC 双路径）
- *
- * 约定：
- *   Redis key = device:secret:{client_id}:{username}
- *   Redis val = bcrypt hash
- *   验证方式  = password_verify
  * ========================================================= */
 
 function getDeviceSecret(string $clientId, string $username): ?string
 {
-    $key = 'device:secret:'.$clientId.':'.$username;
+    $key = 'device:secret:' . $clientId . ':' . $username;
     $val = redisGet($key);
 
     return ($val !== null && $val !== '') ? $val : null;
@@ -34,11 +29,10 @@ function authenticateDevice(string $clientId, string $username, string $password
         return ['ok' => false, 'reason' => 'password mismatch'];
     }
 
-    // 自动升级 bcrypt cost
     if (password_needs_rehash($hash, PASSWORD_BCRYPT)) {
         $newHash = password_hash($password, PASSWORD_BCRYPT);
-        $key = 'device:secret:'.$clientId.':'.$username;
-        redisSetex($key, 0, $newHash); // 0 = 永不过期
+        $key = 'device:secret:' . $clientId . ':' . $username;
+        redisSetex($key, 0, $newHash);
     }
 
     return ['ok' => true, 'reason' => 'ok'];
@@ -50,7 +44,7 @@ function authenticateDevice(string $clientId, string $username, string $password
 
 function acquireUserOnline(string $username, string $clientId, int $ttl = 300): bool
 {
-    $key = 'auth:online:'.$username;
+    $key = 'auth:online:' . $username;
 
     $existing = redisGet($key);
     if ($existing !== null) {
@@ -75,7 +69,7 @@ function acquireUserOnline(string $username, string $clientId, int $ttl = 300): 
 
 function releaseUserOnline(string $username, string $clientId): void
 {
-    $key = 'auth:online:'.$username;
+    $key = 'auth:online:' . $username;
     $existing = redisGet($key);
 
     if ($existing === $clientId) {
@@ -102,7 +96,6 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         $data['username'] ?? $data['user'] ?? ''
     ));
 
-    // 方案 A：password 和 signature 分开
     $password = trim((string) ($data['password'] ?? ''));
     $signature = trim((string) ($data['signature'] ?? $data['token'] ?? ''));
 
@@ -117,6 +110,18 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             'result' => 'deny',
             'reason' => 'missing client_id / username',
         ], 401);
+
+        return;
+    }
+
+    // ★ 入口级拦截：已封禁客户端不占并发、不查 secret、不走限流
+    if (isClientBlocked($clientId)) {
+        metricsInc('auth_fail');
+        respondJson($conn, [
+            'result' => 'deny',
+            'reason' => 'client_blocked',
+            'retry_after' => 600,
+        ], 429);
 
         return;
     }
@@ -146,27 +151,18 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         respondJson($conn, [
             'result' => 'deny',
             'reason' => 'device_overloaded',
-            'detail' => 'max '.MAX_CONCURRENCY_PER_DEVICE.' concurrent requests per device',
+            'detail' => 'max ' . MAX_CONCURRENCY_PER_DEVICE . ' concurrent requests per device',
         ], 429);
 
         return;
     }
 
-    $rateKey = 'rate:'.$clientId;
+    $rateKey = 'rate:' . $clientId;
     if (rateLimited($rateKey)) {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
         respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 429);
-
-        return;
-    }
-
-    if (isClientBlocked($clientId)) {
-        deviceConcurrencyRelease($deviceToken);
-        concurrencyRelease();
-        metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'blocked'], 401);
 
         return;
     }
@@ -215,11 +211,18 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             return;
         }
 
-        // 写入协程上下文，供 server.php finally 释放
+        // ★ 认证成功：清除失败/封禁计数，防止偶发输错被误封
+        resetRate($rateKey);
+        try {
+            withRedis(static function (Redis $conn) use ($clientId): void {
+                $conn->del('fail:' . $clientId, 'block:' . $clientId);
+            });
+        } catch (Throwable) {
+        }
+
         EdgeAuthContext::setAuth($username, $clientId);
 
         metricsInc('auth_ok');
-        resetRate($rateKey);
         respondJson($conn, [
             'result' => 'allow',
             'reason' => $reason,
