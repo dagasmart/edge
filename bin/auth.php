@@ -39,7 +39,7 @@ function authenticateDevice(string $clientId, string $username, string $password
 }
 
 /* =========================================================
- * 单点登录互斥（Lua 原子抢占）
+ * 单点登录互斥（Lua 原子抢占 / 原子释放）
  * ========================================================= */
 
 function acquireUserOnline(string $username, string $clientId, int $ttl = 300): bool
@@ -60,10 +60,12 @@ return 0
 LUA;
 
     try {
-        $ret = withRedis(static function (Redis $conn) use ($key, $clientId, $ttl) {
-            return $conn->eval($script, [$key, $clientId, $ttl], 1);
-        });
-        return (bool) $ret;
+        $ret = withRedis(
+            static function (Redis $conn) use ($key, $clientId, $ttl, $script): bool {
+                return (bool) $conn->eval($script, [$key, $clientId, $ttl], 1);
+            }
+        );
+        return $ret;
     } catch (Throwable $e) {
         fwrite(STDERR, '[acquireUserOnline] ' . $e->getMessage() . PHP_EOL);
         return false;
@@ -73,10 +75,22 @@ LUA;
 function releaseUserOnline(string $username, string $clientId): void
 {
     $key = 'auth:online:' . $username;
-    $existing = redisGet($key);
 
-    if ($existing === $clientId) {
-        redisDel($key);
+    $script = <<<'LUA'
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+LUA;
+
+    try {
+        withRedis(
+            static function (Redis $conn) use ($key, $clientId, $script): void {
+                $conn->eval($script, [$key, $clientId], 1);
+            }
+        );
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[releaseUserOnline] ' . $e->getMessage() . PHP_EOL);
     }
 }
 
@@ -235,7 +249,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
 
-        // ★ 释放在线锁（只删自己的）
+        // ★ 释放在线锁（只删自己的，Lua 原子）
         try {
             $authedUsername = EdgeAuthContext::getUsername();
             $authedClientId = EdgeAuthContext::getClientId();
