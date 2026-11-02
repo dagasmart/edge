@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Swow\Channel;
 use Swow\Coroutine;
+use Swow\Psr7\Server\ServerConnection;
 
 /* =========================================================
  * Redis 连接池（Swow Channel 真协程池）
@@ -668,16 +669,24 @@ if (! function_exists('respondJson')) {
             $data = ['error' => 'internal', 'msg' => 'invalid response data'];
             $status = 500;
         }
+
         $body = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if ($body === false) {
-            fwrite(STDERR, '[respondJson] json_encode failed: '.json_last_error_msg().PHP_EOL);
+            fwrite(STDERR, '[respondJson] json_encode failed: ' . json_last_error_msg() . PHP_EOL);
             $body = '{"error":"json_encode_failed"}';
             $status = 500;
         }
+
+        $length = strlen($body);
+
         try {
-            $conn->respond($body, $status, ['Content-Type' => 'application/json; charset=utf-8']);
+            /** @var ServerConnection $conn */
+            $conn->respond($body, $status, [
+                'Content-Type'   => 'application/json; charset=utf-8',
+                'Content-Length' => (string) $length,
+            ]);
         } catch (Throwable $e) {
-            fwrite(STDERR, '[respondJson] respond failed: '.$e->getMessage().PHP_EOL);
+            fwrite(STDERR, '[respondJson] respond failed: ' . $e->getMessage() . PHP_EOL);
         }
     }
 }
