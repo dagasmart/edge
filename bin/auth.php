@@ -17,11 +17,12 @@ use Swow\Psr7\Server\ServerConnection;
  * 获取设备密钥
  *
  * ★ 对齐 Redis 认证模式：直接读取 Redis，不经过本地 L1 缓存
- * 确保设备密钥轮换后立即生效，避免缓存 TTL 导致的旧密钥残留
+ * key 格式：device:secret:{username}
+ * （clientId 可能已包含 username 段，避免重复拼接导致 key 错位）
  */
 function getDeviceSecret(string $clientId, string $username): ?string
 {
-    $key = 'device:secret:'.$clientId.':'.$username;
+    $key = 'device:secret:'.$username;
 
     $val = redisGet($key);
 
