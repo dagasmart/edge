@@ -16,12 +16,17 @@ use Swow\Psr7\Server\ServerConnection;
 /**
  * amis 兼容响应封装
  *
- * - NanoMQ 继续从 data.result 读取 allow/deny
- * - amis 读取外层 code=0 识别为成功，不再报"资源解析服务请求失败"
+ * - 顶层 result：NanoMQ/EMQX HTTP 认证契约
+ * - data.result：amis 管理端兼容
  */
 function authRespond(ServerConnection $conn, bool $allow, string $reason, int $httpStatus = 200): void
 {
     respondJson($conn, [
+        // ★ NanoMQ 契约：必须在顶层
+        'result' => $allow ? 'allow' : 'deny',
+        'is_superuser' => false,
+
+        // amis 兼容
         'code'    => $allow ? 0 : 1,
         'message' => $allow ? 'success' : $reason,
         'data'    => [
@@ -36,7 +41,6 @@ function authRespond(ServerConnection $conn, bool $allow, string $reason, int $h
  *
  * ★ 对齐 Redis 认证模式：直接读取 Redis，不经过本地 L1 缓存
  * key 格式：device:secret:{username}
- * （clientId 可能已包含 username 段，避免重复拼接导致 key 错位）
  */
 function getDeviceSecret(string $clientId, string $username): ?string
 {
@@ -64,7 +68,6 @@ function authenticateDevice(string $clientId, string $username, string $password
 
 /* =========================================================
  * 严格单点登录（Lua 原子，后登录 deny 不踢前）
- * 对齐 NanoMQ 后不再调用，保留供 HMAC/管理端复用
  * ========================================================= */
 
 function acquireUserOnline(
@@ -79,27 +82,23 @@ function acquireUserOnline(
     $script = <<<'LUA'
 local cur = redis.call('GET', KEYS[1])
 
--- 无人占用：抢占
 if cur == false then
     redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
     redis.call('DEL', KEYS[2])
     return 1
 end
 
--- 自己已占用：续期
 if cur == ARGV[1] then
     redis.call('EXPIRE', KEYS[1], ARGV[2])
     redis.call('DEL', KEYS[2])
     return 1
 end
 
--- 别人占用：检查静默窗口
 local retrying = redis.call('GET', KEYS[2])
 if retrying ~= false then
-    return -1  -- 静默中，快速拒绝
+    return -1
 end
 
--- 首次冲突：设置静默窗口
 redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
 return 0
 LUA;
@@ -232,7 +231,6 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     }
 
     try {
-        // ★ 对齐 NanoMQ：只走 bcrypt 密码校验，密钥直接读 Redis
         $result = authenticateDevice($clientId, $username, $password);
         $authenticated = $result['ok'] ?? false;
         $reason = $result['reason'] ?? 'unknown';
@@ -247,7 +245,6 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             return;
         }
 
-        // ★ 认证成功：清除失败计数和封禁
         resetRate($rateKey);
         try {
             withRedis(static function (Redis $conn) use ($clientId): void {
