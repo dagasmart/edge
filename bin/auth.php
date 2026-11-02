@@ -40,14 +40,21 @@ function authRespond(ServerConnection $conn, bool $allow, string $reason, int $h
 /**
  * 获取设备密钥
  *
- * ★ 对齐 Redis 认证模式：直接读取 Redis，不经过本地 L1 缓存
- * key 格式：device:secret:{username}
+ * ★ 对齐 Laravel EdgeAuthorizeService::syncRedisOnSave 写入格式
+ * key 格式：device:secret:{client_id}:{username}
  */
 function getDeviceSecret(string $clientId, string $username): ?string
 {
-    $key = 'device:secret:'.$username;
-
+    // 优先完整格式（与 Laravel 写入侧一致）
+    $key = 'device:secret:' . $clientId . ':' . $username;
     $val = redisGet($key);
+    if ($val !== null && $val !== '') {
+        return $val;
+    }
+
+    // 兜底：兼容旧格式 device:secret:{username}
+    $legacyKey = 'device:secret:' . $username;
+    $val = redisGet($legacyKey);
 
     return ($val !== null && $val !== '') ? $val : null;
 }
