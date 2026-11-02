@@ -19,21 +19,22 @@ use Swow\Psr7\Server\ServerConnection;
  * - 顶层 result：NanoMQ/EMQX HTTP 认证契约
  * - data.result：amis 管理端兼容
  */
-function authRespond(ServerConnection $conn, bool $allow, string $reason, int $httpStatus = 200): void
+function authRespond(ServerConnection $conn, bool $allow, string $reason, int $httpStatus = 0): void
 {
-    respondJson($conn, [
-        // ★ NanoMQ 契约：必须在顶层
-        'result' => $allow ? 'allow' : 'deny',
-        'is_superuser' => false,
+    // NanoMQ 老版本：只看状态码
+    $status = $httpStatus !== 0
+        ? $httpStatus
+        : ($allow ? 200 : 403); // 失败必须非 200
 
-        // amis 兼容
+    respondJson($conn, [
+        'result'  => $allow ? 'allow' : 'deny',
         'code'    => $allow ? 0 : 1,
         'message' => $allow ? 'success' : $reason,
         'data'    => [
             'result' => $allow ? 'allow' : 'deny',
             'reason' => $reason,
         ],
-    ], $httpStatus);
+    ], $status);
 }
 
 /**
