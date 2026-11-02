@@ -9,9 +9,27 @@ use Swow\Psr7\Server\ServerConnection;
 /* =========================================================
  * EdgeAuth HTTP 路由处理 - 对齐 NanoMQ auth.http
  * 认证方式：username + password（bcrypt）
- * 密钥来源：Redis device:secret:{clientId}:{username}
+ * 密钥来源：Redis device:secret:{username}
  * HMAC / 单点登录 / 重放检测保留代码，不参与主认证路径
  * ========================================================= */
+
+/**
+ * amis 兼容响应封装
+ *
+ * - NanoMQ 继续从 data.result 读取 allow/deny
+ * - amis 读取外层 code=0 识别为成功，不再报"资源解析服务请求失败"
+ */
+function authRespond(ServerConnection $conn, bool $allow, string $reason, int $httpStatus = 200): void
+{
+    respondJson($conn, [
+        'code'    => $allow ? 0 : 1,
+        'message' => $allow ? 'success' : $reason,
+        'data'    => [
+            'result' => $allow ? 'allow' : 'deny',
+            'reason' => $reason,
+        ],
+    ], $httpStatus);
+}
 
 /**
  * 获取设备密钥
@@ -167,32 +185,28 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
     if ($clientId === '' || $username === '') {
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'missing client_id / username'], 200);
+        authRespond($conn, false, 'missing client_id / username');
 
         return;
     }
 
     if (isClientBlocked($clientId)) {
         metricsInc('auth_fail');
-        respondJson($conn, [
-            'result' => 'deny',
-            'reason' => 'client_blocked',
-            'retry_after' => 600,
-        ], 200);
+        authRespond($conn, false, 'client_blocked');
 
         return;
     }
 
     if ($password === '') {
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'missing password'], 200);
+        authRespond($conn, false, 'missing password');
 
         return;
     }
 
     if (! concurrencyAcquire()) {
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'overloaded'], 200);
+        authRespond($conn, false, 'overloaded');
 
         return;
     }
@@ -202,11 +216,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         concurrencyRelease();
         metricsInc('auth_fail');
         metricsInc('device_concurrency_exceeded');
-        respondJson($conn, [
-            'result' => 'deny',
-            'reason' => 'device_overloaded',
-            'detail' => 'max '.MAX_CONCURRENCY_PER_DEVICE.' concurrent requests per device',
-        ], 200);
+        authRespond($conn, false, 'device_overloaded');
 
         return;
     }
@@ -216,7 +226,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
-        respondJson($conn, ['result' => 'deny', 'reason' => 'rate_limited'], 200);
+        authRespond($conn, false, 'rate_limited');
 
         return;
     }
@@ -232,7 +242,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
                 recordClientFail($clientId);
             }
             metricsInc('auth_fail');
-            respondJson($conn, ['result' => 'deny', 'reason' => $reason], 200);
+            authRespond($conn, false, $reason);
 
             return;
         }
@@ -249,7 +259,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         EdgeAuthContext::setAuth($username, $clientId);
 
         metricsInc('auth_ok');
-        respondJson($conn, ['result' => 'allow', 'reason' => $reason], 200);
+        authRespond($conn, true, 'ok');
 
     } finally {
         deviceConcurrencyRelease($deviceToken);
@@ -271,10 +281,10 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
 function handleSuper(ServerConnection $conn, ServerRequest $req): void
 {
-    respondJson($conn, ['result' => 'deny', 'reason' => 'not_implemented'], 501);
+    authRespond($conn, false, 'not_implemented');
 }
 
 function handleAcl(ServerConnection $conn, ServerRequest $req): void
 {
-    respondJson($conn, ['result' => 'deny', 'reason' => 'not_implemented'], 501);
+    authRespond($conn, false, 'not_implemented');
 }
