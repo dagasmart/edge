@@ -9,23 +9,21 @@ return new class extends Migration
 {
     protected $connection = 'master';
 
-    private string $name = 'mcs_edge_data_stream';
+    private string $name = 'mcs_edge_stream_offset';
 
     public function up(): void
     {
         if (! Schema::hasTable($this->name)) {
             Schema::create($this->name, function (Blueprint $table) {
-                $table->comment('边缘网关设备数据流表');
+                $table->comment('边缘网关数据流位点表');
                 $table->id();
-                $table->string('client_id', 64)->comment('MQTT client_id');
-                $table->string('topic', 100);
-                $table->json('payload');
-                $table->unsignedBigInteger('received_ms')->comment('毫秒时间戳');
-                $table->dateTime('received_at');
-                $table->timestamp('created_at')->useCurrent();
+                $table->string('stream', 128)->comment('stream key');
+                $table->string('group_name', 64)->comment('消费组');
+                $table->string('last_id', 64)->comment('最后成功处理的 stream_id');
+                $table->unsignedInteger('last_lag')->default(0)->comment('消费堆积量');
+                $table->timestamp('updated_at')->nullable();
 
-                // 幂等核心：同设备 + 同毫秒 + 同 topic 只能有一条
-                $table->unique(['client_id', 'received_ms', 'topic'])->nullsNotDistinct();
+                $table->primary(['stream', 'group_name']);
             });
         }
 

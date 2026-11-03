@@ -9,14 +9,15 @@ return new class extends Migration
 {
     protected $connection = 'master';
 
-    private string $name = 'mcs_edge_data_stream_fail';
+    private string $name = 'mcs_edge_stream';
 
     public function up(): void
     {
         if (! Schema::hasTable($this->name)) {
             Schema::create($this->name, function (Blueprint $table) {
-                $table->comment('边缘网关数据流(失败)表');
+                $table->comment('边缘网关设备数据流表');
                 $table->id();
+                $table->string('stream_id', 64)->comment('流id');
                 $table->string('client_id', 64)->comment('MQTT client_id');
                 $table->string('topic', 100);
                 $table->json('payload');
@@ -24,6 +25,7 @@ return new class extends Migration
                 $table->dateTime('received_at');
                 $table->timestamp('created_at')->useCurrent();
 
+                $table->unique(['stream_id']);
                 // 幂等核心：同设备 + 同毫秒 + 同 topic 只能有一条
                 $table->unique(['client_id', 'received_ms', 'topic'])->nullsNotDistinct();
             });

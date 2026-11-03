@@ -3,7 +3,7 @@ declare(strict_types=1);
 namespace DagaSmart\Edge\Jobs;
 
 use Carbon\CarbonInterface;
-use DagaSmart\Edge\Models\EdgeDataStream;
+use DagaSmart\Edge\Models\EdgeStream;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldBeUnique;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -74,7 +74,7 @@ class EdgeDataQueue implements ShouldQueue, ShouldBeUnique
     {
         $receivedMs = $this->resolveReceivedMs();
 
-        EdgeDataStream::query()->updateOrCreate(
+        EdgeStream::query()->updateOrCreate(
             [
                 'client_id'   => $this->data['clientid'],
                 'received_ms' => $receivedMs,

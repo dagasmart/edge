@@ -1,56 +1,73 @@
 <?php
+
 declare(strict_types=1);
 
 namespace DagaSmart\Edge\Console\Commands;
 
-use DagaSmart\Edge\Services\MqttService;
+use DagaSmart\Edge\Engine\NanoMQ;
 use Illuminate\Console\Command;
-use Throwable;
-use Swow\Coroutine;
 use Swow\Channel;
+use Swow\Coroutine;
 use Swow\Signal;
+use Throwable;
 
 $edgeRoot = dirname(__DIR__, 3);
-require_once $edgeRoot . '/bin/bootstrap.php';
-require_once $edgeRoot . '/bin/helper.php';
+require_once $edgeRoot.'/bin/bootstrap.php';
+require_once $edgeRoot.'/bin/helper.php';
 
 class EdgeInsertRedisCommand extends Command
 {
     protected $signature = 'edge:insert-redis';
-    protected $description = '订阅 NanoMQ heartbeat/response，批量写入 Redis Stream（MqttService）';
+
+    protected $description = '订阅 NanoMQ heartbeat/response，批量写入 Redis Stream（NanoMQ）';
 
     /* ==================== Stream ==================== */
     private const string STREAM = 'stream:device:data';
+
     private const string DEAD_STREAM = 'stream:device:dead';
+
     private const int STREAM_MAX_LEN = 50_000;
+
     private const int DEAD_MAX_LEN = 10_000;
 
-    /* ==================== 批量参数（可通过配置覆盖） ==================== */
-    private const int DEFAULT_BATCH_SIZE = 50;
-    private const int DEFAULT_FLUSH_INTERVAL_MS = 100;
-    private const int DEFAULT_CHANNEL_SIZE = 2048;
-    private const int DEFAULT_MAX_PAYLOAD_LEN = 65_536; // 64KB
+    /* ==================== 批量参数 ==================== */
+    private const int DEFAULT_BATCH_SIZE = 1;
 
-    /* ==================== 停机等待 ==================== */
-    private const int DRAIN_TIMEOUT_SEC = 10;
-    private const int DRAIN_CHECK_INTERVAL_MS = 50;
+    private const int DEFAULT_FLUSH_INTERVAL_MS = 100;
+
+    private const int DEFAULT_CHANNEL_SIZE = 2048;
+
+    private const int DEFAULT_MAX_PAYLOAD_LEN = 65_536;
+
+    /* ==================== 停机排空 ==================== */
+    private const int DRAIN_POP_TIMEOUT_MS = 50;
 
     private Channel $channel;
+
     private bool $stopping = false;
+
+    /** @var NanoMQ|null 复用同一个 MQTT 实例，避免信号里新建连接 */
+    private ?NanoMQ $mqtt = null;
 
     /* ==================== 统计 ==================== */
     private int $receivedCount = 0;
+
     private int $flushedCount = 0;
+
     private int $droppedCount = 0;
+
     private int $deadCount = 0;
+
     private float $flushLatencySum = 0.0;
+
     private int $flushTimes = 0;
+
     private float $startTime;
 
     public function handle(): int
     {
         $this->startTime = microtime(true);
-        $this->info('[edge:insert-redis] 启动，PID=' . getmypid());
+        $this->info('[edge:insert-redis] 启动，PID='.getmypid());
 
         $batchSize = $this->configInt('edge.mqtt.batch_size', self::DEFAULT_BATCH_SIZE);
         $flushIntervalMs = $this->configInt('edge.mqtt.flush_interval_ms', self::DEFAULT_FLUSH_INTERVAL_MS);
@@ -63,23 +80,26 @@ class EdgeInsertRedisCommand extends Command
         $this->initRedisPool();
         $this->startFlusher($batchSize, $flushIntervalMs);
 
+        $this->mqtt = new NanoMQ;
+
         try {
             $this->info('=====================================');
-            $this->info(sprintf(
-                'MQTT 订阅已启动 | %s',
-                $this->nowString(),
-            ));
+            $this->info(sprintf('MQTT 订阅已启动 | %s', $this->nowString()));
             $this->info('订阅主题：heartbeat/response');
             $this->info(sprintf('批量大小：%d，刷盘间隔：%dms', $batchSize, $flushIntervalMs));
-            $this->info(sprintf('Channel 容量：%d，最大 payload：%dKB', $channelSize, (int)($maxPayloadLen / 1024)));
+            $this->info(sprintf(
+                'Channel 容量：%d，最大 payload：%dKB',
+                $channelSize,
+                (int) ($maxPayloadLen / 1024),
+            ));
             $this->info('按 Ctrl+C 停止');
             $this->info('=====================================');
 
-            $mqtt = new MqttService;
-            $mqtt->subscribe('heartbeat/response', function (
+            // 非阻塞启动，MQTT 在独立协程中运行
+            $this->mqtt->subscribe('heartbeat/response', function (
                 string $topic,
-                string $message
-            ) use ($maxPayloadLen) {
+                string $message,
+            ) use ($maxPayloadLen): void {
                 if ($this->stopping) {
                     return;
                 }
@@ -92,6 +112,7 @@ class EdgeInsertRedisCommand extends Command
                         $maxPayloadLen,
                     ));
                     $this->droppedCount++;
+
                     return;
                 }
 
@@ -126,8 +147,9 @@ class EdgeInsertRedisCommand extends Command
                 ];
 
                 if ($this->channel->isFull()) {
-                    $this->warn('[CHANNEL] 队列已满，丢弃消息 device=' . $device);
+                    $this->warn('[CHANNEL] 队列已满，丢弃消息 device='.$device);
                     $this->droppedCount++;
+
                     return;
                 }
 
@@ -135,22 +157,24 @@ class EdgeInsertRedisCommand extends Command
                     $this->channel->push($item);
                     $this->receivedCount++;
                 } catch (Throwable $e) {
-                    $this->error('[CHANNEL] push 失败：' . $e->getMessage());
+                    $this->error('[CHANNEL] push 失败：'.$e->getMessage());
                     $this->droppedCount++;
                 }
             });
 
-            $this->info('[mqtt] 订阅协程已退出');
+            // 阻塞等待 MQTT 协程退出，无轮询、无 sleep
+            $this->mqtt->wait();
 
+            $this->info('[mqtt] 订阅协程已退出');
         } catch (Throwable $e) {
-            $this->error('[FATAL] ' . $e->getMessage());
+            $this->error('[FATAL] '.$e->getMessage());
+
             return 1;
         }
 
-        $this->drainChannel();
         $this->printStats();
-
         $this->info('[edge:insert-redis] 已停止');
+
         return 0;
     }
 
@@ -165,12 +189,23 @@ class EdgeInsertRedisCommand extends Command
                 } catch (Throwable) {
                     return;
                 }
+
                 if ($this->stopping) {
-                    return;
+                    $this->error('[signal] 再次收到信号，强制退出');
+                    exit(1);
                 }
+
                 $this->warn(sprintf('[signal] 收到 %d，准备优雅停机', $sig));
                 $this->stopping = true;
-                // ✅ 推 null 唤醒 flusher，触发剩余数据刷盘
+
+                // ✅ 复用同一个 MQTT 实例，断开订阅协程持有的连接
+                try {
+                    $this->mqtt?->disconnect();
+                } catch (Throwable) {
+                    // ignore
+                }
+
+                // 唤醒 flusher 进行停机排空
                 try {
                     $this->channel->push(null);
                 } catch (Throwable) {
@@ -184,44 +219,59 @@ class EdgeInsertRedisCommand extends Command
 
     private function startFlusher(int $batchSize, int $flushIntervalMs): void
     {
-        $flushIntervalSec = max(0.001, $flushIntervalMs / 1000.0);
+        $flushIntervalMs = max(1, $flushIntervalMs);
 
-        Coroutine::run(function () use ($batchSize, $flushIntervalSec): void {
+        Coroutine::run(function () use ($batchSize, $flushIntervalMs): void {
             $batch = [];
             $capacity = max(1, $batchSize);
             $lastFlush = microtime(true);
 
             while (true) {
                 $now = microtime(true);
-                $timeout = max(0.0, $flushIntervalSec - ($now - $lastFlush));
+                $elapsedMs = (int) (($now - $lastFlush) * 1000);
+                $timeoutMs = max(0, $flushIntervalMs - $elapsedMs);
 
                 $item = null;
-                if ($timeout > 0.0) {
-                    try {
+
+                try {
+                    if ($timeoutMs > 0) {
                         /** @var array<string, mixed>|null $item */
-                        $item = @$this->channel->pop($timeout);
-                    } catch (Throwable) {
-                        // 超时或 channel 关闭，走兜底刷盘
-                    }
-                } else {
-                    try {
+                        $item = $this->channel->pop($timeoutMs);
+                    } else {
                         /** @var array<string, mixed>|null $item */
                         $item = $this->channel->pop();
-                    } catch (Throwable) {
-                        // ignore
                     }
+                } catch (Throwable) {
+                    // 超时或 channel 关闭，静默处理
+                    // 超时是正常的批量等待行为
+                    continue;
                 }
 
-                // null 表示停机信号或 channel 关闭
+                // null = 停机唤醒信号
                 if ($item === null) {
                     if ($batch !== []) {
                         $this->flushBatch($batch);
                         $batch = [];
                     }
-                    // 如果已停机，排空后退出
+
                     if ($this->stopping) {
-                        break;
+                        // 停机后继续排空 Channel 中残留消息
+                        while (true) {
+                            try {
+                                /** @var array<string, mixed>|null $leftover */
+                                $leftover = $this->channel->pop(self::DRAIN_POP_TIMEOUT_MS);
+                            } catch (Throwable) {
+                                break 2;
+                            }
+
+                            if ($leftover === null) {
+                                break;
+                            }
+
+                            $this->flushBatch([$leftover]);
+                        }
                     }
+
                     continue;
                 }
 
@@ -232,6 +282,8 @@ class EdgeInsertRedisCommand extends Command
                     $lastFlush = microtime(true);
                 }
             }
+
+            $this->line('[flusher] 已退出');
         });
     }
 
@@ -239,10 +291,11 @@ class EdgeInsertRedisCommand extends Command
 
     private function initRedisPool(): void
     {
-        if (!function_exists('redisPoolInit')) {
+        if (! function_exists('redisPoolInit')) {
             throw new \RuntimeException('helper.php 未加载');
         }
-        if (!defined('REDIS_HOST') || !defined('REDIS_PORT') || !defined('REDIS_DB')) {
+
+        if (! defined('REDIS_HOST') || ! defined('REDIS_PORT') || ! defined('REDIS_DB')) {
             throw new \RuntimeException('bootstrap.php 未加载或 Redis 常量未定义');
         }
 
@@ -271,6 +324,7 @@ class EdgeInsertRedisCommand extends Command
         try {
             withRedis(function (\Redis $conn) use ($batch): void {
                 $conn->multi(\Redis::PIPELINE);
+
                 foreach ($batch as $item) {
                     $conn->xAdd(
                         self::STREAM,
@@ -285,9 +339,9 @@ class EdgeInsertRedisCommand extends Command
                         true,
                     );
                 }
+
                 $results = $conn->exec();
 
-                // 诊断：pipeline 返回结果数量应与批量一致
                 if (is_array($results) && count($results) !== count($batch)) {
                     fwrite(STDERR, sprintf(
                         "[FLUSH-DIAG] pipeline 结果数异常 expect=%d actual=%d\n",
@@ -311,6 +365,7 @@ class EdgeInsertRedisCommand extends Command
                 count($batch),
                 $e->getMessage(),
             ));
+
             $this->writeDeadLetter($batch, $e);
         }
 
@@ -339,36 +394,10 @@ class EdgeInsertRedisCommand extends Command
             });
 
             $this->deadCount += count($batch);
-            $this->warn('[DEAD] 已写入死信 ' . self::DEAD_STREAM);
+            $this->warn('[DEAD] 已写入死信 '.self::DEAD_STREAM);
         } catch (Throwable $e) {
-            fwrite(STDERR, '[FATAL] 死信写入也失败：' . $e->getMessage() . PHP_EOL);
+            fwrite(STDERR, '[FATAL] 死信写入也失败：'.$e->getMessage().PHP_EOL);
         }
-    }
-
-    /* ==================== 停机排空 ==================== */
-
-    private function drainChannel(): void
-    {
-        $this->info('[drain] 开始排空 Channel...');
-        $drained = 0;
-
-        // 先把 Channel 里残留的消息全推给 flusher（flusher 已退出，这里自己刷）
-        while ($this->channel->getLength() > 0) {
-            try {
-                /** @var array<string, mixed>|null $item */
-                $item = $this->channel->pop(0.1);
-            } catch (Throwable) {
-                break;
-            }
-            if ($item === null) {
-                break;
-            }
-            // 直接刷单条，不再走 Channel
-            $this->flushBatch([$item]);
-            $drained++;
-        }
-
-        $this->info(sprintf('[drain] 排空完成，补刷 %d 条', $drained));
     }
 
     /* ==================== 统计 ==================== */
@@ -402,6 +431,7 @@ class EdgeInsertRedisCommand extends Command
             if ($value === null) {
                 return $default;
             }
+
             return (int) $value;
         } catch (Throwable) {
             return $default;

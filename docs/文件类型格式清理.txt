@@ -1,0 +1,5 @@
+file -r ./configs/* &&
+sed -i 's/\r$//' ./configs/* &&
+sed -i 's/\r$//' ./docker-compose.yml &&
+docker-compose -f docker-compose.yml -f compose.minimal.yml down -v &&
+docker-compose -f docker-compose.yml -f compose.minimal.yml up -d
