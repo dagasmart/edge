@@ -597,21 +597,21 @@ class EdgeStreamStorageCommand extends Command
 
         $this->line('[SWOW] 启动');
 
-        Coroutine::run(function () use ($stream, $group, $consumer): void {
-            if (PHP_OS_FAMILY !== 'Windows' && class_exists(\Swow\Signal::class)) {
-                $this->registerSignals($stream, $group, $consumer);
-            }
+        // 信号注册必须在主协程里，不能包在 Coroutine::run 里
+        if (PHP_OS_FAMILY !== 'Windows' && class_exists(\Swow\Signal::class)) {
+            $this->registerSignals($stream, $group, $consumer);
+        }
 
-            Coroutine::run(fn () => $this->readerLoop($stream, $group, $consumer));
-            Coroutine::run(fn () => $this->writerLoop($stream, $group, $consumer));
+        // 启动子协程（fire-and-forget，但它们会保活事件循环）
+        Coroutine::run(fn () => $this->readerLoop($stream, $group, $consumer));
+        Coroutine::run(fn () => $this->writerLoop($stream, $group, $consumer));
 
-            while (! $this->stopping) {
-                $this->sleep(0.1);
-            }
+        // ✅ 主函数阻塞：等 stopping 被信号置 true，进程不提前退出
+        while (! $this->stopping) {
+            $this->sleep(0.1);
+        }
 
-            $this->drainChannel($this->writeChannel);
-        });
-
+        $this->drainChannel($this->writeChannel);
         $this->printStats();
 
         return 0;
@@ -620,6 +620,7 @@ class EdgeStreamStorageCommand extends Command
     private function registerSignals(string $stream, string $group, string $consumer): void
     {
         foreach ([\Swow\Signal::INT, \Swow\Signal::TERM] as $sig) {
+            // 每个信号一个协程等待，但 $this->stopping 是共享的
             Coroutine::run(function () use ($sig, $stream, $group, $consumer): void {
                 try {
                     \Swow\Signal::wait($sig);
@@ -635,14 +636,16 @@ class EdgeStreamStorageCommand extends Command
                 $this->warn(sprintf('[signal] 收到 %d，优雅停机', $sig));
                 $this->stopping = true;
 
-                $this->handlePending($stream, $group, $consumer);
-                EdgeStreamFail::forceUnlock($stream, $group);
-
+                // 通知 Writer 结束（Reader 会自己因 stopping=true 退出）
                 try {
                     $this->writeChannel?->push(null);
                 } catch (Throwable) {
-                    // channel 已关闭
+                    // channel 已关闭，忽略
                 }
+
+                // PEL 清理放到这里，不再依赖已退出的 writerLoop
+                $this->handlePending($stream, $group, $consumer);
+                EdgeStreamFail::forceUnlock($stream, $group);
             });
         }
     }
