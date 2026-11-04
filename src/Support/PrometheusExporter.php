@@ -2,14 +2,18 @@
 
 namespace DagaSmart\Edge\Support;
 
-use Swow\Buffer;
 use Swow\Coroutine;
-use Swow\Socket;
-use Swow\SocketException;
 use Throwable;
 
 /**
  * Prometheus 指标收集与 HTTP 暴露
+ *
+ * 使用 PHP 原生 stream_socket_server 实现 HTTP 服务，
+ * 规避 Swow Socket API 在各版本/平台上的差异。
+ *
+ * 路由：
+ * - /metrics       Prometheus 文本格式（text/plain; version=0.0.4）
+ * - /api/metrics   JSON 接口格式（application/json）
  */
 class PrometheusExporter
 {
@@ -18,7 +22,8 @@ class PrometheusExporter
 
     protected bool $running = false;
 
-    protected Socket $server;
+    /** @var resource|null */
+    protected $server;
 
     public function __construct()
     {
@@ -34,61 +39,61 @@ class PrometheusExporter
             // 接收总量
             'edge_received_total' => [
                 'type' => 'counter',
-                'help' => 'Total number of messages received from MQTT',
+                'help' => '从 MQTT 接收到的消息总数',
                 'value' => 0,
             ],
             // 高优写入成功
             'edge_high_write_success_total' => [
                 'type' => 'counter',
-                'help' => 'Total number of high priority messages written to Redis Stream',
+                'help' => '成功写入高优 Redis Stream 的消息总数',
                 'value' => 0,
             ],
             // 普通写入成功
             'edge_data_write_success_total' => [
                 'type' => 'counter',
-                'help' => 'Total number of normal messages written to Redis Stream',
+                'help' => '成功写入普通 Redis Stream 的消息总数',
                 'value' => 0,
             ],
             // 死信总量
             'edge_dead_letter_total' => [
                 'type' => 'counter',
-                'help' => 'Total number of messages sent to dead letter queue',
+                'help' => '进入死信队列的消息总数',
                 'value' => 0,
             ],
             // 当前队列积压
             'edge_queue_backlog' => [
                 'type' => 'gauge',
-                'help' => 'Current message backlog in channels',
+                'help' => '当前 Channel 中的积压消息数',
                 'value' => 0,
             ],
             // 普通 Channel 等待时间
             'edge_message_wait_ms_normal' => [
                 'type' => 'gauge',
-                'help' => 'Average wait time in normal channel (ms)',
+                'help' => '普通通道消息平均等待时间（毫秒）',
                 'value' => 0,
             ],
             // 高优 Channel 等待时间
             'edge_message_wait_ms_high' => [
                 'type' => 'gauge',
-                'help' => 'Average wait time in high priority channel (ms)',
+                'help' => '高优通道消息平均等待时间（毫秒）',
                 'value' => 0,
             ],
             // QPS
             'edge_qps' => [
                 'type' => 'gauge',
-                'help' => 'Current messages processed per second',
+                'help' => '当前每秒处理消息数',
                 'value' => 0,
             ],
             // Redis 写入失败
             'edge_redis_write_failed_total' => [
                 'type' => 'counter',
-                'help' => 'Total number of Redis write failures',
+                'help' => 'Redis 写入失败总数',
                 'value' => 0,
             ],
             // MQTT 连接状态
             'edge_mqtt_connected' => [
                 'type' => 'gauge',
-                'help' => 'MQTT connection status (1=connected, 0=disconnected)',
+                'help' => 'MQTT 连接状态（1=已连接，0=已断开）',
                 'value' => 0,
             ],
         ];
@@ -144,99 +149,173 @@ class PrometheusExporter
     }
 
     /**
-     * 启动 Prometheus HTTP 指标服务（协程方式）
-     * 返回 Server Socket 供调用方管理生命周期
+     * 将指标转换为结构化数组（用于 JSON 接口）
+     */
+    public static function metricsToArray(array $metrics): array
+    {
+        $result = [];
+        foreach ($metrics as $name => $info) {
+            $result[] = [
+                'name' => $name,
+                'type' => $info['type'],
+                'help' => $info['help'] ?? '',
+                'value' => $info['value'],
+            ];
+        }
+        return $result;
+    }
+
+    /**
+     * 从 HTTP 请求头中解析请求路径
+     */
+    private static function parsePath(string $request): string
+    {
+        $line = strtok($request, "\r\n");
+        if ($line === false) {
+            return '/';
+        }
+        // 匹配：GET /path HTTP/1.1
+        if (preg_match('#^\w+\s+(/[^?\s]*)#', $line, $matches)) {
+            return $matches[1];
+        }
+        return '/';
+    }
+
+    /**
+     * 启动 Prometheus HTTP 指标服务
+     *
+     * 路由：
+     * - /metrics      返回 Prometheus 文本格式
+     * - /api/metrics  返回 JSON 格式（供业务接口 / 前端 / 接口文档使用）
      */
     public function startMetricsServer(
         int $port = 9090,
         string $host = '0.0.0.0',
         ?callable $metricsProvider = null
-    ): Socket {
+    ): mixed {
         $this->running = true;
+        $provider = $metricsProvider ?? fn (): array => $this->getMetrics();
 
-        $server = new Socket(Socket::TYPE_TCP);
-        $server->bind($host, $port)->listen();
-        $this->server = $server;
+        $addr = "tcp://{$host}:{$port}";
+        $socket = @stream_socket_server(
+            $addr,
+            $errno,
+            $errstr,
+            STREAM_SERVER_BIND | STREAM_SERVER_LISTEN
+        );
 
-        $provider = $metricsProvider ?? fn(): array => $this->getMetrics();
+        if ($socket === false) {
+            throw new \RuntimeException(
+                "无法启动 Prometheus metrics server on {$addr}: {$errstr} ({$errno})"
+            );
+        }
 
-        Coroutine::run(function () use ($server, $provider): void {
+        stream_set_blocking($socket, false);
+        $this->server = $socket;
+
+        Coroutine::run(function () use ($socket, $provider): void {
+            /** @var array<int, resource> $conns */
+            $conns = [];
+            /** @var array<int, string> $buffers */
+            $buffers = [];
+
             while ($this->running) {
-                try {
-                    $conn = $server->accept();
+                $read = [$socket];
+                foreach ($conns as $c) {
+                    $read[] = $c;
+                }
+                $write = null;
+                $except = null;
 
-                    if ($conn === false) {
-                        // 非阻塞模式下无连接，让出 CPU
-                        Coroutine::yield();
-                        continue;
-                    }
+                // 非阻塞 select，超时 1 秒
+                $ready = @stream_select($read, $write, $except, 1);
+                if ($ready === false || $ready <= 0) {
+                    continue;
+                }
 
-                    // 每个连接独立协程处理
-                    Coroutine::run(function () use ($conn, $provider): void {
-                        $readBuffer = null;
-
-                        try {
-                            // Swow Socket::read(Buffer) —— 你的版本无 SocketTimeoutException
-                            $readBuffer = new Buffer(Buffer::COMMON_SIZE);
-                            $conn->read($readBuffer);
-
-                            // 忽略请求内容，只回指标
-                            $metrics = $provider();
-                            $body = self::buildMetrics($metrics);
-
-                            $header = "HTTP/1.1 200 OK\r\n"
-                                . "Content-Type: text/plain; version=0.0.4\r\n"
-                                . "Content-Length: " . strlen($body) . "\r\n"
-                                . "Connection: close\r\n"
-                                . "\r\n";
-
-                            // Swow Socket::write(array) —— I/O 向量写
-                            $conn->write([
-                                new Buffer($header),
-                                new Buffer($body),
-                            ]);
-
-                        } catch (SocketException) {
-                            // socket 读/写错误（客户端断开等），静默关闭
-                        } catch (Throwable) {
-                            // 业务逻辑异常，尝试回 500
-                            try {
-                                $conn->write([
-                                    new Buffer(
-                                        "HTTP/1.1 500 Internal Server Error\r\n"
-                                        . "Content-Length: 0\r\n"
-                                        . "Connection: close\r\n"
-                                        . "\r\n"
-                                    ),
-                                ]);
-                            } catch (Throwable) {
-                                // ignore
-                            }
-                        } finally {
-                            // 确保连接一定关闭，防止泄漏
-                            try {
-                                $conn->close();
-                            } catch (Throwable) {
-                                // ignore
-                            }
-                            unset($readBuffer);
+                foreach ($read as $sock) {
+                    if ($sock === $socket) {
+                        // 有新连接
+                        $conn = @stream_socket_accept($socket, 0);
+                        if ($conn) {
+                            stream_set_blocking($conn, false);
+                            $conns[] = $conn;
+                            $buffers[(int) $conn] = '';
                         }
-                    });
+                    } else {
+                        // 有数据可读
+                        $data = @fread($sock, 8192);
+                        $key = (int) $sock;
 
-                } catch (SocketException) {
-                    // accept 失败，短暂让出 CPU，避免忙等
-                    if ($this->running) {
-                        Coroutine::yield();
-                    }
-                } catch (Throwable) {
-                    if ($this->running) {
-                        Coroutine::yield();
+                        if ($data === '' || $data === false) {
+                            // 客户端关闭连接
+                            fclose($sock);
+                            $conns = array_filter($conns, fn ($c) => $c !== $sock);
+                            unset($buffers[$key]);
+
+                            continue;
+                        }
+
+                        $buffers[$key] .= $data;
+
+                        // 收到完整请求头就响应
+                        if (str_contains($buffers[$key], "\r\n\r\n")) {
+                            try {
+                                $request = $buffers[$key];
+                                $metrics = $provider();
+                                $path = self::parsePath($request);
+
+                                if ($path === '/api/metrics') {
+                                    // JSON 接口
+                                    $body = json_encode([
+                                        'code' => 0,
+                                        'msg' => 'success',
+                                        'data' => self::metricsToArray($metrics),
+                                    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+                                    if ($body === false) {
+                                        throw new \RuntimeException('Failed to encode metrics to JSON');
+                                    }
+
+                                    $resp = "HTTP/1.1 200 OK\r\n"
+                                        ."Content-Type: application/json; charset=utf-8\r\n"
+                                        .'Content-Length: '.strlen($body)."\r\n"
+                                        ."Connection: close\r\n"
+                                        ."\r\n"
+                                        .$body;
+                                } else {
+                                    // Prometheus 默认文本格式（/metrics 或其他路径）
+                                    $body = self::buildMetrics($metrics);
+
+                                    $resp = "HTTP/1.1 200 OK\r\n"
+                                        ."Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                                        .'Content-Length: '.strlen($body)."\r\n"
+                                        ."Connection: close\r\n"
+                                        ."\r\n"
+                                        .$body;
+                                }
+
+                                @fwrite($sock, $resp);
+                            } catch (Throwable $e) {
+                                @fwrite(
+                                    $sock,
+                                    "HTTP/1.1 500 服务未启动\r\n"
+                                    ."Content-Length: 0\r\n"
+                                    ."Connection: close\r\n"
+                                    ."\r\n"
+                                );
+                            } finally {
+                                fclose($sock);
+                                $conns = array_filter($conns, fn ($c) => $c !== $sock);
+                                unset($buffers[$key]);
+                            }
+                        }
                     }
                 }
             }
         });
 
-        return $server;
+        return $socket;
     }
 
     /**
@@ -246,12 +325,13 @@ class PrometheusExporter
     {
         $this->running = false;
 
-        if (isset($this->server)) {
+        if ($this->server !== null) {
             try {
-                $this->server->close();
+                fclose($this->server);
             } catch (Throwable) {
                 // ignore
             }
+            $this->server = null;
         }
     }
 

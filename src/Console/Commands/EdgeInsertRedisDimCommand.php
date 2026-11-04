@@ -92,10 +92,19 @@ class EdgeInsertRedisDimCommand extends Command
 
     private float $startTime;
 
-    /** 等待时间采样（毫秒） */
+    /** 等待时间采样（毫秒）—— 消息入队到写出的真实队列等待时间 */
     private float $lastNormalWaitMs = 0.0;
 
     private float $lastHighWaitMs = 0.0;
+
+    /** 自维护积压（Swow Channel 无 getLength） */
+    private int $normalBacklog = 0;
+
+    private int $highBacklog = 0;
+
+    /** QPS 滑动窗口（最近 5 秒） */
+    /** @var array<float, int> */
+    private array $qpsWindow = [];
 
     public function handle(): int
     {
@@ -117,7 +126,7 @@ class EdgeInsertRedisDimCommand extends Command
             $this->exporter->set('edge_message_wait_ms_normal', $this->lastNormalWaitMs);
             $this->exporter->set('edge_message_wait_ms_high', $this->lastHighWaitMs);
             $this->exporter->set('edge_qps', $this->calculateQps());
-            $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && !$this->stopping ? 1 : 0);
+            $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && ! $this->stopping ? 1 : 0);
 
             return $this->exporter->getMetrics();
         });
@@ -198,6 +207,7 @@ class EdgeInsertRedisDimCommand extends Command
                     'payload' => $message,
                     'device' => $device,
                     'ts' => sprintf('%.3f', microtime(true)),
+                    '_enqueued_at' => microtime(true),
                 ];
 
                 $this->exporter->inc('edge_received_total');
@@ -236,7 +246,7 @@ class EdgeInsertRedisDimCommand extends Command
     {
         $this->normalBatchSize = $this->configInt(
             'edge.mqtt.batch_size',
-            1,
+            200,
         );
         $this->normalFlushIntervalMs = $this->configInt(
             'edge.mqtt.flush_interval_ms',
@@ -271,7 +281,7 @@ class EdgeInsertRedisDimCommand extends Command
 
     private function initComponents(): void
     {
-        $this->exporter = new PrometheusExporter();
+        $this->exporter = new PrometheusExporter;
 
         $adaptMin = $this->configInt('edge.mqtt.adapt_min_batch', 10);
         $adaptMax = $this->configInt('edge.mqtt.adapt_max_batch', 2000);
@@ -337,6 +347,7 @@ class EdgeInsertRedisDimCommand extends Command
         try {
             $this->normalChannel->push($item);
             $this->receivedCount++;
+            $this->normalBacklog++;
         } catch (Throwable $e) {
             $this->error('[CHANNEL] 普通队列 push 失败：'.$e->getMessage());
             $this->droppedCount++;
@@ -356,6 +367,7 @@ class EdgeInsertRedisDimCommand extends Command
         try {
             $this->highChannel->push($item);
             $this->receivedCount++;
+            $this->highBacklog++;
         } catch (Throwable $e) {
             $this->error('[CHANNEL] 高优队列 push 失败：'.$e->getMessage());
             $this->exporter->inc('edge_dead_letter_total');
@@ -550,6 +562,13 @@ class EdgeInsertRedisDimCommand extends Command
         }
 
         $flushStart = microtime(true);
+        $now = microtime(true);
+        $waitSum = 0.0;
+        foreach ($batch as $item) {
+            $enqueuedAt = $item['_enqueued_at'] ?? $now;
+            $waitSum += ($now - $enqueuedAt) * 1000;
+        }
+
         $success = false;
 
         try {
@@ -584,6 +603,7 @@ class EdgeInsertRedisDimCommand extends Command
 
             $this->normalFlushedCount += count($batch);
             $this->exporter->inc('edge_data_write_success_total', count($batch));
+            $this->normalBacklog -= count($batch);
             $success = true;
 
             $this->line(sprintf(
@@ -604,7 +624,7 @@ class EdgeInsertRedisDimCommand extends Command
 
         if ($success) {
             $elapsedMs = (microtime(true) - $flushStart) * 1000;
-            $this->lastNormalWaitMs = $elapsedMs / count($batch);
+            $this->lastNormalWaitMs = $waitSum > 0 ? $waitSum / count($batch) : $elapsedMs / count($batch);
             $this->normalFlushLatencySum += $elapsedMs;
             $this->normalFlushTimes++;
         }
@@ -617,6 +637,12 @@ class EdgeInsertRedisDimCommand extends Command
         }
 
         $flushStart = microtime(true);
+        $now = microtime(true);
+        $waitSum = 0.0;
+        foreach ($batch as $item) {
+            $enqueuedAt = $item['_enqueued_at'] ?? $now;
+            $waitSum += ($now - $enqueuedAt) * 1000;
+        }
 
         try {
             withRedis(function (\Redis $conn) use ($batch): void {
@@ -650,6 +676,7 @@ class EdgeInsertRedisDimCommand extends Command
 
             $this->highFlushedCount += count($batch);
             $this->exporter->inc('edge_high_write_success_total', count($batch));
+            $this->highBacklog -= count($batch);
 
             $this->line(sprintf(
                 '[FLUSH:HIGH] batch=%d → %s',
@@ -668,7 +695,7 @@ class EdgeInsertRedisDimCommand extends Command
         }
 
         $elapsedMs = (microtime(true) - $flushStart) * 1000;
-        $this->lastHighWaitMs = $elapsedMs / max(1, count($batch));
+        $this->lastHighWaitMs = $waitSum > 0 ? $waitSum / max(1, count($batch)) : $elapsedMs / max(1, count($batch));
         $this->highFlushLatencySum += $elapsedMs;
         $this->highFlushTimes++;
     }
@@ -694,6 +721,8 @@ class EdgeInsertRedisDimCommand extends Command
 
             $this->deadCount += count($batch);
             $this->exporter->inc('edge_dead_letter_total', count($batch));
+            // 写入死信也算"消费掉"，从积压中扣除（保守处理，统一从 normalBacklog 扣）
+            $this->normalBacklog = max(0, $this->normalBacklog - count($batch));
             $this->warn('[DEAD] 已写入死信 '.self::STREAM_DEAD);
         } catch (Throwable $e) {
             fwrite(STDERR, '[FATAL] 死信写入也失败：'.$e->getMessage().PHP_EOL);
@@ -729,34 +758,35 @@ class EdgeInsertRedisDimCommand extends Command
 
     private function getBacklog(): int
     {
-        // Swow Channel 没有 getLength()，用容量减剩余估算或直接返回 0
-        // 如需精确值，可在 push/pop 时自维护计数器
-        return 0;
+        return $this->normalBacklog + $this->highBacklog;
     }
 
     private function calculateQps(): float
     {
-        static $lastTime = 0.0, $lastCount = 0;
         $now = microtime(true);
         $current = $this->normalFlushedCount + $this->highFlushedCount;
 
-        if ($lastTime === 0.0) {
-            $lastTime = $now;
-            $lastCount = $current;
+        $this->qpsWindow[$now] = $current;
 
+        // 只保留最近 5 秒
+        $cutoff = $now - 5.0;
+        foreach ($this->qpsWindow as $ts => $_) {
+            if ($ts < $cutoff) {
+                unset($this->qpsWindow[$ts]);
+            }
+        }
+
+        $values = array_values($this->qpsWindow);
+        if (count($values) < 2) {
             return 0.0;
         }
 
-        $elapsed = $now - $lastTime;
-        if ($elapsed < 0.1) {
+        $elapsed = array_key_last($this->qpsWindow) - array_key_first($this->qpsWindow);
+        if ($elapsed <= 0) {
             return 0.0;
         }
 
-        $qps = ($current - $lastCount) / $elapsed;
-        $lastTime = $now;
-        $lastCount = $current;
-
-        return max(0.0, $qps);
+        return max(0.0, ($values[count($values) - 1] - $values[0]) / $elapsed);
     }
 
     private function printStats(): void
