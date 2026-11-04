@@ -267,7 +267,10 @@ class EdgeStreamStorageCommand extends Command
     private function backfillLoop(string $stream, int $batchSize, int $maxPayload): void
     {
         $this->line('[BACKFILL][READER] 启动');
+
         $lastId = '0';
+        $emptyCount = 0;           // 连续空返回计数
+        $maxEmpty = 3;             // 连续 3 次空返回才认为无数据
 
         while (! $this->stopping) {
             try {
@@ -277,17 +280,35 @@ class EdgeStreamStorageCommand extends Command
                     self::BACKFILL_BLOCK_MS,
                 ));
             } catch (Throwable $e) {
-                $this->error('[BACKFILL][READER] '.$e->getMessage());
+                $this->error('[BACKFILL][READER] xRead 失败：' . $e->getMessage());
                 break;
             }
 
+            // 阻塞模式下空返回 = 当前无数据，不是结束信号
             if (empty($entries)) {
-                break;
+                $emptyCount++;
+
+                $this->line(sprintf(
+                    '[BACKFILL][READER] xRead 空返回（%d/%d），lastId=%s，继续等待',
+                    $emptyCount,
+                    $maxEmpty,
+                    $lastId,
+                ));
+
+                if ($emptyCount >= $maxEmpty) {
+                    $this->line('[BACKFILL][READER] 连续空返回，确认无数据，退出循环');
+                    break;
+                }
+
+                continue;
             }
+
+            // 有数据，重置空计数
+            $emptyCount = 0;
 
             $items = $entries[$stream] ?? [];
             if (empty($items)) {
-                break;
+                continue;
             }
 
             foreach ($items as $id => $data) {
@@ -298,9 +319,15 @@ class EdgeStreamStorageCommand extends Command
 
                 if (strlen($payload) > $maxPayload) {
                     EdgeStream::writeDead(
-                        (string) $id, $stream, '', '', 1,
-                        $payload, 'payload too large (backfill)',
-                        $device, $topic,
+                        (string) $id,
+                        $stream,
+                        '',
+                        '',
+                        1,
+                        $payload,
+                        'payload too large (backfill)',
+                        $device,
+                        $topic,
                         (int) ($ts * 1000),
                         date('Y-m-d H:i:s', (int) $ts),
                     );
@@ -320,19 +347,27 @@ class EdgeStreamStorageCommand extends Command
                 ]);
             }
 
-            // 推进游标
+            // 推进游标：取最后一条 id
             $lastEntry = null;
             foreach ($items as $id => $data) {
                 $lastEntry = $id;
             }
             $lastId = (string) $lastEntry;
 
-            if (count($items) < $batchSize) {
+            // 非阻塞模式下，返回数量小于 batch 才认为已读完
+            if (self::BACKFILL_BLOCK_MS <= 0 && count($items) < $batchSize) {
+                $this->line('[BACKFILL][READER] 非阻塞模式且数据不足一批，认为已读完');
                 break;
             }
         }
 
-        $this->writeChannel->push(null);
+        // ✅ 确保 Writer 一定能收到结束信号
+        try {
+            $this->writeChannel->push(null);
+        } catch (Throwable $e) {
+            $this->error('[BACKFILL][READER] push 结束信号失败：' . $e->getMessage());
+        }
+
         $this->line('[BACKFILL][READER] 退出');
     }
 
