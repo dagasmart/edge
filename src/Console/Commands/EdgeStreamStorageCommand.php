@@ -381,12 +381,61 @@ class EdgeStreamStorageCommand extends Command
         $batchSize = max(1, (int) $this->option('batch'));
         $batch = [];
 
+        // ---- 启动期：等 Reader 和 Redis 连接池就绪 ----
+        $startupWaitMs = 10_000;   // 最多等 10s
+        $pollIntervalMs = 100;     // 每 100ms 检查一次
+        $waited = 0;
+        $ready = false;
+
+        $this->line('[BACKFILL][WRITER] 等待 Reader 就绪...');
+
+        while ($waited < $startupWaitMs) {
+            $len = 0;
+            try {
+                $len = $this->writeChannel->getLength();
+            } catch (Throwable) {
+                // channel 未就绪，继续等
+            }
+
+            if ($len > 0) {
+                $ready = true;
+                break;
+            }
+
+            // 非阻塞尝试 pop，避免死等
+            try {
+                $probe = $this->writeChannel->pop(0);
+                if ($probe !== null) {
+                    $batch[] = $probe;
+                    $ready = true;
+                    break;
+                }
+            } catch (Throwable) {
+                // 无数据，继续等
+            }
+
+            $this->sleep($pollIntervalMs / 1000);
+            $waited += $pollIntervalMs;
+        }
+
+        if (! $ready && empty($batch)) {
+            $this->warn(sprintf(
+                '[BACKFILL][WRITER] 启动期 %dms 内未收到数据，进入正常运行',
+                $startupWaitMs,
+            ));
+        } else {
+            $this->line('[BACKFILL][WRITER] Reader 已就绪，开始消费');
+        }
+
+        // ---- 正常运行：从 Channel 消费 ----
         while (true) {
             $item = null;
+
             try {
                 $item = $this->writeChannel->pop(self::BACKFILL_BLOCK_MS);
             } catch (Throwable $e) {
-                $this->error('[BACKFILL][WRITER] pop 失败：'.$e->getMessage());
+                // 降级为 warn：启动期超时属正常抖动，不是错误
+                $this->warn('[BACKFILL][WRITER] pop 超时（等待 Reader 数据）：' . $e->getMessage());
                 $this->sleep(0.1);
                 continue;
             }
@@ -400,13 +449,14 @@ class EdgeStreamStorageCommand extends Command
             }
 
             $batch[] = $item;
+
             if (count($batch) >= $batchSize) {
                 $this->flushBackfillBatch($batch, $stream);
                 $batch = [];
             }
         }
 
-        // ✅ 关键：通知 runBackfill 回刷结束
+        // ✅ 通知 runBackfill 回刷结束
         $this->writeChannel = null;
 
         $this->line('[BACKFILL][WRITER] 退出');
