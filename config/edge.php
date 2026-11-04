@@ -8,7 +8,9 @@ return [
         'max_payload_len' => 65536,   // 单条 payload 上限（64KB）
 
         // 多主题订阅：数组 / 逗号分隔字符串 / 单字符串，支持 +/# 通配符
-        'topics' => ['heartbeat/response'],
+        'topics' => [
+            'heartbeat/response',
+        ],
 
         // 高优先级主题（前缀匹配，命中则走高优 Channel）
         'high_priority_topics' => [
@@ -29,16 +31,17 @@ return [
         'adapt_alpha' => 0.3,         // EMA 平滑系数，越大对瞬时流量越敏感
     ],
 
+    // redis落盘
     'redis' => [
         'pool_size' => 64,
         'db' => 2,
-
         // Stream key 前缀（按需调整）
         'stream_high' => 'stream:device:high',
         'stream_data' => 'stream:device:data',
         'stream_dead' => 'stream:device:dead',
     ],
 
+    // 指标追踪
     'metrics' => [
         'enabled' => true,
         'host' => '0.0.0.0',
