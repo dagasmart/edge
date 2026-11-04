@@ -8,7 +8,6 @@ use DagaSmart\Edge\Models\EdgeStream;
 use DagaSmart\Edge\Models\EdgeStreamFail;
 use DagaSmart\Edge\Models\EdgeStreamOffset;
 use Illuminate\Console\Command;
-use Swow\Channel;
 use Swow\Coroutine;
 use Throwable;
 
@@ -21,6 +20,9 @@ use Throwable;
  *   - 停机 handlePending()：PEL 超限 → 死信表 → XDEL 删除
  *   - 写 PG 失败 → 进死信 → XDEL 删除（避免反复阻塞）
  *   - --backfill：XREAD 从 0 独立消费历史存量，不碰消费组
+ *
+ * 传输通道：Swow 模式下使用 Redis List（edge:buffer:insert_redis）
+ * 替代 Swow Channel，避免连接池协程上下文导致的数据丢失。
  */
 $edgeRoot = dirname(__DIR__, 3);
 require_once $edgeRoot.'/bin/bootstrap.php';
@@ -46,10 +48,12 @@ class EdgeStreamStorageCommand extends Command
 
     protected $description = 'Redis Stream -> PG，消费成功即 XDEL 清理 Redis 数据';
 
+    /** Redis List 作为 Reader/Writer 之间的缓冲，避免 Swow Channel 跨协程上下文丢失 */
+    private const string BUFFER_KEY = 'edge:buffer:insert_redis';
+
     private const int PEL_BATCH = 20;
     private const int PEL_MAX_DELIVERED = 3;
-    private const int DRAIN_TIMEOUT_MS = 3000;
-    private const int DRAIN_POP_TIMEOUT_MS = 50;
+    private const int DRAIN_TIMEOUT_SEC = 3;
     private const int BACKFILL_BLOCK_MS = 2000;
 
     private bool $stopping = false;
@@ -58,9 +62,6 @@ class EdgeStreamStorageCommand extends Command
     private int $duplicated = 0;
     private int $dead = 0;
     private int $deleted = 0;
-
-    private ?Channel $sleepChannel = null;
-    private ?Channel $writeChannel = null;
 
     protected function getDriver(): string
     {
@@ -79,19 +80,6 @@ class EdgeStreamStorageCommand extends Command
 
     private function sleep(float $seconds): void
     {
-        if ($this->getDriver() === 'swow') {
-            try {
-                if ($this->sleepChannel === null) {
-                    $this->sleepChannel = new Channel(1);
-                }
-                $this->sleepChannel->pop((int) ($seconds * 1000));
-
-                return;
-            } catch (Throwable) {
-                // 降级
-            }
-        }
-
         usleep((int) ($seconds * 1_000_000));
     }
 
@@ -119,468 +107,6 @@ class EdgeStreamStorageCommand extends Command
             : $this->runSyncMode();
     }
 
-    /* ==================== 回刷存量 ==================== */
-
-    private function runBackfill(): int
-    {
-        $driver = $this->getDriver();
-        $stream = (string) $this->option('stream');
-        $batchSize = max(1, (int) $this->option('batch'));
-        $maxPayload = max(1, (int) $this->option('max-payload'));
-
-        $this->info(sprintf(
-            '[BACKFILL] stream=%s batch=%d driver=%s',
-            $stream,
-            $batchSize,
-            $driver,
-        ));
-
-        if ($driver === 'swow') {
-            $this->initRedisPool();
-            $this->writeChannel = new Channel(
-                max(1, (int) $this->option('channel-size')),
-            );
-
-            Coroutine::run(fn () => $this->backfillWriterLoop($stream));
-            Coroutine::run(fn () => $this->backfillLoop($stream, $batchSize, $maxPayload));
-
-            // writer 会把 $this->writeChannel 置 null，这里作为退出信号
-            while ($this->writeChannel !== null) {
-                $this->sleep(0.2);
-            }
-        } else {
-            $this->backfillSync($stream, $batchSize, $maxPayload);
-        }
-
-        $this->printStats();
-
-        return 0;
-    }
-
-    /**
-     * 同步回刷：XREAD 从 0 开始，读完即 XDEL
-     */
-    private function backfillSync(string $stream, int $batchSize, int $maxPayload): void
-    {
-        $lastId = '0';
-
-        while (! $this->stopping) {
-            try {
-                $entries = withRedis(fn (\Redis $conn) => $conn->xRead(
-                    [$stream => $lastId],
-                    $batchSize,
-                    self::BACKFILL_BLOCK_MS,
-                ));
-            } catch (Throwable $e) {
-                $this->error('[BACKFILL] xRead 失败：'.$e->getMessage());
-                break;
-            }
-
-            if (empty($entries)) {
-                break;
-            }
-
-            $items = $entries[$stream] ?? [];
-            if (empty($items)) {
-                break;
-            }
-
-            $buffer = [];
-            $invalidIds = [];
-
-            foreach ($items as $id => $data) {
-                $payload = (string) ($data['payload'] ?? '{}');
-                $device = (string) ($data['device'] ?? 'unknown');
-                $topic = (string) ($data['topic'] ?? '');
-                $ts = (float) ($data['ts'] ?? microtime(true));
-
-                if (strlen($payload) > $maxPayload) {
-                    EdgeStream::writeDead(
-                        (string) $id, $stream, '', '', 1,
-                        $payload, 'payload too large (backfill)',
-                        $device, $topic,
-                        (int) ($ts * 1000),
-                        date('Y-m-d H:i:s', (int) $ts),
-                    );
-                    $invalidIds[] = (string) $id;
-                    $this->dead++;
-                    continue;
-                }
-
-                $this->received++;
-                $buffer[] = [
-                    'stream_id'   => (string) $id,
-                    'client_id'   => $device,
-                    'topic'       => $topic,
-                    'payload'     => $payload,
-                    'received_ms' => (int) ($ts * 1000),
-                    'received_at' => date('Y-m-d H:i:s', (int) $ts),
-                ];
-            }
-
-            if ($invalidIds !== []) {
-                $this->xDel($stream, $invalidIds);
-            }
-
-            if (! empty($buffer)) {
-                $ids = array_map(fn ($r) => (string) $r['stream_id'], $buffer);
-
-                try {
-                    [$written] = EdgeStream::upsertBatch($buffer);
-                    $this->written += $written;
-                    $this->xDel($stream, $ids);
-                } catch (Throwable $e) {
-                    $this->error('[BACKFILL] 写入失败：'.$e->getMessage());
-                    foreach ($buffer as $row) {
-                        EdgeStream::writeDead(
-                            (string) ($row['stream_id'] ?? ''), $stream, '', '', 1,
-                            (string) ($row['payload'] ?? '{}'), $e->getMessage(),
-                            (string) ($row['client_id'] ?? 'unknown'),
-                            (string) ($row['topic'] ?? ''),
-                            (int) ($row['received_ms'] ?? 0),
-                            (string) ($row['received_at'] ?? ''),
-                        );
-                        $this->dead++;
-                    }
-                    $this->xDel($stream, $ids);
-                }
-            }
-
-            // 推进游标：取最后一条 id
-            $lastEntry = null;
-            foreach ($items as $id => $data) {
-                $lastEntry = $id;
-            }
-            $lastId = (string) $lastEntry;
-
-            if (count($items) < $batchSize) {
-                break; // 已经读完
-            }
-        }
-
-        $this->line('[BACKFILL] 同步回刷结束');
-    }
-
-    /**
-     * Swow 回刷 reader：XREAD 从 0 推送到 writeChannel
-     */
-    private function backfillLoop(string $stream, int $batchSize, int $maxPayload): void
-    {
-        $this->line('[BACKFILL][READER] 启动');
-
-        $lastId = '0';
-        $emptyCount = 0;           // 连续空返回计数
-        $maxEmpty = 3;             // 连续 3 次空返回才认为无数据
-
-        while (! $this->stopping) {
-            try {
-                $entries = withRedis(fn (\Redis $conn) => $conn->xRead(
-                    [$stream => $lastId],
-                    $batchSize,
-                    self::BACKFILL_BLOCK_MS,
-                ));
-            } catch (Throwable $e) {
-                $this->error('[BACKFILL][READER] xRead 失败：' . $e->getMessage());
-                break;
-            }
-
-            // 阻塞模式下空返回 = 当前无数据，不是结束信号
-            if (empty($entries)) {
-                $emptyCount++;
-
-                $this->line(sprintf(
-                    '[BACKFILL][READER] xRead 空返回（%d/%d），lastId=%s，继续等待',
-                    $emptyCount,
-                    $maxEmpty,
-                    $lastId,
-                ));
-
-                if ($emptyCount >= $maxEmpty) {
-                    $this->line('[BACKFILL][READER] 连续空返回，确认无数据，退出循环');
-                    break;
-                }
-
-                continue;
-            }
-
-            // 有数据，重置空计数
-            $emptyCount = 0;
-
-            $items = $entries[$stream] ?? [];
-            if (empty($items)) {
-                continue;
-            }
-
-            foreach ($items as $id => $data) {
-                $payload = (string) ($data['payload'] ?? '{}');
-                $device = (string) ($data['device'] ?? 'unknown');
-                $topic = (string) ($data['topic'] ?? '');
-                $ts = (float) ($data['ts'] ?? microtime(true));
-
-                if (strlen($payload) > $maxPayload) {
-                    EdgeStream::writeDead(
-                        (string) $id,
-                        $stream,
-                        '',
-                        '',
-                        1,
-                        $payload,
-                        'payload too large (backfill)',
-                        $device,
-                        $topic,
-                        (int) ($ts * 1000),
-                        date('Y-m-d H:i:s', (int) $ts),
-                    );
-                    $this->dead++;
-                    $this->xDel($stream, [(string) $id]);
-                    continue;
-                }
-
-                $this->received++;
-                $this->writeChannel->push([
-                    'stream_id'   => (string) $id,
-                    'client_id'   => $device,
-                    'topic'       => $topic,
-                    'payload'     => $payload,
-                    'received_ms' => (int) ($ts * 1000),
-                    'received_at' => date('Y-m-d H:i:s', (int) $ts),
-                ]);
-            }
-
-            // 推进游标：取最后一条 id
-            $lastEntry = null;
-            foreach ($items as $id => $data) {
-                $lastEntry = $id;
-            }
-            $lastId = (string) $lastEntry;
-
-            // 非阻塞模式下，返回数量小于 batch 才认为已读完
-            if (self::BACKFILL_BLOCK_MS <= 0 && count($items) < $batchSize) {
-                $this->line('[BACKFILL][READER] 非阻塞模式且数据不足一批，认为已读完');
-                break;
-            }
-        }
-
-        // ✅ 确保 Writer 一定能收到结束信号
-        try {
-            $this->writeChannel->push(null);
-        } catch (Throwable $e) {
-            $this->error('[BACKFILL][READER] push 结束信号失败：' . $e->getMessage());
-        }
-
-        $this->line('[BACKFILL][READER] 退出');
-    }
-
-    /**
-     * Swow 回刷 writer：批量写 PG + XDEL
-     */
-    private function backfillWriterLoop(string $stream): void
-    {
-        $this->line('[BACKFILL][WRITER] 启动');
-
-        $batchSize = max(1, (int) $this->option('batch'));
-        $batch = [];
-
-        // ---- 启动期：等 Reader 和 Redis 连接池就绪 ----
-        $startupWaitMs = 10_000;   // 最多等 10s
-        $pollIntervalMs = 100;     // 每 100ms 检查一次
-        $waited = 0;
-        $ready = false;
-
-        $this->line('[BACKFILL][WRITER] 等待 Reader 就绪...');
-
-        while ($waited < $startupWaitMs) {
-            $len = 0;
-            try {
-                $len = $this->writeChannel->getLength();
-            } catch (Throwable) {
-                // channel 未就绪，继续等
-            }
-
-            if ($len > 0) {
-                $ready = true;
-                break;
-            }
-
-            // 非阻塞尝试 pop，避免死等
-            try {
-                $probe = $this->writeChannel->pop(0);
-                if ($probe !== null) {
-                    $batch[] = $probe;
-                    $ready = true;
-                    break;
-                }
-            } catch (Throwable) {
-                // 无数据，继续等
-            }
-
-            $this->sleep($pollIntervalMs / 1000);
-            $waited += $pollIntervalMs;
-        }
-
-        if (! $ready && empty($batch)) {
-            $this->warn(sprintf(
-                '[BACKFILL][WRITER] 启动期 %dms 内未收到数据，进入正常运行',
-                $startupWaitMs,
-            ));
-        } else {
-            $this->line('[BACKFILL][WRITER] Reader 已就绪，开始消费');
-        }
-
-        // ---- 正常运行：从 Channel 消费 ----
-        while (true) {
-            $item = null;
-
-            try {
-                $item = $this->writeChannel->pop(self::BACKFILL_BLOCK_MS);
-            } catch (Throwable $e) {
-                // 降级为 warn：启动期超时属正常抖动，不是错误
-                $this->warn('[BACKFILL][WRITER] pop 超时（等待 Reader 数据）：' . $e->getMessage());
-                $this->sleep(0.1);
-                continue;
-            }
-
-            if ($item === null) {
-                if ($batch !== []) {
-                    $this->flushBackfillBatch($batch, $stream);
-                    $batch = [];
-                }
-                break;
-            }
-
-            $batch[] = $item;
-
-            if (count($batch) >= $batchSize) {
-                $this->flushBackfillBatch($batch, $stream);
-                $batch = [];
-            }
-        }
-
-        // ✅ 通知 runBackfill 回刷结束
-        $this->writeChannel = null;
-
-        $this->line('[BACKFILL][WRITER] 退出');
-    }
-
-    private function flushBackfillBatch(array $batch, string $stream): void
-    {
-        if ($batch === []) {
-            return;
-        }
-
-        $ids = array_map(fn ($r) => (string) $r['stream_id'], $batch);
-
-        try {
-            [$written] = EdgeStream::upsertBatch($batch);
-            $this->written += $written;
-            $this->xDel($stream, $ids);
-
-            $this->line(sprintf(
-                '[BACKFILL] batch=%d written=%d XDEL=%d',
-                count($batch),
-                $written,
-                count($ids),
-            ));
-        } catch (Throwable $e) {
-            $this->error('[BACKFILL] 写入失败：'.$e->getMessage());
-            foreach ($batch as $row) {
-                EdgeStream::writeDead(
-                    (string) ($row['stream_id'] ?? ''), $stream, '', '', 1,
-                    (string) ($row['payload'] ?? '{}'), $e->getMessage(),
-                    (string) ($row['client_id'] ?? 'unknown'),
-                    (string) ($row['topic'] ?? ''),
-                    (int) ($row['received_ms'] ?? 0),
-                    (string) ($row['received_at'] ?? ''),
-                );
-                $this->dead++;
-            }
-            $this->xDel($stream, $ids);
-        }
-    }
-
-    /* ==================== Redis 连接池 ==================== */
-
-    private function initRedisPool(): void
-    {
-        if (! function_exists('redisPoolInit')) {
-            throw new \RuntimeException('helper.php 未加载');
-        }
-
-        if (! defined('REDIS_HOST') || ! defined('REDIS_PORT') || ! defined('REDIS_DB')) {
-            throw new \RuntimeException('bootstrap.php 未加载或 Redis 常量未定义');
-        }
-
-        redisPoolInit(
-            $this->configInt('edge.redis.pool_size', defined('REDIS_POOL_SIZE') ? REDIS_POOL_SIZE : 64),
-            $this->configInt('edge.redis.db', defined('REDIS_DB') ? REDIS_DB : 2),
-        );
-
-        $this->info(sprintf(
-            '[redis] 连接池已初始化 %s:%s db=%s',
-            REDIS_HOST,
-            REDIS_PORT,
-            REDIS_DB,
-        ));
-    }
-
-    private function ensureGroup(string $stream, string $group): void
-    {
-        try {
-            withRedis(fn (\Redis $conn) => $conn->xGroup('CREATE', $stream, $group, '0', true));
-        } catch (Throwable) {
-            // BUSYGROUP 已存在，忽略
-        }
-    }
-
-    /* ==================== 死信重试 ==================== */
-
-    private function runRetryDead(): int
-    {
-        $stream = (string) $this->option('stream');
-        $group = (string) $this->option('group');
-        $consumer = (string) $this->option('consumer');
-        $batchSize = max(1, (int) $this->option('retry-batch'));
-        $maxRetries = max(1, (int) $this->option('max-retries'));
-        $timeout = max(1, (int) $this->option('timeout'));
-
-        $this->info(sprintf(
-            '[RETRY-DEAD] stream=%s group=%s consumer=%s batch=%d maxRetries=%d timeout=%dms',
-            $stream, $group, $consumer, $batchSize, $maxRetries, $timeout,
-        ));
-
-        $total = ['retried' => 0, 'succeeded' => 0, 'failed' => 0];
-
-        while (true) {
-            $claims = EdgeStreamFail::claimBatch($stream, $group, $batchSize, $maxRetries, $timeout);
-
-            if ($claims === []) {
-                break;
-            }
-
-            $stats = EdgeStream::retryBatch($claims, $maxRetries);
-
-            $total['retried'] += $stats['retried'];
-            $total['succeeded'] += $stats['succeeded'];
-            $total['failed'] += $stats['failed'];
-
-            $this->line(sprintf(
-                '[RETRY-DEAD] retried=%d succeeded=%d failed=%d',
-                $stats['retried'],
-                $stats['succeeded'],
-                $stats['failed'],
-            ));
-        }
-
-        $this->info(sprintf(
-            '[RETRY-DEAD] 完成 retried=%d succeeded=%d failed=%d',
-            $total['retried'],
-            $total['succeeded'],
-            $total['failed'],
-        ));
-
-        return 0;
-    }
-
     /* ==================== Swow 模式 ==================== */
 
     private function runSwowMode(): int
@@ -588,30 +114,29 @@ class EdgeStreamStorageCommand extends Command
         $stream = (string) $this->option('stream');
         $group = (string) $this->option('group');
         $consumer = (string) $this->option('consumer');
-        $channelSize = max(1, (int) $this->option('channel-size'));
 
-        $this->writeChannel = new Channel($channelSize);
-
+        $this->initRedisPool();
         $this->ensureGroup($stream, $group);
         $this->recoverPending($stream, $group, $consumer);
 
+        // 清空上次异常遗留的 buffer，避免脏数据
+        $this->clearBuffer();
+
         $this->line('[SWOW] 启动');
 
-        // 信号注册必须在主协程里，不能包在 Coroutine::run 里
         if (PHP_OS_FAMILY !== 'Windows' && class_exists(\Swow\Signal::class)) {
             $this->registerSignals($stream, $group, $consumer);
         }
 
-        // 启动子协程（fire-and-forget，但它们会保活事件循环）
         Coroutine::run(fn () => $this->readerLoop($stream, $group, $consumer));
         Coroutine::run(fn () => $this->writerLoop($stream, $group, $consumer));
 
-        // ✅ 主函数阻塞：等 stopping 被信号置 true，进程不提前退出
+        // 主协程阻塞，保活事件循环
         while (! $this->stopping) {
             $this->sleep(0.1);
         }
 
-        $this->drainChannel($this->writeChannel);
+        $this->drainBuffer($stream, $group, $consumer);
         $this->printStats();
 
         return 0;
@@ -620,7 +145,6 @@ class EdgeStreamStorageCommand extends Command
     private function registerSignals(string $stream, string $group, string $consumer): void
     {
         foreach ([\Swow\Signal::INT, \Swow\Signal::TERM] as $sig) {
-            // 每个信号一个协程等待，但 $this->stopping 是共享的
             Coroutine::run(function () use ($sig, $stream, $group, $consumer): void {
                 try {
                     \Swow\Signal::wait($sig);
@@ -636,17 +160,194 @@ class EdgeStreamStorageCommand extends Command
                 $this->warn(sprintf('[signal] 收到 %d，优雅停机', $sig));
                 $this->stopping = true;
 
-                // 通知 Writer 结束（Reader 会自己因 stopping=true 退出）
-                try {
-                    $this->writeChannel?->push(null);
-                } catch (Throwable) {
-                    // channel 已关闭，忽略
-                }
-
-                // PEL 清理放到这里，不再依赖已退出的 writerLoop
                 $this->handlePending($stream, $group, $consumer);
                 EdgeStreamFail::forceUnlock($stream, $group);
             });
+        }
+    }
+
+    /* ==================== Reader / Writer（Redis List 通道） ==================== */
+
+    private function readerLoop(string $stream, string $group, string $consumer): void
+    {
+        $batchSize = max(1, (int) $this->option('batch'));
+        $timeout = max(1, (int) $this->option('timeout'));
+        $maxPayload = max(1, (int) $this->option('max-payload'));
+        $once = (bool) $this->option('once');
+
+        $this->line('[READER] 启动，开始 xReadGroup 循环');
+        $this->recoverPending($stream, $group, $consumer);
+
+        $loopCount = 0;
+
+        while (! $this->stopping) {
+            $loopCount++;
+
+            try {
+                $entries = withRedis(fn (\Redis $conn) => $conn->xReadGroup(
+                    $group, $consumer, [$stream => '>'], $batchSize, $timeout,
+                ));
+            } catch (Throwable $e) {
+                $this->error('[READER] '.$e->getMessage());
+                if ($once) {
+                    break;
+                }
+                $this->sleep(1.0);
+                continue;
+            }
+
+            if (empty($entries)) {
+                if ($loopCount % 10 === 1) {
+                    $this->line(sprintf(
+                        '[READER] 等待数据中（第 %d 次 xReadGroup）',
+                        $loopCount,
+                    ));
+                }
+                if ($once) {
+                    break;
+                }
+                continue;
+            }
+
+            $items = $entries[$stream] ?? [];
+            if ($items !== []) {
+                $this->line(sprintf('[READER] 收到 %d 条数据', count($items)));
+            }
+
+            foreach ($items as $id => $data) {
+                $payload = (string) ($data['payload'] ?? '{}');
+                $device = (string) ($data['device'] ?? 'unknown');
+                $topic = (string) ($data['topic'] ?? '');
+                $ts = (float) ($data['ts'] ?? microtime(true));
+
+                if (strlen($payload) > $maxPayload) {
+                    EdgeStream::writeDead(
+                        (string) $id, $stream, $group, $consumer, 1,
+                        $payload, 'payload too large',
+                        $device, $topic,
+                        (int) ($ts * 1000),
+                        date('Y-m-d H:i:s', (int) $ts),
+                    );
+                    $this->dead++;
+                    $this->xDel($stream, [(string) $id]);
+                    continue;
+                }
+
+                $this->received++;
+
+                $item = [
+                    'stream_id'   => (string) $id,
+                    'client_id'   => $device,
+                    'topic'       => $topic,
+                    'payload'     => $payload,
+                    'received_ms' => (int) ($ts * 1000),
+                    'received_at' => date('Y-m-d H:i:s', (int) $ts),
+                ];
+
+                // ✅ 写入 Redis List，由 Writer 消费
+                try {
+                    withRedis(function (\Redis $conn) use ($item): void {
+                        $conn->lPush(self::BUFFER_KEY, json_encode(
+                            $item,
+                            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE,
+                        ));
+                    });
+                } catch (Throwable $e) {
+                    $this->error('[READER] lPush 失败：'.$e->getMessage());
+                }
+            }
+
+            if ($once) {
+                break;
+            }
+        }
+
+        $this->line('[READER] 退出');
+    }
+
+    private function writerLoop(string $stream, string $group, string $consumer): void
+    {
+        $batchSize = max(1, (int) $this->option('batch'));
+        $timeout = max(1, (int) $this->option('timeout'));
+        $batch = [];
+
+        $this->line('[WRITER] 启动');
+
+        while (! $this->stopping) {
+            try {
+                // bRPop 超时单位是秒
+                $raw = withRedis(fn (\Redis $conn) => $conn->bRPop(
+                    [self::BUFFER_KEY],
+                    max(1, (int) ($timeout / 1000)),
+                ));
+            } catch (Throwable $e) {
+                $this->warn('[WRITER] bRPop 异常：'.$e->getMessage());
+                $this->sleep(0.5);
+                continue;
+            }
+
+            if (empty($raw)) {
+                // 超时无数据，刷一次残留
+                if (! empty($batch)) {
+                    $this->flushBatchAndDelete($batch, $stream, $group, $consumer);
+                    $batch = [];
+                }
+                continue;
+            }
+
+            $item = json_decode($raw[1], true);
+            if ($item === null) {
+                continue;
+            }
+
+            $batch[] = $item;
+
+            if (count($batch) >= $batchSize) {
+                $this->flushBatchAndDelete($batch, $stream, $group, $consumer);
+                $batch = [];
+            }
+        }
+
+        if (! empty($batch)) {
+            $this->flushBatchAndDelete($batch, $stream, $group, $consumer);
+        }
+
+        $this->line('[WRITER] 退出');
+    }
+
+    /* ==================== Buffer 管理 ==================== */
+
+    private function clearBuffer(): void
+    {
+        try {
+            withRedis(fn (\Redis $conn) => $conn->del([self::BUFFER_KEY]));
+        } catch (Throwable) {
+            // 忽略
+        }
+    }
+
+    private function drainBuffer(string $stream, string $group, string $consumer): void
+    {
+        $this->line('[SWOW] 停机排空 Buffer...');
+
+        while (true) {
+            try {
+                $raw = withRedis(fn (\Redis $conn) => $conn->bRPop(
+                    [self::BUFFER_KEY],
+                    1,
+                ));
+            } catch (Throwable) {
+                break;
+            }
+
+            if (empty($raw)) {
+                break;
+            }
+
+            $item = json_decode($raw[1], true);
+            if ($item) {
+                $this->flushBatchAndDelete([$item], $stream, $group, $consumer);
+            }
         }
     }
 
@@ -664,7 +365,6 @@ class EdgeStreamStorageCommand extends Command
 
         $this->ensureGroup($stream, $group);
         $this->recoverPending($stream, $group, $consumer);
-
         $this->registerSyncSignalHandler($stream, $group);
 
         $this->info(sprintf(
@@ -678,11 +378,7 @@ class EdgeStreamStorageCommand extends Command
         while (! $this->stopping) {
             try {
                 $entries = withRedis(fn (\Redis $conn) => $conn->xReadGroup(
-                    $group,
-                    $consumer,
-                    [$stream => '>'],
-                    $batchSize,
-                    $timeout,
+                    $group, $consumer, [$stream => '>'], $batchSize, $timeout,
                 ));
             } catch (Throwable $e) {
                 $this->error('[READ] xReadGroup 失败：'.$e->getMessage());
@@ -776,56 +472,61 @@ class EdgeStreamStorageCommand extends Command
         pcntl_signal(SIGTERM, $cleanup);
     }
 
-    /* ==================== Reader / Writer ==================== */
+    /* ==================== 回刷存量 ==================== */
 
-    private function readerLoop(string $stream, string $group, string $consumer): void
+    private function runBackfill(): int
     {
+        $driver = $this->getDriver();
+        $stream = (string) $this->option('stream');
         $batchSize = max(1, (int) $this->option('batch'));
-        $timeout = max(1, (int) $this->option('timeout'));
         $maxPayload = max(1, (int) $this->option('max-payload'));
-        $once = (bool) $this->option('once');
 
-        $this->line('[READER] 启动，开始 xReadGroup 循环');
-        $this->recoverPending($stream, $group, $consumer);
+        $this->info(sprintf(
+            '[BACKFILL] stream=%s batch=%d driver=%s',
+            $stream,
+            $batchSize,
+            $driver,
+        ));
 
-        $loopCount = 0;
+        if ($driver === 'swow') {
+            $this->initRedisPool();
+            $this->backfillSwow($stream, $batchSize, $maxPayload);
+        } else {
+            $this->backfillSync($stream, $batchSize, $maxPayload);
+        }
+
+        $this->printStats();
+
+        return 0;
+    }
+
+    private function backfillSwow(string $stream, int $batchSize, int $maxPayload): void
+    {
+        $emptyCount = 0;
+        $lastId = '0';
 
         while (! $this->stopping) {
-            $loopCount++;
-
             try {
-                $entries = withRedis(fn (\Redis $conn) => $conn->xReadGroup(
-                    $group, $consumer, [$stream => '>'], $batchSize, $timeout,
+                $entries = withRedis(fn (\Redis $conn) => $conn->xRead(
+                    [$stream => $lastId],
+                    $batchSize,
+                    self::BACKFILL_BLOCK_MS,
                 ));
             } catch (Throwable $e) {
-                $this->error('[READER] ' . $e->getMessage());
-                if ($once) {
-                    break;
-                }
-                $this->sleep(1.0);
-                continue;
+                $this->error('[BACKFILL] xRead 失败：'.$e->getMessage());
+                break;
             }
 
             if (empty($entries)) {
-                // 每 10 次空返回打一行，避免刷屏
-                if ($loopCount % 10 === 1) {
-                    $this->line(sprintf(
-                        '[READER] 等待数据中（第 %d 次 xReadGroup，timeout=%dms）',
-                        $loopCount,
-                        $timeout,
-                    ));
-                }
-
-                if ($once) {
+                $emptyCount++;
+                if ($emptyCount >= 3) {
                     break;
                 }
                 continue;
             }
 
+            $emptyCount = 0;
             $items = $entries[$stream] ?? [];
-            if ($items !== []) {
-                $this->line(sprintf('[READER] 收到 %d 条数据', count($items)));
-            }
 
             foreach ($items as $id => $data) {
                 $payload = (string) ($data['payload'] ?? '{}');
@@ -835,15 +536,9 @@ class EdgeStreamStorageCommand extends Command
 
                 if (strlen($payload) > $maxPayload) {
                     EdgeStream::writeDead(
-                        (string) $id,
-                        $stream,
-                        $group,
-                        $consumer,
-                        1,
-                        $payload,
-                        'payload too large',
-                        $device,
-                        $topic,
+                        (string) $id, $stream, '', '', 1,
+                        $payload, 'payload too large (backfill)',
+                        $device, $topic,
                         (int) ($ts * 1000),
                         date('Y-m-d H:i:s', (int) $ts),
                     );
@@ -853,69 +548,235 @@ class EdgeStreamStorageCommand extends Command
                 }
 
                 $this->received++;
-                $this->writeChannel->push([
+                $this->flushBackfillItem(
+                    $stream,
+                    (string) $id,
+                    $device,
+                    $topic,
+                    $payload,
+                    (int) ($ts * 1000),
+                    date('Y-m-d H:i:s', (int) $ts),
+                );
+            }
+
+            $lastEntry = null;
+            foreach ($items as $id => $data) {
+                $lastEntry = $id;
+            }
+            $lastId = (string) $lastEntry;
+
+            if (count($items) < $batchSize) {
+                break;
+            }
+        }
+
+        $this->line('[BACKFILL] Swow 回刷结束');
+    }
+
+    private function backfillSync(string $stream, int $batchSize, int $maxPayload): void
+    {
+        $lastId = '0';
+
+        while (! $this->stopping) {
+            try {
+                $entries = withRedis(fn (\Redis $conn) => $conn->xRead(
+                    [$stream => $lastId],
+                    $batchSize,
+                    self::BACKFILL_BLOCK_MS,
+                ));
+            } catch (Throwable $e) {
+                $this->error('[BACKFILL] xRead 失败：'.$e->getMessage());
+                break;
+            }
+
+            if (empty($entries)) {
+                break;
+            }
+
+            $items = $entries[$stream] ?? [];
+            if (empty($items)) {
+                break;
+            }
+
+            $buffer = [];
+
+            foreach ($items as $id => $data) {
+                $payload = (string) ($data['payload'] ?? '{}');
+                $device = (string) ($data['device'] ?? 'unknown');
+                $topic = (string) ($data['topic'] ?? '');
+                $ts = (float) ($data['ts'] ?? microtime(true));
+
+                if (strlen($payload) > $maxPayload) {
+                    EdgeStream::writeDead(
+                        (string) $id, $stream, '', '', 1,
+                        $payload, 'payload too large (backfill)',
+                        $device, $topic,
+                        (int) ($ts * 1000),
+                        date('Y-m-d H:i:s', (int) $ts),
+                    );
+                    $this->dead++;
+                    $this->xDel($stream, [(string) $id]);
+                    continue;
+                }
+
+                $this->received++;
+                $buffer[] = [
                     'stream_id'   => (string) $id,
                     'client_id'   => $device,
                     'topic'       => $topic,
                     'payload'     => $payload,
                     'received_ms' => (int) ($ts * 1000),
                     'received_at' => date('Y-m-d H:i:s', (int) $ts),
-                ]);
+                ];
             }
 
-            if ($once) {
+            if (! empty($buffer)) {
+                $ids = array_map(fn ($r) => (string) $r['stream_id'], $buffer);
+                try {
+                    [$written] = EdgeStream::upsertBatch($buffer);
+                    $this->written += $written;
+                    $this->xDel($stream, $ids);
+                } catch (Throwable $e) {
+                    $this->error('[BACKFILL] 写入失败：'.$e->getMessage());
+                    foreach ($buffer as $row) {
+                        EdgeStream::writeDead(
+                            (string) ($row['stream_id'] ?? ''), $stream, '', '', 1,
+                            (string) ($row['payload'] ?? '{}'), $e->getMessage(),
+                            (string) ($row['client_id'] ?? 'unknown'),
+                            (string) ($row['topic'] ?? ''),
+                            (int) ($row['received_ms'] ?? 0),
+                            (string) ($row['received_at'] ?? ''),
+                        );
+                        $this->dead++;
+                    }
+                    $this->xDel($stream, $ids);
+                }
+            }
+
+            $lastEntry = null;
+            foreach ($items as $id => $data) {
+                $lastEntry = $id;
+            }
+            $lastId = (string) $lastEntry;
+
+            if (count($items) < $batchSize) {
                 break;
             }
         }
 
-        // ✅ 通知 Writer 结束
-        try {
-            $this->writeChannel->push(null);
-        } catch (Throwable $e) {
-            $this->error('[READER] push 结束信号失败：' . $e->getMessage());
-        }
-
-        $this->line('[READER] 退出');
+        $this->line('[BACKFILL] 同步回刷结束');
     }
 
-    private function writerLoop(string $stream, string $group, string $consumer): void
-    {
-        $batchSize = max(1, (int) $this->option('batch'));
-        $timeout = max(1, (int) $this->option('timeout'));
-        $batch = [];
+    private function flushBackfillItem(
+        string $stream,
+        string $id,
+        string $device,
+        string $topic,
+        string $payload,
+        int $receivedMs,
+        string $receivedAt,
+    ): void {
+        try {
+            [$written] = EdgeStream::upsertBatch([[
+                'stream_id'   => $id,
+                'client_id'   => $device,
+                'topic'       => $topic,
+                'payload'     => $payload,
+                'received_ms' => $receivedMs,
+                'received_at' => $receivedAt,
+            ]]);
+            $this->written += $written;
+            $this->xDel($stream, [$id]);
+        } catch (Throwable $e) {
+            EdgeStream::writeDead(
+                $id, $stream, '', '', 1,
+                $payload, $e->getMessage(),
+                $device, $topic, $receivedMs, $receivedAt,
+            );
+            $this->dead++;
+            $this->xDel($stream, [$id]);
+        }
+    }
 
-        $this->line('[WRITER] 启动');
+    /* ==================== Redis ==================== */
+
+    private function initRedisPool(): void
+    {
+        if (! function_exists('redisPoolInit')) {
+            throw new \RuntimeException('helper.php 未加载');
+        }
+
+        if (! defined('REDIS_HOST') || ! defined('REDIS_PORT') || ! defined('REDIS_DB')) {
+            throw new \RuntimeException('bootstrap.php 未加载或 Redis 常量未定义');
+        }
+
+        redisPoolInit(
+            $this->configInt('edge.redis.pool_size', defined('REDIS_POOL_SIZE') ? REDIS_POOL_SIZE : 64),
+            $this->configInt('edge.redis.db', defined('REDIS_DB') ? REDIS_DB : 2),
+        );
+
+        $this->info(sprintf(
+            '[redis] 连接池已初始化 %s:%s db=%s',
+            REDIS_HOST,
+            REDIS_PORT,
+            REDIS_DB,
+        ));
+    }
+
+    private function ensureGroup(string $stream, string $group): void
+    {
+        try {
+            withRedis(fn (\Redis $conn) => $conn->xGroup('CREATE', $stream, $group, '0', true));
+        } catch (Throwable) {
+            // BUSYGROUP 已存在，忽略
+        }
+    }
+
+    /* ==================== 死信重试 ==================== */
+
+    private function runRetryDead(): int
+    {
+        $stream = (string) $this->option('stream');
+        $group = (string) $this->option('group');
+        $consumer = (string) $this->option('consumer');
+        $batchSize = max(1, (int) $this->option('retry-batch'));
+        $maxRetries = max(1, (int) $this->option('max-retries'));
+        $timeout = max(1, (int) $this->option('timeout'));
+
+        $this->info(sprintf(
+            '[RETRY-DEAD] stream=%s group=%s consumer=%s batch=%d maxRetries=%d timeout=%dms',
+            $stream, $group, $consumer, $batchSize, $maxRetries, $timeout,
+        ));
+
+        $total = ['retried' => 0, 'succeeded' => 0, 'failed' => 0];
 
         while (true) {
-            $item = null;
-
-            try {
-                $item = $this->writeChannel->pop($timeout);
-            } catch (Throwable $e) {
-                // ✅ 降级为 warn：阻塞等待是正常行为，不是错误
-                $this->warn('[WRITER] 等待数据中（Channel 超时）：' . $e->getMessage());
-                $this->sleep(0.1);
-                continue;
-            }
-
-            // null = Reader 发来的结束信号
-            if ($item === null) {
-                if ($batch !== []) {
-                    $this->flushBatchAndDelete($batch, $stream, $group, $consumer);
-                    $batch = [];
-                }
+            $claims = EdgeStreamFail::claimBatch($stream, $group, $batchSize, $maxRetries, $timeout);
+            if ($claims === []) {
                 break;
             }
 
-            $batch[] = $item;
+            $stats = EdgeStream::retryBatch($claims, $maxRetries);
+            $total['retried'] += $stats['retried'];
+            $total['succeeded'] += $stats['succeeded'];
+            $total['failed'] += $stats['failed'];
 
-            if (count($batch) >= $batchSize) {
-                $this->flushBatchAndDelete($batch, $stream, $group, $consumer);
-                $batch = [];
-            }
+            $this->line(sprintf(
+                '[RETRY-DEAD] retried=%d succeeded=%d failed=%d',
+                $stats['retried'],
+                $stats['succeeded'],
+                $stats['failed'],
+            ));
         }
 
-        $this->line('[WRITER] 退出');
+        $this->info(sprintf(
+            '[RETRY-DEAD] 完成 retried=%d succeeded=%d failed=%d',
+            $total['retried'],
+            $total['succeeded'],
+            $total['failed'],
+        ));
+
+        return 0;
     }
 
     /* ==================== 核心：写 PG + XDEL ==================== */
@@ -963,13 +824,20 @@ class EdgeStreamStorageCommand extends Command
             $this->written += $written;
             $this->xDel($stream, $ids);
 
+            $this->line(sprintf(
+                '[FLUSH] batch=%d written=%d XDEL=%d',
+                count($validBatch),
+                $written,
+                count($ids),
+            ));
+
             $last = end($validBatch);
             if (! empty($last['stream_id'])) {
                 EdgeStreamOffset::query()->updateOrInsert(
                     ['stream' => $stream, 'group_name' => $group],
                     [
                         'last_id' => (string) $last['stream_id'],
-                        'last_lag' => $this->writeChannel?->getLength() ?? 0,
+                        'last_lag' => 0,
                         'updated_at' => now(),
                     ],
                 );
@@ -994,7 +862,6 @@ class EdgeStreamStorageCommand extends Command
     private function xDel(string $stream, array $ids): void
     {
         $ids = array_values(array_filter($ids, fn ($id) => $id !== ''));
-
         if ($ids === []) {
             return;
         }
@@ -1007,7 +874,7 @@ class EdgeStreamStorageCommand extends Command
         }
     }
 
-    /* ==================== 启动恢复 PEL 存量 ==================== */
+    /* ==================== PEL 恢复 ==================== */
 
     private function recoverPending(string $stream, string $group, string $consumer): void
     {
@@ -1038,11 +905,11 @@ class EdgeStreamStorageCommand extends Command
             $skipIds = [];
 
             foreach ($pending as $p) {
-                [$id, $owner, $idle, $delivered] = $p;
+                [, , , $delivered] = $p;
                 if ((int) $delivered <= $maxDelivered) {
-                    $claimIds[] = (string) $id;
+                    $claimIds[] = (string) $p[0];
                 } else {
-                    $skipIds[] = (string) $id;
+                    $skipIds[] = (string) $p[0];
                 }
             }
 
@@ -1114,7 +981,6 @@ class EdgeStreamStorageCommand extends Command
 
             if (! empty($buffer)) {
                 $ids = array_map(fn ($r) => (string) $r['stream_id'], $buffer);
-
                 try {
                     [$written] = EdgeStream::upsertBatch($buffer);
                     $this->written += $written;
@@ -1155,8 +1021,6 @@ class EdgeStreamStorageCommand extends Command
         }
     }
 
-    /* ==================== 停机 PEL 清理 ==================== */
-
     private function handlePending(string $stream, string $group, string $consumer): void
     {
         try {
@@ -1171,7 +1035,7 @@ class EdgeStreamStorageCommand extends Command
             $claimedIds = [];
 
             foreach ($pending as $p) {
-                [$id, $owner, $idle, $delivered] = $p;
+                [$id, , $idle, $delivered] = $p;
 
                 if ((int) $delivered < self::PEL_MAX_DELIVERED) {
                     continue;
@@ -1210,29 +1074,7 @@ class EdgeStreamStorageCommand extends Command
         }
     }
 
-    private function drainChannel(Channel $channel): void
-    {
-        $deadline = microtime(true) + (self::DRAIN_TIMEOUT_MS / 1000);
-        $drained = 0;
-
-        while (microtime(true) < $deadline) {
-            try {
-                $item = $channel->pop(self::DRAIN_POP_TIMEOUT_MS);
-            } catch (Throwable) {
-                break;
-            }
-
-            if ($item === null) {
-                break;
-            }
-
-            $drained++;
-        }
-
-        if ($drained > 0) {
-            $this->line(sprintf('[DRAIN] 排空残留 %d 条', $drained));
-        }
-    }
+    /* ==================== 统计 ==================== */
 
     private function printStats(): void
     {
