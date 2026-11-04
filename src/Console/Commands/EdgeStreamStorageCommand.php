@@ -785,16 +785,20 @@ class EdgeStreamStorageCommand extends Command
         $maxPayload = max(1, (int) $this->option('max-payload'));
         $once = (bool) $this->option('once');
 
-        $this->line('[READER] 启动');
+        $this->line('[READER] 启动，开始 xReadGroup 循环');
         $this->recoverPending($stream, $group, $consumer);
 
+        $loopCount = 0;
+
         while (! $this->stopping) {
+            $loopCount++;
+
             try {
                 $entries = withRedis(fn (\Redis $conn) => $conn->xReadGroup(
                     $group, $consumer, [$stream => '>'], $batchSize, $timeout,
                 ));
             } catch (Throwable $e) {
-                $this->error('[READER] '.$e->getMessage());
+                $this->error('[READER] ' . $e->getMessage());
                 if ($once) {
                     break;
                 }
@@ -803,6 +807,15 @@ class EdgeStreamStorageCommand extends Command
             }
 
             if (empty($entries)) {
+                // 每 10 次空返回打一行，避免刷屏
+                if ($loopCount % 10 === 1) {
+                    $this->line(sprintf(
+                        '[READER] 等待数据中（第 %d 次 xReadGroup，timeout=%dms）',
+                        $loopCount,
+                        $timeout,
+                    ));
+                }
+
                 if ($once) {
                     break;
                 }
@@ -810,6 +823,9 @@ class EdgeStreamStorageCommand extends Command
             }
 
             $items = $entries[$stream] ?? [];
+            if ($items !== []) {
+                $this->line(sprintf('[READER] 收到 %d 条数据', count($items)));
+            }
 
             foreach ($items as $id => $data) {
                 $payload = (string) ($data['payload'] ?? '{}');
@@ -819,9 +835,15 @@ class EdgeStreamStorageCommand extends Command
 
                 if (strlen($payload) > $maxPayload) {
                     EdgeStream::writeDead(
-                        (string) $id, $stream, $group, $consumer, 1,
-                        $payload, 'payload too large',
-                        $device, $topic,
+                        (string) $id,
+                        $stream,
+                        $group,
+                        $consumer,
+                        1,
+                        $payload,
+                        'payload too large',
+                        $device,
+                        $topic,
                         (int) ($ts * 1000),
                         date('Y-m-d H:i:s', (int) $ts),
                     );
@@ -846,7 +868,13 @@ class EdgeStreamStorageCommand extends Command
             }
         }
 
-        $this->writeChannel->push(null);
+        // ✅ 通知 Writer 结束
+        try {
+            $this->writeChannel->push(null);
+        } catch (Throwable $e) {
+            $this->error('[READER] push 结束信号失败：' . $e->getMessage());
+        }
+
         $this->line('[READER] 退出');
     }
 
@@ -860,14 +888,17 @@ class EdgeStreamStorageCommand extends Command
 
         while (true) {
             $item = null;
+
             try {
                 $item = $this->writeChannel->pop($timeout);
             } catch (Throwable $e) {
-                $this->error('[WRITER] pop 失败：'.$e->getMessage());
+                // ✅ 降级为 warn：阻塞等待是正常行为，不是错误
+                $this->warn('[WRITER] 等待数据中（Channel 超时）：' . $e->getMessage());
                 $this->sleep(0.1);
                 continue;
             }
 
+            // null = Reader 发来的结束信号
             if ($item === null) {
                 if ($batch !== []) {
                     $this->flushBatchAndDelete($batch, $stream, $group, $consumer);
@@ -877,6 +908,7 @@ class EdgeStreamStorageCommand extends Command
             }
 
             $batch[] = $item;
+
             if (count($batch) >= $batchSize) {
                 $this->flushBatchAndDelete($batch, $stream, $group, $consumer);
                 $batch = [];
