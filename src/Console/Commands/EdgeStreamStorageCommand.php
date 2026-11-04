@@ -98,9 +98,9 @@ class EdgeStreamStorageCommand extends Command
         $driver = $this->getDriver();
         $this->info("启动模式：{$driver}");
 
-        if ($driver === 'swow') {
-            $this->initRedisPool();
-        }
+        // ✅ 修复：Swow 模式下 initRedisPool 已由 runSwowMode() 负责，
+        // 这里不再重复调用，避免日志里出现两次"连接池已初始化"。
+        // 同步模式不需要连接池，所以也不在这里初始化。
 
         return $driver === 'swow'
             ? $this->runSwowMode()
@@ -115,6 +115,7 @@ class EdgeStreamStorageCommand extends Command
         $group = (string) $this->option('group');
         $consumer = (string) $this->option('consumer');
 
+        // ✅ 连接池只在这里初始化一次
         $this->initRedisPool();
         $this->ensureGroup($stream, $group);
         $this->recoverPending($stream, $group, $consumer);
@@ -136,6 +137,7 @@ class EdgeStreamStorageCommand extends Command
             $this->sleep(0.1);
         }
 
+        // ✅ 信号只负责设置 $stopping=true，排空统一在这里做
         $this->drainBuffer($stream, $group, $consumer);
         $this->printStats();
 
@@ -158,8 +160,12 @@ class EdgeStreamStorageCommand extends Command
                 }
 
                 $this->warn(sprintf('[signal] 收到 %d，优雅停机', $sig));
+
+                // ✅ 只设置停止标志，通知 Reader/Writer 退出
+                // 排空和统计由主协程 runSwowMode() 统一处理，不在这里做
                 $this->stopping = true;
 
+                // PEL 清理和死信锁释放可以提前做，不影响后续排空
                 $this->handlePending($stream, $group, $consumer);
                 EdgeStreamFail::forceUnlock($stream, $group);
             });
@@ -308,6 +314,7 @@ class EdgeStreamStorageCommand extends Command
             }
         }
 
+        // ✅ stopping=true 后，把最后一批残留数据刷完
         if (! empty($batch)) {
             $this->flushBatchAndDelete($batch, $stream, $group, $consumer);
         }
@@ -330,24 +337,42 @@ class EdgeStreamStorageCommand extends Command
     {
         $this->line('[SWOW] 停机排空 Buffer...');
 
-        while (true) {
+        $drained = 0;
+        $emptyCount = 0;
+
+        // ✅ 修复：while(true) 改为 while(!$this->stopping)，
+        // 防止信号触发后仍然无限阻塞在 bRPop 上导致进程卡死
+        while (! $this->stopping) {
             try {
                 $raw = withRedis(fn (\Redis $conn) => $conn->bRPop(
                     [self::BUFFER_KEY],
-                    1,
+                    1, // 最多阻塞 1 秒，定期回到事件循环检查 stopping
                 ));
             } catch (Throwable) {
                 break;
             }
 
             if (empty($raw)) {
-                break;
+                $emptyCount++;
+                // ✅ 连续 2 次空返回（约 2 秒）说明 buffer 已空，直接退出
+                if ($emptyCount >= 2) {
+                    break;
+                }
+                continue;
             }
 
+            $emptyCount = 0;
             $item = json_decode($raw[1], true);
             if ($item) {
                 $this->flushBatchAndDelete([$item], $stream, $group, $consumer);
+                $drained++;
             }
+        }
+
+        if ($drained > 0) {
+            $this->line(sprintf('[SWOW] Buffer 排空完成，处理 %d 条', $drained));
+        } else {
+            $this->line('[SWOW] Buffer 已空，无需排空');
         }
     }
 
