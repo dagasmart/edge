@@ -838,6 +838,7 @@ class EdgeInsertRedisDimCommand extends Command
 
     /**
      * 服务器IP
+     *
      * @return array{0: string, 1: string} [scheme, ip]
      */
     public function getServerIp(): array
@@ -847,10 +848,7 @@ class EdgeInsertRedisDimCommand extends Command
         $hostname = gethostname();
         if ($hostname !== false) {
             $ip = gethostbyname($hostname);
-            if (filter_var($ip, FILTER_VALIDATE_IP)) {
-                return [$scheme, $ip];
-            }
-            if ($ip !== $hostname && $ip !== '127.0.0.1') {
+            if (filter_var($ip, FILTER_VALIDATE_IP) && ! str_starts_with($ip, '127.')) {
                 return [$scheme, $ip];
             }
         }
