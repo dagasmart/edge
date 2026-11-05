@@ -845,40 +845,39 @@ class EdgeInsertRedisDimCommand extends Command
     {
         $scheme = config('edge.metrics.scheme', 'http');
 
-        // Linux: 从 ip addr 解析第一个非回环 IPv4
-        if (DIRECTORY_SEPARATOR === '/') {
-            $lines = [];
-            exec('ip -4 addr show 2>/dev/null', $lines, $code);
-            if ($code === 0) {
-                foreach ($lines as $line) {
-                    if (preg_match('/^\s+inet\s+([0-9.]+)/', $line, $m)) {
-                        $ip = $m[1];
-                        // 过滤回环地址
-                        if (! $this->isLoopbackIp($ip)) {
-                            return [$scheme, $ip];
-                        }
-                    }
+        // 1) 配置优先
+        $configured = config('edge.metrics.public_host');
+        if ($configured && filter_var($configured, FILTER_VALIDATE_IP)) {
+            return [$scheme, $configured];
+        }
+
+        // 2) 云元数据（带 2s 超时，卡住就跳过）
+        $meta = @file_get_contents('http://100.100.100.200/latest/meta-data/eip-addresses/', false, stream_context_create(['http' => ['timeout' => 2]]));
+        if ($meta && filter_var(trim($meta), FILTER_VALIDATE_IP)) {
+            return [$scheme, trim($meta)];
+        }
+
+        // 3) 外部回显（ifconfig.me 通、ipify 不通就靠它）
+        foreach (['https://ifconfig.me', 'http://ipinfo.io/ip', 'http://icanhazip.com'] as $url) {
+            $ctx = stream_context_create(['http' => ['timeout' => 3]]);
+            $body = @file_get_contents($url, false, $ctx);
+            if ($body) {
+                $ip = trim($body);
+                if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)
+                    && ! preg_match('/^(10\.|127\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.64\.)/', $ip)) {
+                    return [$scheme, $ip];
                 }
             }
         }
 
-        // Windows 兜底
-        $hostname = gethostname();
-        if ($hostname !== false) {
-            $ip = gethostbyname($hostname);
-            if (filter_var($ip, FILTER_VALIDATE_IP) && ! $this->isLoopbackIp($ip)) {
-                return [$scheme, $ip];
-            }
+        // 4) 兜底内网 IP
+        $lines = [];
+        @exec('ip -4 addr show 2>/dev/null', $lines);
+        if (array_any($lines, fn ($line) => preg_match('/^\s+inet\s+([\d.]+)/', $line, $m) && ! str_starts_with($m[1], '127.'))) {
+            return [$scheme, $m[1]];
         }
 
-        // 实在拿不到，返回监听地址提示用户自查
         return [$scheme, '0.0.0.0'];
-    }
-
-    private function isLoopbackIp(string $ip): bool
-    {
-        return $ip === '127.0.0.1'
-            || str_starts_with($ip, '127.');
     }
 
     private function nowString(): string
