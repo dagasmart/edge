@@ -9,15 +9,16 @@ return [
 
         // 多主题订阅：数组 / 逗号分隔字符串 / 单字符串，支持 +/# 通配符
         'topics' => [
-            'heartbeat/response',
+            'heartbeat/response', //MQTT 心跳 topic
         ],
 
         // 高优先级主题（前缀匹配，命中则走高优 Channel）
         'high_priority_topics' => [
-            'device/+/alarm',
-            'device/+/alert',
-            'device/+/control',
-            'device/+/command',
+            'face/*/response',  //获取下发命令返回值 topic，MQTT 服务端需要订阅
+            'face/response',    //推送人脸识别结果 topic
+            'qr/response',      //二维码数据 topic
+            'online/response',  //mqtt 上线 topic
+            'will/+/response',  //推送遗嘱 topic
         ],
 
         // 高优 Channel 配置
