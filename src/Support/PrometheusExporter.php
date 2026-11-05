@@ -18,17 +18,9 @@ use Throwable;
 class PrometheusExporter
 {
     /** @var array<string, mixed> */
-    public array $metrics = [] {
-        get {
-            return $this->metrics;
-        }
-    }
+    protected array $metrics = [];
 
-    protected bool $running = false {
-        get {
-            return $this->running;
-        }
-    }
+    protected bool $running = false;
 
     /** @var resource|null */
     protected $server;
@@ -128,10 +120,15 @@ class PrometheusExporter
     }
 
     /**
+     * 获取当前指标快照（供外部使用）
+     */
+    public function getMetrics(): array
+    {
+        return $this->metrics;
+    }
+
+    /**
      * 构建 Prometheus 文本格式
-     *
-     * @param array $metrics
-     * @return string
      */
     public static function buildMetrics(array $metrics): string
     {
@@ -165,7 +162,6 @@ class PrometheusExporter
                 'value' => $info['value'],
             ];
         }
-
         return $result;
     }
 
@@ -182,7 +178,6 @@ class PrometheusExporter
         if (preg_match('#^\w+\s+(/[^?\s]*)#', $line, $matches)) {
             return $matches[1];
         }
-
         return '/';
     }
 
@@ -199,7 +194,7 @@ class PrometheusExporter
         ?callable $metricsProvider = null
     ): mixed {
         $this->running = true;
-        $provider = $metricsProvider ?? fn (): array => $this->metrics;
+        $provider = $metricsProvider ?? fn (): array => $this->getMetrics();
 
         $addr = "tcp://{$host}:{$port}";
         $socket = @stream_socket_server(
@@ -225,16 +220,28 @@ class PrometheusExporter
             $buffers = [];
 
             while ($this->running) {
+                // ✅ 每次循环重建，避免 stream_select 污染数组（Windows 必现）
                 $read = [$socket];
                 foreach ($conns as $c) {
-                    $read[] = $c;
+                    // ✅ 过滤已关闭/无效 resource，防止 stream_select 返回 false
+                    if (is_resource($c) && !feof($c)) {
+                        $read[] = $c;
+                    }
                 }
+
                 $write = null;
                 $except = null;
 
-                // 非阻塞 select，超时 1 秒
-                $ready = @stream_select($read, $write, $except, 1);
-                if ($ready === false || $ready <= 0) {
+                // ✅ 不使用 @，false 时让出 CPU 重试
+                $ready = stream_select($read, $write, $except, 1);
+
+                if ($ready === false) {
+                    // Windows/Swow 下偶发，短暂休眠避免 100% CPU
+                    usleep(10000);
+                    continue;
+                }
+
+                if ($ready <= 0) {
                     continue;
                 }
 
@@ -242,79 +249,87 @@ class PrometheusExporter
                     if ($sock === $socket) {
                         // 有新连接
                         $conn = @stream_socket_accept($socket, 0);
-                        if ($conn) {
+                        if ($conn !== false && $conn !== null) {
                             stream_set_blocking($conn, false);
                             $conns[] = $conn;
                             $buffers[(int) $conn] = '';
                         }
-                    } else {
-                        // 有数据可读
-                        $data = @fread($sock, 8192);
-                        $key = (int) $sock;
+                        continue;
+                    }
 
-                        if ($data === '' || $data === false) {
-                            // 客户端关闭连接
-                            fclose($sock);
-                            $conns = array_filter($conns, fn ($c) => $c !== $sock);
-                            unset($buffers[$key]);
+                    // 有数据可读
+                    $data = @fread($sock, 8192);
+                    $key = (int) $sock;
 
-                            continue;
+                    if ($data === '' || $data === false) {
+                        // 客户端关闭连接
+                        fclose($sock);
+                        $idx = array_search($sock, $conns, true);
+                        if ($idx !== false) {
+                            unset($conns[$idx]);
                         }
+                        unset($buffers[$key]);
+                        continue;
+                    }
 
-                        $buffers[$key] .= $data;
+                    $buffers[$key] .= $data;
 
-                        // 收到完整请求头就响应
-                        if (str_contains($buffers[$key], "\r\n\r\n")) {
-                            try {
-                                $request = $buffers[$key];
-                                $metrics = $provider();
-                                $path = self::parsePath($request);
+                    // 收到完整请求头就响应
+                    if (!str_contains($buffers[$key], "\r\n\r\n")) {
+                        continue;
+                    }
 
-                                if ($path === '/api/metrics') {
-                                    // JSON 接口
-                                    $body = json_encode([
-                                        'code' => 0,
-                                        'msg' => 'success',
-                                        'data' => self::metricsToArray($metrics),
-                                    ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                    try {
+                        $request = $buffers[$key];
+                        $metrics = $provider();
+                        $path = self::parsePath($request);
 
-                                    if ($body === false) {
-                                        throw new \RuntimeException('Failed to encode metrics to JSON');
-                                    }
+                        if ($path === '/api/metrics') {
+                            // JSON 接口
+                            $body = json_encode([
+                                'code' => 0,
+                                'msg' => 'success',
+                                'data' => self::metricsToArray($metrics),
+                            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
-                                    $resp = "HTTP/1.1 200 OK\r\n"
-                                        ."Content-Type: application/json; charset=utf-8\r\n"
-                                        .'Content-Length: '.strlen($body)."\r\n"
-                                        ."Connection: close\r\n"
-                                        ."\r\n"
-                                        .$body;
-                                } else {
-                                    // Prometheus 默认文本格式（/metrics 或其他路径）
-                                    $body = self::buildMetrics($metrics);
-
-                                    $resp = "HTTP/1.1 200 OK\r\n"
-                                        ."Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
-                                        .'Content-Length: '.strlen($body)."\r\n"
-                                        ."Connection: close\r\n"
-                                        ."\r\n"
-                                        .$body;
-                                }
-
-                                @fwrite($sock, $resp);
-                            } catch (Throwable $e) {
-                                @fwrite(
-                                    $sock,
-                                    "HTTP/1.1 500 服务未启动\r\n"
-                                    ."Content-Length: 0\r\n"
-                                    ."Connection: close\r\n"
-                                    ."\r\n"
-                                );
-                            } finally {
-                                fclose($sock);
-                                $conns = array_filter($conns, fn ($c) => $c !== $sock);
-                                unset($buffers[$key]);
+                            if ($body === false) {
+                                throw new \RuntimeException('Failed to encode metrics to JSON');
                             }
+
+                            $resp = "HTTP/1.1 200 OK\r\n"
+                                ."Content-Type: application/json; charset=utf-8\r\n"
+                                .'Content-Length: '.strlen($body)."\r\n"
+                                ."Connection: close\r\n"
+                                ."\r\n"
+                                .$body;
+                        } else {
+                            // Prometheus 默认文本格式（/metrics 或其他路径）
+                            $body = self::buildMetrics($metrics);
+
+                            $resp = "HTTP/1.1 200 OK\r\n"
+                                ."Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                                .'Content-Length: '.strlen($body)."\r\n"
+                                ."Connection: close\r\n"
+                                ."\r\n"
+                                .$body;
                         }
+
+                        @fwrite($sock, $resp);
+                    } catch (Throwable $e) {
+                        @fwrite(
+                            $sock,
+                            "HTTP/1.1 500 Internal Server Error\r\n"
+                            ."Content-Length: 0\r\n"
+                            ."Connection: close\r\n"
+                            ."\r\n"
+                        );
+                    } finally {
+                        fclose($sock);
+                        $idx = array_search($sock, $conns, true);
+                        if ($idx !== false) {
+                            unset($conns[$idx]);
+                        }
+                        unset($buffers[$key]);
                     }
                 }
             }
@@ -338,5 +353,10 @@ class PrometheusExporter
             }
             $this->server = null;
         }
+    }
+
+    public function isRunning(): bool
+    {
+        return $this->running;
     }
 }

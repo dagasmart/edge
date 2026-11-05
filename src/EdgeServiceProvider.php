@@ -1,5 +1,7 @@
 <?php
+
 declare(strict_types=1);
+
 namespace DagaSmart\Edge;
 
 use DagaSmart\BizAdmin\Extend\ServiceProvider;
@@ -55,7 +57,6 @@ class EdgeServiceProvider extends ServiceProvider
         ['name' => '筛选', 'namespace' => 'dagasmart.edge',  'code' => 'extension.edge.authorize', 'abbr' => 'search', 'custom_order' => 5],
     ];
 
-
     /**
      * @throws Exception
      */
@@ -65,8 +66,8 @@ class EdgeServiceProvider extends ServiceProvider
 
         /** ✅ 批量注册配置文件 */
         $this->registerConfigs([
-            'services.stock' => 'stock.php',
-            'services.finance' => 'finance.php',
+            'edge' => 'edge.php',
+            'secrets' => 'secrets.php',
         ]);
 
         /**✅ 加载路由*/
@@ -81,13 +82,13 @@ class EdgeServiceProvider extends ServiceProvider
         if ($this->app->runningInConsole()) {
             $this->commands($this->discoverCommands());
         }
-        //网关签名验签服务
+        // 网关签名验签服务
         $this->app->singleton(EdgeAuthSignerService::class, function () {
-            return new EdgeAuthSignerService();
+            return new EdgeAuthSignerService;
         });
         // 网关规则服务
         $this->app->singleton(EdgeAclEngineService::class, function () {
-            return new EdgeAclEngineService();
+            return new EdgeAclEngineService;
         });
 
     }

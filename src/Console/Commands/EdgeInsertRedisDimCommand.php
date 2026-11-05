@@ -128,10 +128,15 @@ class EdgeInsertRedisDimCommand extends Command
             $this->exporter->set('edge_qps', $this->calculateQps());
             $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && ! $this->stopping ? 1 : 0);
 
-            return $this->exporter;
+            return $this->exporter->getMetrics();
         });
 
+        [$scheme, $serverIp] = $this->getServerIp();
+
         $this->info(sprintf('[metrics] Prometheus 监听 %s:%d', $metricsHost, $metricsPort));
+        $this->info(sprintf('[metrics] Prometheus 本地 %s://%s:%d', $scheme, $metricsHost, $metricsPort));
+        echo "[metrics] Prometheus 预览 {$scheme}://{$serverIp}:{$metricsPort}/metrics\n";
+        echo "[metrics] Prometheus 接口 {$scheme}://{$serverIp}:{$metricsPort}/api/metrics\n";
 
         // 启动两个 Flusher 协程
         $this->startNormalFlusher();
@@ -829,6 +834,28 @@ class EdgeInsertRedisDimCommand extends Command
         } catch (Throwable) {
             return $default;
         }
+    }
+
+    /**
+     * 服务器IP
+     * @return array{0: string, 1: string} [scheme, ip]
+     */
+    public function getServerIp(): array
+    {
+        $scheme = config('edge.metrics.scheme');
+        // CLI 下优先用 gethostbyname
+        $hostname = gethostname();
+        if ($hostname !== false) {
+            $ip = gethostbyname($hostname);
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return [$scheme, $ip];
+            }
+            if ($ip !== $hostname && $ip !== '127.0.0.1') {
+                return [$scheme, $ip];
+            }
+        }
+
+        return [$scheme, '127.0.0.1'];
     }
 
     private function nowString(): string
