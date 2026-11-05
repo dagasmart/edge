@@ -837,23 +837,48 @@ class EdgeInsertRedisDimCommand extends Command
     }
 
     /**
-     * 服务器IP
+     * 获取服务器对外 IPv4 地址（CLI / 跨平台）
      *
      * @return array{0: string, 1: string} [scheme, ip]
      */
     public function getServerIp(): array
     {
-        $scheme = config('edge.metrics.scheme');
-        // CLI 下优先用 gethostbyname
+        $scheme = config('edge.metrics.scheme', 'http');
+
+        // Linux: 从 ip addr 解析第一个非回环 IPv4
+        if (DIRECTORY_SEPARATOR === '/') {
+            $lines = [];
+            exec('ip -4 addr show 2>/dev/null', $lines, $code);
+            if ($code === 0) {
+                foreach ($lines as $line) {
+                    if (preg_match('/^\s+inet\s+([0-9.]+)/', $line, $m)) {
+                        $ip = $m[1];
+                        // 过滤回环地址
+                        if (! $this->isLoopbackIp($ip)) {
+                            return [$scheme, $ip];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Windows 兜底
         $hostname = gethostname();
         if ($hostname !== false) {
             $ip = gethostbyname($hostname);
-            if (filter_var($ip, FILTER_VALIDATE_IP) && ! str_starts_with($ip, '127.')) {
+            if (filter_var($ip, FILTER_VALIDATE_IP) && ! $this->isLoopbackIp($ip)) {
                 return [$scheme, $ip];
             }
         }
 
-        return [$scheme, '127.0.0.1'];
+        // 实在拿不到，返回监听地址提示用户自查
+        return [$scheme, '0.0.0.0'];
+    }
+
+    private function isLoopbackIp(string $ip): bool
+    {
+        return $ip === '127.0.0.1'
+            || str_starts_with($ip, '127.');
     }
 
     private function nowString(): string
