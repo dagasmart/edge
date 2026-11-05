@@ -128,7 +128,7 @@ class EdgeInsertRedisDimCommand extends Command
             $this->exporter->set('edge_qps', $this->calculateQps());
             $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && ! $this->stopping ? 1 : 0);
 
-            return $this->exporter->getMetrics();
+            return $this->exporter;
         });
 
         $this->info(sprintf('[metrics] Prometheus 监听 %s:%d', $metricsHost, $metricsPort));

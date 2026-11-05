@@ -18,9 +18,17 @@ use Throwable;
 class PrometheusExporter
 {
     /** @var array<string, mixed> */
-    protected array $metrics = [];
+    public array $metrics = [] {
+        get {
+            return $this->metrics;
+        }
+    }
 
-    protected bool $running = false;
+    protected bool $running = false {
+        get {
+            return $this->running;
+        }
+    }
 
     /** @var resource|null */
     protected $server;
@@ -120,15 +128,10 @@ class PrometheusExporter
     }
 
     /**
-     * 获取当前指标快照（供外部使用）
-     */
-    public function getMetrics(): array
-    {
-        return $this->metrics;
-    }
-
-    /**
      * 构建 Prometheus 文本格式
+     *
+     * @param array $metrics
+     * @return string
      */
     public static function buildMetrics(array $metrics): string
     {
@@ -162,6 +165,7 @@ class PrometheusExporter
                 'value' => $info['value'],
             ];
         }
+
         return $result;
     }
 
@@ -178,6 +182,7 @@ class PrometheusExporter
         if (preg_match('#^\w+\s+(/[^?\s]*)#', $line, $matches)) {
             return $matches[1];
         }
+
         return '/';
     }
 
@@ -194,7 +199,7 @@ class PrometheusExporter
         ?callable $metricsProvider = null
     ): mixed {
         $this->running = true;
-        $provider = $metricsProvider ?? fn (): array => $this->getMetrics();
+        $provider = $metricsProvider ?? fn (): array => $this->metrics;
 
         $addr = "tcp://{$host}:{$port}";
         $socket = @stream_socket_server(
@@ -333,10 +338,5 @@ class PrometheusExporter
             }
             $this->server = null;
         }
-    }
-
-    public function isRunning(): bool
-    {
-        return $this->running;
     }
 }
