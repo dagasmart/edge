@@ -851,15 +851,9 @@ class EdgeInsertRedisDimCommand extends Command
             return [$scheme, $configured];
         }
 
-        // 2) 云元数据（带 2s 超时，卡住就跳过）
-        $meta = @file_get_contents('http://100.100.100.200/latest/meta-data/eip-addresses/', false, stream_context_create(['http' => ['timeout' => 2]]));
-        if ($meta && filter_var(trim($meta), FILTER_VALIDATE_IP)) {
-            return [$scheme, trim($meta)];
-        }
-
-        // 3) 外部回显（ifconfig.me 通、ipify 不通就靠它）
+        // 2) 外部回显（ifconfig.me 通、ipify 不通就靠它）
         foreach (['https://ifconfig.me', 'http://ipinfo.io/ip', 'http://icanhazip.com'] as $url) {
-            $ctx = stream_context_create(['http' => ['timeout' => 3]]);
+            $ctx = stream_context_create(['http' => ['timeout' => 2]]);
             $body = @file_get_contents($url, false, $ctx);
             if ($body) {
                 $ip = trim($body);
@@ -870,7 +864,7 @@ class EdgeInsertRedisDimCommand extends Command
             }
         }
 
-        // 4) 兜底内网 IP
+        // 3) 兜底内网 IP
         $lines = [];
         @exec('ip -4 addr show 2>/dev/null', $lines);
         if (array_any($lines, fn ($line) => preg_match('/^\s+inet\s+([\d.]+)/', $line, $m) && ! str_starts_with($m[1], '127.'))) {
