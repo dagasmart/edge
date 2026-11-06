@@ -19,6 +19,12 @@ class EdgeAuthSwowCommand extends Command
 
     protected bool $stopping = false;
 
+    /** @var array<int, array<int>> worker_id => 重启时间戳列表 */
+    protected array $restartLog = [];
+
+    /** 上次 SIGHUP 处理时间，用于防抖 */
+    protected float $lastHupTime = 0.0;
+
     public function handle(): int
     {
         if (! extension_loaded('swow')) {
@@ -88,6 +94,9 @@ class EdgeAuthSwowCommand extends Command
         $this->info("Port: {$port} | Workers: {$workers} | Mode: REUSEPORT fork");
         $this->info("Server file: {$serverFile}");
 
+        // 先忽略 SIGHUP，避免窗口期内被误杀
+        pcntl_signal(SIGHUP, SIG_IGN);
+
         pcntl_async_signals(true);
 
         pcntl_signal(SIGTERM, function (): void {
@@ -98,7 +107,13 @@ class EdgeAuthSwowCommand extends Command
             $this->stopAllChildren('SIGINT');
         });
 
+        // SIGHUP 防抖 + 只 reload，不做退出
         pcntl_signal(SIGHUP, function (): void {
+            $now = microtime(true);
+            if ($now - $this->lastHupTime < 2.0) {
+                return;
+            }
+            $this->lastHupTime = $now;
             $this->info('SIGHUP received, reloading workers...');
             $this->stopAllChildren('SIGHUP', true);
         });
@@ -110,7 +125,11 @@ class EdgeAuthSwowCommand extends Command
 
         $this->info("All {$workers} workers forked. Parent pid=" . getmypid());
 
+        // 父进程永久阻塞循环
         while ($this->children !== []) {
+            // 确保信号处理器能及时触发
+            pcntl_signal_dispatch();
+
             $pid = pcntl_waitpid(-1, $status, WNOHANG);
 
             if ($pid > 0) {
@@ -153,13 +172,18 @@ class EdgeAuthSwowCommand extends Command
         }
 
         if ($pid === 0) {
+            // 子进程：重置信号处理器（继承的闭包 $this 可能已失效）
+            pcntl_signal(SIGTERM, SIG_DFL);
+            pcntl_signal(SIGINT, SIG_DFL);
+            pcntl_signal(SIGHUP, SIG_DFL);
+
             cli_set_process_title("edgeauth-worker-{$workerId}");
 
             if (function_exists('pcntl_async_signals')) {
                 pcntl_async_signals(true);
             }
 
-            // ★ 解除 Swow 继承的信号屏蔽，让 posix_kill 的 SIGTERM 能到达子进程
+            // 解除 Swow 继承的信号屏蔽，让 posix_kill 的 SIGTERM 能到达子进程
             if (function_exists('pcntl_sigprocmask')) {
                 pcntl_sigprocmask(SIG_UNBLOCK, [SIGTERM, SIGINT, SIGHUP]);
             }
@@ -188,6 +212,13 @@ class EdgeAuthSwowCommand extends Command
 
     protected function stopAllChildren(string $signalName, bool $reload = false): void
     {
+        // 防止重入
+        static $inProgress = false;
+        if ($inProgress) {
+            return;
+        }
+        $inProgress = true;
+
         $this->stopping = true;
         $this->info("{$signalName} received, stopping all workers...");
 
@@ -196,7 +227,7 @@ class EdgeAuthSwowCommand extends Command
             posix_kill($pid, SIGTERM);
         }
 
-        // 3 秒足够：accept 超时 1s + 清理协程
+        // 3 秒优雅退出窗口
         $deadline = time() + 3;
         while ($this->children !== [] && time() < $deadline) {
             $pid = pcntl_waitpid(-1, $status, WNOHANG);
@@ -208,6 +239,7 @@ class EdgeAuthSwowCommand extends Command
             usleep(100000);
         }
 
+        // 强杀剩余
         foreach ($this->children as $pid => $workerId) {
             $this->warn("Worker {$workerId} (pid={$pid}) did not exit in time, sending SIGKILL");
             posix_kill($pid, SIGKILL);
@@ -222,17 +254,18 @@ class EdgeAuthSwowCommand extends Command
             }
         }
 
-        $this->stopping = false;
+        $inProgress = false;
 
         if ($reload) {
+            // reload 完成，重置状态让主循环继续
+            $this->stopping = false;
             $this->info('Reload complete. Workers will be respawned by main loop.');
-        } else {
-            $this->info('All workers stopped. Parent exiting.');
-            exit(0);
+            return;
         }
-    }
 
-    protected array $restartLog = [];
+        $this->info('All workers stopped. Parent exiting.');
+        exit(0);
+    }
 
     protected function shouldRestart(int $workerId): bool
     {
