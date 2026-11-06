@@ -7,6 +7,17 @@ return [
         'channel_size' => 4096,       // Channel 队列容量（普通 Channel）
         'max_payload_len' => 65536,   // 单条 payload 上限（64KB）
 
+        /* Worker 池 */
+        'normal_workers' => 4,
+        'high_workers' => 2,
+        'dead_workers' => 1,
+        'worker_idle_timeout' => 5,
+
+        // 死信 Channel（可选，有就启用）
+        'dead_channel_size' => 1024,
+        'dead_batch_size' => 50,
+        'dead_flush_interval_ms' => 1000,
+
         // 多主题订阅：数组 / 逗号分隔字符串 / 单字符串，支持 +/# 通配符
         'topics' => [
             'heartbeat/response', // MQTT 心跳 topic
@@ -30,6 +41,12 @@ return [
         'adapt_min_batch' => 10,
         'adapt_max_batch' => 2000,
         'adapt_alpha' => 0.3,         // EMA 平滑系数，越大对瞬时流量越敏感
+
+        /* ========== Prometheus 观测 ========== */
+        'stats_interval_sec' => 5,    // 内存指标刷新间隔
+        'histogram_buckets' => [      // 耗时/大小分布桶（毫秒 / 条）
+            1, 5, 10, 25, 50, 100, 200, 500, 1000, 2000, 5000,
+        ],
     ],
 
     // redis落盘
@@ -40,6 +57,19 @@ return [
         'stream_high' => 'stream:device:high',
         'stream_data' => 'stream:device:data',
         'stream_dead' => 'stream:device:dead',
+
+        'stream_max_len' => 10000,   // 每个 stream key 近似裁剪保留条数
+
+        /* ========== 死信消费端（可选） ========== */
+        'dead_letter' => [
+            'enabled' => true,
+            'group' => 'edge-consumer',
+            'consumer' => 'worker-1',    // 多实例部署需唯一
+            'batch_size' => 100,         // 单次 XREADGROUP 条数
+            'block_ms' => 2000,          // 阻塞等待毫秒
+            'claim_idle_ms' => 30000,    // 超过此时间未 ACK 视为 pending
+            'retry_limit' => 3,          // 单条最大重试次数
+        ],
     ],
 
     // 指标追踪
@@ -48,5 +78,7 @@ return [
         'scheme' => 'http',
         'host' => '0.0.0.0',
         'port' => 9090,
+        'path' => '/metrics',           // Prometheus scrape 路径
+        'instance' => '',               // 留空自动取 hostname:pid
     ],
 ];
