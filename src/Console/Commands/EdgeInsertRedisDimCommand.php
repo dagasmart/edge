@@ -167,7 +167,7 @@ class EdgeInsertRedisDimCommand extends Command
         [$scheme, $serverIp] = $this->getServerIp();
 
         $this->info(sprintf('[metrics] Prometheus 监听 %s:%d', $metricsHost, $metricsPort));
-        $this->info(sprintf('[metrics] Prometheus 本地 %s://%s:%d', $scheme, $metricsHost, $metricsPort));
+        $this->info(sprintf('[metrics] Prometheus 本地 %s://%s:%d', $scheme, $serverIp, $metricsPort));
         echo "[metrics] Prometheus 预览 {$scheme}://{$serverIp}:{$metricsPort}/metrics\n";
         echo "[metrics] Prometheus 接口 {$scheme}://{$serverIp}:{$metricsPort}/api/metrics\n";
 
@@ -176,106 +176,125 @@ class EdgeInsertRedisDimCommand extends Command
         $this->startHighWorkerPool();
         $this->startDeadLetterWorkerPool();
 
+        // 启动期探针：失败直接终止，避免订阅后才发现连不上
+        $this->probeMqttConnectivity();
+
+        // 运行期定时探针：后台协程，失败告警不退出
+        $this->startPeriodicMqttProbe();
+
         $topics = $this->resolveTopics();
-        $this->mqtt = new NanoMQ;
 
-        try {
-            $this->info('=====================================');
-            $this->info(sprintf('MQTT 订阅已启动 | %s', $this->nowString()));
-            $this->info('订阅主题：'.implode(', ', $topics));
-            $this->info(sprintf(
-                '普通：batch=%d interval=%dms channel=%d workers=%d',
-                $this->normalBatchSize,
-                $this->normalFlushIntervalMs,
-                $this->normalChannel->getCapacity(),
-                $this->normalWorkers,
-            ));
-            $this->info(sprintf(
-                '高优：batch=%d interval=%dms channel=%d workers=%d',
-                $this->highBatchSize,
-                $this->highFlushIntervalMs,
-                $this->highChannel->getCapacity(),
-                $this->highWorkers,
-            ));
-            $this->info(sprintf(
-                '死信：batch=%d interval=%dms channel=%d workers=%d',
-                $this->deadBatchSize,
-                $this->deadFlushIntervalMs,
-                $this->deadChannel->getCapacity(),
-                $this->deadWorkers,
-            ));
-            $this->info('按 Ctrl+C 停止');
-            $this->info('=====================================');
+        // MQTT 连接 + 自动重连循环
+        while (! $this->stopping) {
+            try {
+                $this->mqtt = new NanoMQ;
 
-            $handler = function (string $topic, string $message): void {
-                if ($this->stopping) {
-                    return;
-                }
-
-                $payloadLen = strlen($message);
-                if ($payloadLen > $this->maxPayloadLen) {
-                    $this->warn(sprintf(
-                        '[DROP] payload 超过限制 %d > %d，丢弃',
-                        $payloadLen,
-                        $this->maxPayloadLen,
-                    ));
-                    $this->droppedCount++;
-                    $this->exporter->inc('edge_redis_write_failed_total');
-
-                    return;
-                }
-
-                fwrite(STDERR, sprintf(
-                    "[RECV] topic=%s len=%d\n",
-                    $topic,
-                    $payloadLen,
+                $this->info('=====================================');
+                $this->info(sprintf('MQTT 订阅已启动 | %s', $this->nowString()));
+                $this->info('订阅主题：'.implode(', ', $topics));
+                $this->info(sprintf(
+                    '普通：batch=%d interval=%dms channel=%d workers=%d',
+                    $this->normalBatchSize,
+                    $this->normalFlushIntervalMs,
+                    $this->normalChannel->getCapacity(),
+                    $this->normalWorkers,
                 ));
+                $this->info(sprintf(
+                    '高优：batch=%d interval=%dms channel=%d workers=%d',
+                    $this->highBatchSize,
+                    $this->highFlushIntervalMs,
+                    $this->highChannel->getCapacity(),
+                    $this->highWorkers,
+                ));
+                $this->info(sprintf(
+                    '死信：batch=%d interval=%dms channel=%d workers=%d',
+                    $this->deadBatchSize,
+                    $this->deadFlushIntervalMs,
+                    $this->deadChannel->getCapacity(),
+                    $this->deadWorkers,
+                ));
+                $this->info('按 Ctrl+C 停止');
+                $this->info('=====================================');
 
-                $device = 'unknown';
-                try {
-                    $data = json_decode($message, false, 512, JSON_THROW_ON_ERROR);
-                    if (isset($data->sn)) {
-                        $device = strtoupper((string) $data->sn);
+                $handler = function (string $topic, string $message): void {
+                    if ($this->stopping) {
+                        return;
                     }
-                } catch (Throwable) {
-                    // 非法 payload 仍写入，由下游处理
+
+                    $payloadLen = strlen($message);
+                    if ($payloadLen > $this->maxPayloadLen) {
+                        $this->warn(sprintf(
+                            '[DROP] payload 超过限制 %d > %d，丢弃',
+                            $payloadLen,
+                            $this->maxPayloadLen,
+                        ));
+                        $this->droppedCount++;
+                        $this->exporter->inc('edge_redis_write_failed_total');
+
+                        return;
+                    }
+
+                    fwrite(STDERR, sprintf(
+                        "[RECV] topic=%s len=%d\n",
+                        $topic,
+                        $payloadLen,
+                    ));
+
+                    $device = 'unknown';
+                    try {
+                        $data = json_decode($message, false, 512, JSON_THROW_ON_ERROR);
+                        if (isset($data->sn)) {
+                            $device = strtoupper((string) $data->sn);
+                        }
+                    } catch (Throwable) {
+                        // 非法 payload 仍写入，由下游处理
+                    }
+
+                    $this->line(sprintf(
+                        '[MQTT] topic=%s device=%s payload_len=%d',
+                        $topic,
+                        $device,
+                        $payloadLen,
+                    ));
+
+                    $item = [
+                        'topic' => $topic,
+                        'payload' => $message,
+                        'device' => $device,
+                        'ts' => sprintf('%.3f', microtime(true)),
+                        '_enqueued_at' => microtime(true),
+                    ];
+
+                    $this->exporter->inc('edge_received_total');
+
+                    if ($this->router->isHighPriority($topic)) {
+                        $this->routeToHighChannel($item, $device);
+                    } else {
+                        $this->routeToNormalChannel($item, $device);
+                    }
+                };
+
+                foreach ($topics as $topic) {
+                    $this->mqtt->subscribe($topic, $handler);
                 }
 
-                $this->line(sprintf(
-                    '[MQTT] topic=%s device=%s payload_len=%d',
-                    $topic,
-                    $device,
-                    $payloadLen,
-                ));
+                $this->mqtt->wait();
 
-                $item = [
-                    'topic' => $topic,
-                    'payload' => $message,
-                    'device' => $device,
-                    'ts' => sprintf('%.3f', microtime(true)),
-                    '_enqueued_at' => microtime(true),
-                ];
-
-                $this->exporter->inc('edge_received_total');
-
-                if ($this->router->isHighPriority($topic)) {
-                    $this->routeToHighChannel($item, $device);
-                } else {
-                    $this->routeToNormalChannel($item, $device);
+                if ($this->stopping) {
+                    break;
                 }
-            };
 
-            foreach ($topics as $topic) {
-                $this->mqtt->subscribe($topic, $handler);
+                $this->warn('[mqtt] 连接断开，3 秒后重连...');
+                sleep(3);
+
+            } catch (Throwable $e) {
+                if ($this->stopping) {
+                    break;
+                }
+
+                $this->error('[mqtt] 连接异常：'.$e->getMessage().'，3 秒后重连...');
+                sleep(3);
             }
-
-            $this->mqtt->wait();
-
-            $this->info('[mqtt] 订阅协程已退出');
-        } catch (Throwable $e) {
-            $this->error('[FATAL] '.$e->getMessage());
-
-            return 1;
         }
 
         $this->printStats();
@@ -283,6 +302,254 @@ class EdgeInsertRedisDimCommand extends Command
         $this->info('[edge:insert-redis] 已停止');
 
         return 0;
+    }
+
+    /* ==================== MQTT 连通性探针 ==================== */
+
+    /**
+     * 启动期 TCP/TLS 连通探测，支持重试与可配置超时
+     * 失败抛 RuntimeException，进程终止
+     */
+    private function probeMqttConnectivity(): void
+    {
+        $maxRetries = max(0, $this->configInt('edge.mqtt.probe_retries', 2));
+        $maxAttempts = $maxRetries + 1;
+
+        $lastError = '';
+        $attempts = 0;
+
+        while ($attempts < $maxAttempts) {
+            $attempts++;
+            $result = $this->probeOnce($attempts, $maxAttempts);
+
+            if ($result['ok']) {
+                $this->info(sprintf(
+                    '[mqtt-probe] %s 可达（%.2fms）',
+                    $result['target'],
+                    $result['elapsed_ms'],
+                ));
+
+                return;
+            }
+
+            $lastError = $result['error'];
+            $this->warn(sprintf(
+                '[mqtt-probe] 第 %d 次探测失败（%.2fms）：%s',
+                $attempts,
+                $result['elapsed_ms'],
+                $lastError,
+            ));
+
+            if ($attempts < $maxAttempts) {
+                usleep(200_000); // 200ms，避免瞬时重试风暴
+            }
+        }
+
+        throw new \RuntimeException(sprintf(
+            '[mqtt-probe] MQTT 连通性探测失败，已重试 %d 次：%s，进程终止',
+            $maxRetries,
+            $lastError,
+        ));
+    }
+
+    /**
+     * 启动后台定时探针协程
+     * - 连续失败达到阈值：告警 + 指标
+     * - 恢复成功：通知
+     * - 不抛异常、不退出进程
+     */
+    private function startPeriodicMqttProbe(): void
+    {
+        $interval = $this->configInt('edge.mqtt.probe_interval_sec', 30);
+        if ($interval <= 0) {
+            $this->info('[mqtt-probe:periodic] 已禁用（probe_interval_sec <= 0）');
+
+            return;
+        }
+
+        $threshold = max(1, $this->configInt('edge.mqtt.probe_failure_threshold', 3));
+        $consecutiveFailures = 0;
+        $wasFailing = false;
+
+        Coroutine::run(function () use ($interval, $threshold, &$consecutiveFailures, &$wasFailing): void {
+            while (! $this->stopping) {
+                // 分段 sleep，及时响应停机信号
+                $deadline = time() + $interval;
+                while (time() < $deadline && ! $this->stopping) {
+                    usleep(500_000); // 500ms
+                }
+
+                if ($this->stopping) {
+                    break;
+                }
+
+                $result = $this->probeOnce();
+
+                if ($result['ok']) {
+                    if ($wasFailing) {
+                        $this->info(sprintf(
+                            '[mqtt-probe:periodic] 恢复，%s 可达（%.2fms）',
+                            $result['target'],
+                            $result['elapsed_ms'],
+                        ));
+                        $wasFailing = false;
+                    }
+
+                    $consecutiveFailures = 0;
+                    $this->exporter->set('edge_mqtt_probe_consecutive_failures', 0);
+
+                    continue;
+                }
+
+                $consecutiveFailures++;
+                $this->exporter->set('edge_mqtt_probe_consecutive_failures', $consecutiveFailures);
+
+                $this->warn(sprintf(
+                    '[mqtt-probe:periodic] 第 %d 次失败（%.2fms）：%s',
+                    $consecutiveFailures,
+                    $result['elapsed_ms'],
+                    $result['error'],
+                ));
+
+                if ($consecutiveFailures >= $threshold && ! $wasFailing) {
+                    $this->error(sprintf(
+                        '[mqtt-probe:periodic] 连续失败 %d 次，MQTT 可能不可达（阈值=%d）',
+                        $consecutiveFailures,
+                        $threshold,
+                    ));
+                    $wasFailing = true;
+                }
+            }
+        });
+
+        $this->info(sprintf(
+            '[mqtt-probe:periodic] 已启动，间隔 %ds，失败阈值 %d 次',
+            $interval,
+            $threshold,
+        ));
+    }
+
+    /**
+     * 执行单次 TCP/TLS 探测
+     *
+     * @return array{ok: bool, target: string, elapsed_ms: float, error: string}
+     */
+    private function probeOnce(int $attempt = 0, int $maxAttempts = 0): array
+    {
+        $host = config('edge.mqtt.host', '127.0.0.1');
+        $port = $this->configInt('edge.mqtt.port', 1883);
+        $timeout = (float) config('edge.mqtt.probe_timeout', 3.0);
+
+        $tlsEnabled = (bool) config('edge.mqtt.tls.enable', false);
+        $scheme = $tlsEnabled ? 'tls' : 'tcp';
+        $target = sprintf('%s://%s:%d', $scheme, $host, $port);
+
+        $context = $this->buildTlsContext();
+
+        $errno = 0;
+        $errstr = '';
+        $start = microtime(true);
+
+        if ($attempt > 0 && $maxAttempts > 0) {
+            $this->info(sprintf(
+                '[mqtt-probe] 探测 %s（第 %d/%d 次，超时 %.1fs）...',
+                $target,
+                $attempt,
+                $maxAttempts,
+                $timeout,
+            ));
+        }
+
+        // fsockopen 不支持 $context 参数，Windows 下会直接抛 ArgumentCountError
+        // 统一用 stream_socket_client，跨平台一致
+        $timeoutInt = (int) ceil($timeout);
+        $socket = @stream_socket_client(
+            $target,
+            $errno,
+            $errstr,
+            $timeoutInt > 0 ? $timeoutInt : null,
+            STREAM_CLIENT_CONNECT,
+            $context,
+        );
+
+        $elapsedMs = (microtime(true) - $start) * 1000;
+
+        if ($socket !== false) {
+            try {
+                fclose($socket);
+            } catch (Throwable) {
+                // ignore
+            }
+
+            return [
+                'ok' => true,
+                'target' => $target,
+                'elapsed_ms' => $elapsedMs,
+                'error' => '',
+            ];
+        }
+
+        $error = trim(sprintf('errno=%d errstr=%s', $errno, $errstr ?: 'unknown'));
+        $this->exporter->inc('edge_mqtt_probe_failed_total');
+
+        return [
+            'ok' => false,
+            'target' => $target,
+            'elapsed_ms' => $elapsedMs,
+            'error' => $error,
+        ];
+    }
+
+    /**
+     * 构建 TLS 流上下文
+     */
+    private function buildTlsContext(): mixed
+    {
+        $tlsEnabled = (bool) config('edge.mqtt.tls.enable', false);
+
+        if (! $tlsEnabled) {
+            return stream_context_create([]);
+        }
+
+        $options = [
+            'ssl' => [
+                'verify_peer' => (bool) config('edge.mqtt.tls.verify_peer', false),
+                'verify_peer_name' => (bool) config('edge.mqtt.tls.verify_peer_name', true),
+                'allow_self_signed' => (bool) config('edge.mqtt.tls.allow_self_signed', false),
+            ],
+        ];
+
+        $cafile = config('edge.mqtt.tls.cafile');
+        if (is_string($cafile) && $cafile !== '') {
+            $options['ssl']['cafile'] = $cafile;
+        }
+
+        $capath = config('edge.mqtt.tls.capath');
+        if (is_string($capath) && $capath !== '') {
+            $options['ssl']['capath'] = $capath;
+        }
+
+        $certfile = config('edge.mqtt.tls.certfile');
+        if (is_string($certfile) && $certfile !== '') {
+            $options['ssl']['local_cert'] = $certfile;
+        }
+
+        $keyfile = config('edge.mqtt.tls.keyfile');
+        if (is_string($keyfile) && $keyfile !== '') {
+            $options['ssl']['local_pk'] = $keyfile;
+        }
+
+        $passphrase = config('edge.mqtt.tls.passphrase');
+        if (is_string($passphrase) && $passphrase !== '') {
+            $options['ssl']['passphrase'] = $passphrase;
+        }
+
+        $alpn = config('edge.mqtt.tls.alpn');
+        if (is_string($alpn) && $alpn !== '') {
+            $options['ssl']['alpn_protocols'] = $alpn;
+        }
+
+        return stream_context_create($options);
     }
 
     /* ==================== 配置 & 初始化 ==================== */
@@ -763,6 +1030,9 @@ class EdgeInsertRedisDimCommand extends Command
             $this->normalFlushLatencySum += $elapsedMs;
             $this->normalFlushTimes++;
 
+            // 记录 flush 耗时分布（直方图）
+            $this->exporter->observe('edge_flush_duration_ms_normal', $elapsedMs);
+
             $this->line(sprintf(
                 '[FLUSH] batch=%d → %s (%.2fms)',
                 $count,
@@ -778,9 +1048,8 @@ class EdgeInsertRedisDimCommand extends Command
 
             $this->exporter->inc('edge_redis_write_failed_total', $count);
             $this->pushDeadLetter($batch, $e->getMessage());
-        } finally {
-            $this->activeNormalWorkers = max(0, $this->activeNormalWorkers - $count);
         }
+        // activeNormalWorkers 由 Worker 生命周期管理，finally 不再递减
     }
 
     private function flushHighBatch(array $batch): void
@@ -839,6 +1108,9 @@ class EdgeInsertRedisDimCommand extends Command
             $this->highFlushLatencySum += $elapsedMs;
             $this->highFlushTimes++;
 
+            // 记录 flush 耗时分布（直方图）
+            $this->exporter->observe('edge_flush_duration_ms_high', $elapsedMs);
+
             $this->line(sprintf(
                 '[FLUSH:HIGH] batch=%d → %s (%.2fms)',
                 $count,
@@ -854,9 +1126,8 @@ class EdgeInsertRedisDimCommand extends Command
 
             $this->exporter->inc('edge_redis_write_failed_total', $count);
             $this->pushDeadLetter($batch, $e->getMessage());
-        } finally {
-            $this->activeHighWorkers = max(0, $this->activeHighWorkers - $count);
         }
+        // activeHighWorkers 由 Worker 生命周期管理，finally 不再递减
     }
 
     private function flushDeadLetterBatch(array $batch): void
@@ -909,6 +1180,9 @@ class EdgeInsertRedisDimCommand extends Command
             $this->deadFlushLatencySum += $elapsedMs;
             $this->deadFlushTimes++;
 
+            // 记录 flush 耗时分布（直方图）
+            $this->exporter->observe('edge_flush_duration_ms_dead', $elapsedMs);
+
             $this->warn(sprintf(
                 '[DEAD] batch=%d → %s (%.2fms)',
                 $count,
@@ -921,9 +1195,8 @@ class EdgeInsertRedisDimCommand extends Command
                 $count,
                 $e->getMessage(),
             ));
-        } finally {
-            $this->activeDeadWorkers = max(0, $this->activeDeadWorkers - $count);
         }
+        // activeDeadWorkers 由 Worker 生命周期管理，finally 不再递减
     }
 
     /* ==================== Prometheus 指标 ==================== */
@@ -968,6 +1241,11 @@ class EdgeInsertRedisDimCommand extends Command
         $this->exporter->set('edge_queue_backlog', $this->getBacklog());
         $this->exporter->set('edge_qps', $this->calculateQps());
         $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && ! $this->stopping ? 1 : 0);
+
+        // 直方图占位：让 Prometheus 发现指标名，实际分布数据来自 $exporter->histograms
+        $this->exporter->set('edge_flush_duration_ms_normal', 0);
+        $this->exporter->set('edge_flush_duration_ms_high', 0);
+        $this->exporter->set('edge_flush_duration_ms_dead', 0);
     }
 
     /* ==================== Redis 连接池 ==================== */
@@ -1109,6 +1387,23 @@ class EdgeInsertRedisDimCommand extends Command
             return [$scheme, $configured];
         }
 
+        // Windows：用 ipconfig 取 IPv4
+        if (PHP_OS_FAMILY === 'Windows') {
+            $lines = [];
+            @exec('ipconfig', $lines);
+            foreach ($lines as $line) {
+                if (preg_match('/IPv4 Address[.\s]*:\s*([\d.]+)/', $line, $m)) {
+                    $ip = $m[1];
+                    if (! str_starts_with($ip, '127.')) {
+                        return [$scheme, $ip];
+                    }
+                }
+            }
+
+            return [$scheme, '127.0.0.1'];
+        }
+
+        // Linux：外网 IP
         foreach (['https://ifconfig.me', 'http://ipinfo.io/ip', 'http://icanhazip.com'] as $url) {
             $ctx = stream_context_create(['http' => ['timeout' => 2]]);
             $body = @file_get_contents($url, false, $ctx);
@@ -1123,11 +1418,13 @@ class EdgeInsertRedisDimCommand extends Command
 
         $lines = [];
         @exec('ip -4 addr show 2>/dev/null', $lines);
-        if (array_any($lines, fn ($line) => preg_match('/^\s+inet\s+([\d.]+)/', $line, $m) && ! str_starts_with($m[1], '127.'))) {
-            return [$scheme, $m[1]];
+        foreach ($lines as $line) {
+            if (preg_match('/^\s+inet\s+([\d.]+)/', $line, $m) && ! str_starts_with($m[1], '127.')) {
+                return [$scheme, $m[1]];
+            }
         }
 
-        return [$scheme, '0.0.0.0'];
+        return [$scheme, '127.0.0.1'];
     }
 
     private function nowString(): string

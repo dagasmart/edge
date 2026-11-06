@@ -2,6 +2,12 @@
 
 return [
     'mqtt' => [
+        'host' => '1.15.51.149',
+        'port' => 21883,
+        'timeout' => 3,
+        'tls' => [
+            'enable' => false,
+        ],
         'batch_size' => 200,           // 批量写入大小（普通 Channel 初始 batch）
         'flush_interval_ms' => 100,   // 最大刷盘间隔（毫秒）
         'channel_size' => 4096,       // Channel 队列容量（普通 Channel）

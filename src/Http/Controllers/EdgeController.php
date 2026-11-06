@@ -3,6 +3,7 @@ declare(strict_types=1);
 namespace DagaSmart\Edge\Http\Controllers;
 
 use DagaSmart\Edge\Services\EdgeService;
+use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 class EdgeController extends AdminController
@@ -93,4 +94,51 @@ class EdgeController extends AdminController
 
         return response()->json(['result' => 'deley'], 300);
     }
+
+    /**
+     * EdgeAuth Redis miss 回源接口
+     *
+     * 由 Swow 端 getDeviceSecret() 在 Redis 双 miss 时调用。
+     * 从 PG 加载 bcrypt 密码哈希和 HMAC secret，返回 JSON。
+     *
+     * 安全：由 EdgeInternalMiddleware 校验 X-Edge-Internal 头
+     */
+    public function authFallback(Request $request): JsonResponse
+    {
+        $clientId = $request->query('client_id', '');
+        $username = $request->query('username', '');
+        $service = $request->query('service', 'nano');
+
+        if ($clientId === '' || $username === '') {
+            return response()->json([
+                'error' => 'missing_params',
+                'message' => 'client_id and username are required',
+            ], 400);
+        }
+
+        // 参数长度防护（与 DB 字段长度匹配）
+        if (strlen($clientId) > 128 || strlen($username) > 64) {
+            return response()->json([
+                'error' => 'invalid_params',
+            ], 400);
+        }
+
+        /** @var EdgeAuthorizeService $service */
+        $svc = app(EdgeAuthorizeService::class);
+        $result = $svc->loadSecretFromPg($clientId, $username, $service);
+
+        if ($result === null) {
+            return response()->json([
+                'error' => 'not_found',
+            ], 404);
+        }
+
+        return response()->json([
+            'password' => $result['password'],
+            'secret' => $result['secret'],
+        ]);
+    }
+
+
+
 }

@@ -9,22 +9,13 @@ use Swow\Psr7\Server\ServerConnection;
 /* =========================================================
  * EdgeAuth HTTP 路由处理 - 对齐 NanoMQ auth.http
  * 认证方式：username + password（bcrypt）
- * 密钥来源：Redis device:secret:{username}
- * HMAC / 单点登录 / 重放检测保留代码，不参与主认证路径
  * ========================================================= */
 
-/**
- * amis 兼容响应封装
- *
- * - 顶层 result：NanoMQ/EMQX HTTP 认证契约
- * - data.result：amis 管理端兼容
- */
 function authRespond(ServerConnection $conn, bool $allow, string $reason, int $httpStatus = 0): void
 {
-    // NanoMQ 老版本：只看状态码
     $status = $httpStatus !== 0
         ? $httpStatus
-        : ($allow ? 200 : 403); // 失败必须非 200
+        : ($allow ? 200 : 403);
 
     respondJson($conn, [
         'result'  => $allow ? 'allow' : 'deny',
@@ -40,23 +31,159 @@ function authRespond(ServerConnection $conn, bool $allow, string $reason, int $h
 /**
  * 获取设备密钥
  *
- * ★ 对齐 Laravel EdgeAuthorizeService::syncRedisOnSave 写入格式
- * key 格式：device:secret:{client_id}:{username}
+ * ★ 所有 Redis 操作显式按 key 路由，确保分片模式下落到正确 shard
  */
 function getDeviceSecret(string $clientId, string $username): ?string
 {
-    // 优先完整格式（与 Laravel 写入侧一致）
+    // 1. 优先完整格式
     $key = 'device:secret:' . $clientId . ':' . $username;
-    $val = redisGet($key);
+    $val = withRedisForKey($key, static function (Redis $conn) use ($key): mixed {
+        $v = $conn->get($key);
+        return $v !== false ? (string) $v : null;
+    });
     if ($val !== null && $val !== '') {
         return $val;
     }
 
-    // 兜底：兼容旧格式 device:secret:{username}
+    // 2. 兜底：兼容旧格式 device:secret:{username}
     $legacyKey = 'device:secret:' . $username;
-    $val = redisGet($legacyKey);
+    $val = withRedisForKey($legacyKey, static function (Redis $conn) use ($legacyKey): mixed {
+        $v = $conn->get($legacyKey);
+        return $v !== false ? (string) $v : null;
+    });
+    if ($val !== null && $val !== '') {
+        // 回填完整格式，下次直接命中
+        try {
+            withRedisForKey($key, static function (Redis $conn) use ($key, $val): void {
+                $conn->setex($key, 300, $val);
+            });
+        } catch (Throwable) {
+            // 回填失败不影响本次认证
+        }
+        return $val;
+    }
 
-    return ($val !== null && $val !== '') ? $val : null;
+    // 3. Redis 双 miss → 回源 PG
+    $secret = fallbackToPg($clientId, $username);
+    if ($secret !== null) {
+        try {
+            withRedisForKey($key, static function (Redis $conn) use ($key, $secret): void {
+                $conn->setex($key, 300, $secret);
+            });
+            withRedisForKey($legacyKey, static function (Redis $conn) use ($legacyKey, $secret): void {
+                $conn->setex($legacyKey, 300, $secret);
+            });
+        } catch (Throwable) {
+            // 回填失败不影响本次认证
+        }
+        return $secret;
+    }
+
+    return null;
+}
+
+function fallbackToPg(string $clientId, string $username): ?string
+{
+    $baseUrl = authFallbackUrl();
+    if ($baseUrl === '') {
+        debugLog('fallbackToPg: EDGE_AUTH_FALLBACK_URL not configured');
+        return null;
+    }
+
+    $token = (string) getenv('EDGE_INTERNAL_TOKEN');
+    if ($token === '') {
+        debugLog('fallbackToPg: EDGE_INTERNAL_TOKEN not configured');
+        return null;
+    }
+
+    $url = rtrim($baseUrl, '/')
+        . '/extension/edge/auth/fallback'
+        . '?client_id=' . rawurlencode($clientId)
+        . '&username=' . rawurlencode($username)
+        . '&service=nano';
+
+    try {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 2,
+            CURLOPT_CONNECTTIMEOUT => 1,
+            CURLOPT_HTTPHEADER => [
+                'X-Edge-Internal: ' . $token,
+                'Accept: application/json',
+            ],
+        ]);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+
+        if ($error !== '') {
+            fwrite(STDERR, '[fallbackToPg] curl error: ' . $error . PHP_EOL);
+            return null;
+        }
+
+        if ($httpCode !== 200 || ! is_string($response) || $response === '') {
+            debugLog(sprintf(
+                'fallbackToPg: upstream returned %d for client=%s user=%s',
+                $httpCode,
+                $clientId,
+                $username
+            ));
+            return null;
+        }
+
+        $data = json_decode($response, true, 512, JSON_THROW_ON_ERROR);
+        if (! is_array($data) || ! isset($data['password'])) {
+            return null;
+        }
+
+        return (string) $data['password'];
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[fallbackToPg] ' . $e->getMessage() . PHP_EOL);
+        return null;
+    }
+}
+
+function authFallbackUrl(): string
+{
+    $url = (string) getenv('EDGE_AUTH_FALLBACK_URL');
+    if ($url !== '') {
+        return $url;
+    }
+
+    $prefix = defined('AUTH_HTTP_PREFIX') ? AUTH_HTTP_PREFIX : '';
+    if ($prefix === '') {
+        return '';
+    }
+
+    if (preg_match('#^https?://#i', $prefix)) {
+        $parts = parse_url($prefix);
+        if (isset($parts['host'])) {
+            $host = $parts['host'];
+            $port = $parts['port'] ?? null;
+            $scheme = ($parts['scheme'] ?? 'http');
+
+            if ($port !== null) {
+                return $scheme . '://' . $host . ':' . $port;
+            }
+            return $scheme . '://' . $host;
+        }
+        return '';
+    }
+
+    $host = (string) getenv('EDGE_FALLBACK_HOST');
+    if ($host === '') {
+        $host = '127.0.0.1';
+    }
+
+    $port = (int) getenv('EDGE_FALLBACK_PORT');
+    if ($port <= 0) {
+        $port = 8000;
+    }
+
+    return 'http://' . $host . ':' . $port;
 }
 
 function authenticateDevice(string $clientId, string $username, string $password): array
@@ -66,7 +193,6 @@ function authenticateDevice(string $clientId, string $username, string $password
         return ['ok' => false, 'reason' => 'no secret'];
     }
 
-    // ★ NanoMQ 对齐：只做 bcrypt 校验，不做 rehash、不写 Redis
     if (! password_verify($password, $hash)) {
         return ['ok' => false, 'reason' => 'password mismatch'];
     }
@@ -76,6 +202,9 @@ function authenticateDevice(string $clientId, string $username, string $password
 
 /* =========================================================
  * 严格单点登录（Lua 原子，后登录 deny 不踢前）
+ *
+ * ★ 分片改造：Lua 涉及 GET/SET/DEL 多 key 原子性，
+ * 必须按 username 路由到同一个 shard，不能跨 shard。
  * ========================================================= */
 
 function acquireUserOnline(
@@ -84,8 +213,8 @@ function acquireUserOnline(
     int $ttl = 300,
     int $retryWindow = 30
 ): bool {
-    $key = 'auth:online:'.$username;
-    $retryKey = 'auth:retry:'.$username.':'.$clientId;
+    $key = 'auth:online:' . $username;
+    $retryKey = 'auth:retry:' . $username . ':' . $clientId;
 
     $script = <<<'LUA'
 local cur = redis.call('GET', KEYS[1])
@@ -112,7 +241,8 @@ return 0
 LUA;
 
     try {
-        $ret = withRedis(
+        $ret = withRedisForKey(
+            $key,
             static function (Redis $conn) use (
                 $key,
                 $retryKey,
@@ -140,7 +270,7 @@ LUA;
 
         return $ret === 1;
     } catch (Throwable $e) {
-        fwrite(STDERR, '[acquireUserOnline] '.$e->getMessage().PHP_EOL);
+        fwrite(STDERR, '[acquireUserOnline] ' . $e->getMessage() . PHP_EOL);
 
         return false;
     }
@@ -148,8 +278,8 @@ LUA;
 
 function releaseUserOnline(string $username, string $clientId): void
 {
-    $key = 'auth:online:'.$username;
-    $retryKey = 'auth:retry:'.$username.':'.$clientId;
+    $key = 'auth:online:' . $username;
+    $retryKey = 'auth:retry:' . $username . ':' . $clientId;
 
     $script = <<<'LUA'
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -160,13 +290,14 @@ return 0
 LUA;
 
     try {
-        withRedis(
+        withRedisForKey(
+            $key,
             static function (Redis $conn) use ($key, $retryKey, $clientId, $script): void {
                 $conn->eval($script, [$key, $retryKey, $clientId], 2);
             }
         );
     } catch (Throwable $e) {
-        fwrite(STDERR, '[releaseUserOnline] '.$e->getMessage().PHP_EOL);
+        fwrite(STDERR, '[releaseUserOnline] ' . $e->getMessage() . PHP_EOL);
     }
 }
 
@@ -228,7 +359,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         return;
     }
 
-    $rateKey = 'rate:'.$clientId;
+    $rateKey = 'rate:' . $clientId;
     if (rateLimited($rateKey)) {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
@@ -253,10 +384,12 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             return;
         }
 
-        resetRate($rateKey);
+        // ★ 按 clientId 路由清除 fail/block 计数
+        $failKey = 'fail:' . $clientId;
+        $blockKey = 'block:' . $clientId;
         try {
-            withRedis(static function (Redis $conn) use ($clientId): void {
-                $conn->del('fail:'.$clientId, 'block:'.$clientId);
+            withRedisForKey($failKey, static function (Redis $conn) use ($failKey, $blockKey): void {
+                $conn->del($failKey, $blockKey);
             });
         } catch (Throwable) {
         }
@@ -265,7 +398,6 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
         metricsInc('auth_ok');
         authRespond($conn, true, 'ok');
-
     } finally {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
@@ -277,7 +409,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
                 releaseUserOnline($authedUsername, $authedClientId);
             }
         } catch (Throwable $e) {
-            fwrite(STDERR, '[release-online] '.$e->getMessage().PHP_EOL);
+            fwrite(STDERR, '[release-online] ' . $e->getMessage() . PHP_EOL);
         } finally {
             EdgeAuthContext::clear();
         }

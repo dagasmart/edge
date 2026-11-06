@@ -1,26 +1,29 @@
 <?php
 
+declare(strict_types=1);
+
 namespace DagaSmart\Edge\Support;
 
 use Swow\Coroutine;
 use Throwable;
 
 /**
- * Prometheus 指标收集与 HTTP 暴露
+ * Prometheus 指标收集与 HTTP 暴露（纯内存版）
  *
- * 使用 PHP 原生 stream_socket_server 实现 HTTP 服务，
- * 规避 Swow Socket API 在各版本/平台上的差异。
+ * 指标仅存于进程内存，通过 HTTP 端点暴露：
+ * - /metrics       Prometheus 文本格式（Prometheus Server 抓取）
+ * - /api/metrics   JSON 格式（运维脚本 / 健康检查）
  *
- * 路由：
- * - /metrics       Prometheus 文本格式（text/plain; version=0.0.4）
- * - /api/metrics   JSON 接口格式（application/json）
+ * 不依赖 Redis、不依赖 Channel、不依赖额外协程。
  */
 class PrometheusExporter
 {
     /** @var array<string, mixed> */
     protected array $metrics = [];
 
-    /** @var array<string, array{sum: float, count: int, buckets: array<float, int>}> */
+    /**
+     * @var array<string, array{sum: float, count: int, buckets: array<float, int>}>
+     */
     protected array $histograms = [];
 
     protected bool $running = false;
@@ -100,7 +103,7 @@ class PrometheusExporter
                 'value' => 0,
             ],
 
-            // ============ Worker 级指标（新增） ============
+            // ============ Worker 级指标 ============
 
             // 活跃 Worker 数
             'edge_active_workers_normal' => [
@@ -169,6 +172,9 @@ class PrometheusExporter
                 'help' => '死信 Worker 已刷盘消息总数',
                 'value' => 0,
             ],
+
+            // ============ 直方图（观测值，由 observe() 写入 $histograms） ============
+            // 这里只做占位，实际数据来自 $this->histograms
         ];
 
         $this->histograms = [];
@@ -197,7 +203,7 @@ class PrometheusExporter
     /**
      * 记录直方图观测值（flush 耗时分布）
      *
-     * @param string $name  指标名，如 edge_flush_duration_ms
+     * @param string $name  指标名，如 edge_flush_duration_ms_normal
      * @param float  $value 观测值（毫秒）
      */
     public function observe(string $name, float $value): void
@@ -228,7 +234,7 @@ class PrometheusExporter
     }
 
     /**
-     * 获取当前指标快照（供外部使用）
+     * 获取当前指标快照
      */
     public function getMetrics(): array
     {
@@ -246,7 +252,7 @@ class PrometheusExporter
     }
 
     /**
-     * 构建 Prometheus 文本格式（支持 gauge/counter + histogram）
+     * 构建 Prometheus 文本格式（gauge/counter + histogram）
      */
     public static function buildMetrics(array $metrics, array $histograms = []): string
     {
@@ -271,21 +277,26 @@ class PrometheusExporter
             $buckets = $h['buckets'] ?? [];
             // 按 le 排序，+Inf 放最后
             uksort($buckets, function ($a, $b): int {
-                if (! is_numeric($a) && $a !== INF) return 0;
-                if (! is_numeric($b) && $b !== INF) return 0;
                 if ($a === INF) return 1;
                 if ($b === INF) return -1;
+                if (! is_numeric($a) || ! is_numeric($b)) return 0;
                 return $a <=> $b;
             });
 
             $cum = 0;
             foreach ($buckets as $le => $count) {
                 $cum += $count;
-                $leStr = is_infinite((float) $le) ? '+Inf' : rtrim(rtrim(sprintf('%.6F', (float) $le), '0'), '.');
+                $leStr = is_infinite((float) $le)
+                    ? '+Inf'
+                    : rtrim(rtrim(sprintf('%.6F', (float) $le), '0'), '.');
                 $lines[] = sprintf('%s_bucket{le="%s"} %d', $name, $leStr, $cum);
             }
 
-            $lines[] = sprintf('%s_sum %s', $name, rtrim(rtrim(sprintf('%.6F', $h['sum'] ?? 0.0), '0'), '.'));
+            $lines[] = sprintf(
+                '%s_sum %s',
+                $name,
+                rtrim(rtrim(sprintf('%.6F', $h['sum'] ?? 0.0), '0'), '.'),
+            );
             $lines[] = sprintf('%s_count %d', $name, $h['count'] ?? 0);
             $lines[] = '';
         }
@@ -324,16 +335,12 @@ class PrometheusExporter
         return $result;
     }
 
-    /**
-     * 从 HTTP 请求头中解析请求路径
-     */
     private static function parsePath(string $request): string
     {
         $line = strtok($request, "\r\n");
         if ($line === false) {
             return '/';
         }
-        // 匹配：GET /path HTTP/1.1
         if (preg_match('#^\w+\s+(/[^?\s]*)#', $line, $matches)) {
             return $matches[1];
         }
@@ -342,10 +349,6 @@ class PrometheusExporter
 
     /**
      * 启动 Prometheus HTTP 指标服务
-     *
-     * 路由：
-     * - /metrics      返回 Prometheus 文本格式
-     * - /api/metrics  返回 JSON 格式（供业务接口 / 前端 / 接口文档使用）
      */
     public function startMetricsServer(
         int $port = 9090,
@@ -379,10 +382,8 @@ class PrometheusExporter
             $buffers = [];
 
             while ($this->running) {
-                // ✅ 每次循环重建，避免 stream_select 污染数组（Windows 必现）
                 $read = [$socket];
                 foreach ($conns as $c) {
-                    // ✅ 过滤已关闭/无效 resource，防止 stream_select 返回 false
                     if (is_resource($c) && !feof($c)) {
                         $read[] = $c;
                     }
@@ -390,12 +391,9 @@ class PrometheusExporter
 
                 $write = null;
                 $except = null;
-
-                // ✅ 不使用 @，false 时让出 CPU 重试
                 $ready = stream_select($read, $write, $except, 1);
 
                 if ($ready === false) {
-                    // Windows/Swow 下偶发，短暂休眠避免 100% CPU
                     usleep(10000);
                     continue;
                 }
@@ -406,7 +404,6 @@ class PrometheusExporter
 
                 foreach ($read as $sock) {
                     if ($sock === $socket) {
-                        // 有新连接
                         $conn = @stream_socket_accept($socket, 0);
                         if ($conn !== false && $conn !== null) {
                             stream_set_blocking($conn, false);
@@ -416,12 +413,10 @@ class PrometheusExporter
                         continue;
                     }
 
-                    // 有数据可读
                     $data = @fread($sock, 8192);
                     $key = (int) $sock;
 
                     if ($data === '' || $data === false) {
-                        // 客户端关闭连接
                         fclose($sock);
                         $idx = array_search($sock, $conns, true);
                         if ($idx !== false) {
@@ -433,7 +428,6 @@ class PrometheusExporter
 
                     $buffers[$key] .= $data;
 
-                    // 收到完整请求头就响应
                     if (!str_contains($buffers[$key], "\r\n\r\n")) {
                         continue;
                     }
@@ -444,7 +438,6 @@ class PrometheusExporter
                         $path = self::parsePath($request);
 
                         if ($path === '/api/metrics') {
-                            // JSON 接口 —— 传入直方图
                             $body = json_encode([
                                 'code' => 0,
                                 'msg' => 'success',
@@ -465,7 +458,6 @@ class PrometheusExporter
                                 ."\r\n"
                                 .$body;
                         } else {
-                            // Prometheus 默认文本格式（/metrics 或其他路径）
                             $body = self::buildMetrics(
                                 $metrics,
                                 $this->histograms,
