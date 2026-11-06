@@ -15,12 +15,13 @@ use Swow\Signal;
 use Throwable;
 
 /**
- * 订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream
+ * 订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（Worker Pool 版）
  *
- * - 高优主题 → 高优 Channel → stream:device:high
- * - 普通主题 → 普通 Channel → stream:device:data
- * - 失败统一 → stream:device:dead
- * - Prometheus 指标暴露在独立端口
+ * 架构：
+ *   MQTT 接收协程
+ *     ├─ 高优 topic → highChannel → HighWorkerPool → stream:device:high
+ *     ├─ 普通 topic → normalChannel → NormalWorkerPool → stream:device:data
+ *     └─ 写入失败 → deadChannel → DeadLetterWorkerPool → stream:device:dead
  */
 class EdgeInsertRedisDimCommand extends Command
 {
@@ -49,7 +50,7 @@ class EdgeInsertRedisDimCommand extends Command
 
     private MultiDimAdaptiveBatch $adaptiveBatch;
 
-    /* ==================== 普通 Channel（数据） ==================== */
+    /* ==================== 普通 Channel ==================== */
     private Channel $normalChannel;
 
     private int $normalBatchSize;
@@ -63,13 +64,45 @@ class EdgeInsertRedisDimCommand extends Command
 
     private int $highFlushIntervalMs;
 
+    /* ==================== 死信 Channel ==================== */
+    private Channel $deadChannel;
+
+    private int $deadBatchSize;
+
+    private int $deadFlushIntervalMs;
+
     /* ==================== 公共 ==================== */
     private int $maxPayloadLen;
 
     private bool $stopping = false;
 
-    /** @var NanoMQ|null 复用同一个 MQTT 实例，避免信号里新建连接 */
     private ?NanoMQ $mqtt = null;
+
+    /* ==================== Worker 池配置 ==================== */
+    private int $normalWorkers;
+
+    private int $highWorkers;
+
+    private int $deadWorkers;
+
+    private int $workerIdleTimeoutSec;
+
+    /* ==================== Worker 协程引用 ==================== */
+    /** @var array<int, Coroutine> */
+    private array $normalWorkerCoroutines = [];
+
+    /** @var array<int, Coroutine> */
+    private array $highWorkerCoroutines = [];
+
+    /** @var array<int, Coroutine> */
+    private array $deadWorkerCoroutines = [];
+
+    /* ==================== 活跃 Worker 计数 ==================== */
+    private int $activeNormalWorkers = 0;
+
+    private int $activeHighWorkers = 0;
+
+    private int $activeDeadWorkers = 0;
 
     /* ==================== 统计 ==================== */
     private int $receivedCount = 0;
@@ -78,9 +111,9 @@ class EdgeInsertRedisDimCommand extends Command
 
     private int $highFlushedCount = 0;
 
-    private int $droppedCount = 0;
+    private int $deadFlushedCount = 0;
 
-    private int $deadCount = 0;
+    private int $droppedCount = 0;
 
     private float $normalFlushLatencySum = 0.0;
 
@@ -90,19 +123,25 @@ class EdgeInsertRedisDimCommand extends Command
 
     private int $highFlushTimes = 0;
 
+    private float $deadFlushLatencySum = 0.0;
+
+    private int $deadFlushTimes = 0;
+
     private float $startTime;
 
-    /** 等待时间采样（毫秒）—— 消息入队到写出的真实队列等待时间 */
     private float $lastNormalWaitMs = 0.0;
 
     private float $lastHighWaitMs = 0.0;
 
-    /** 自维护积压（Swow Channel 无 getLength） */
+    private float $lastDeadWaitMs = 0.0;
+
+    /** 自维护积压 */
     private int $normalBacklog = 0;
 
     private int $highBacklog = 0;
 
-    /** QPS 滑动窗口（最近 5 秒） */
+    private int $deadBacklog = 0;
+
     /** @var array<float, int> */
     private array $qpsWindow = [];
 
@@ -116,17 +155,11 @@ class EdgeInsertRedisDimCommand extends Command
         $this->initRedisPool();
         $this->registerSignalHandlers();
 
-        // 启动 Prometheus 指标服务
         $metricsPort = $this->configInt('edge.metrics.port', 9090);
         $metricsHost = config('edge.metrics.host', '0.0.0.0');
 
         $this->exporter->startMetricsServer($metricsPort, $metricsHost, function (): array {
-            // 动态刷新实时指标
-            $this->exporter->set('edge_queue_backlog', $this->getBacklog());
-            $this->exporter->set('edge_message_wait_ms_normal', $this->lastNormalWaitMs);
-            $this->exporter->set('edge_message_wait_ms_high', $this->lastHighWaitMs);
-            $this->exporter->set('edge_qps', $this->calculateQps());
-            $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && ! $this->stopping ? 1 : 0);
+            $this->collectWorkerMetrics();
 
             return $this->exporter->getMetrics();
         });
@@ -138,12 +171,12 @@ class EdgeInsertRedisDimCommand extends Command
         echo "[metrics] Prometheus 预览 {$scheme}://{$serverIp}:{$metricsPort}/metrics\n";
         echo "[metrics] Prometheus 接口 {$scheme}://{$serverIp}:{$metricsPort}/api/metrics\n";
 
-        // 启动两个 Flusher 协程
-        $this->startNormalFlusher();
-        $this->startHighFlusher();
+        // 启动 Worker 池
+        $this->startNormalWorkerPool();
+        $this->startHighWorkerPool();
+        $this->startDeadLetterWorkerPool();
 
         $topics = $this->resolveTopics();
-
         $this->mqtt = new NanoMQ;
 
         try {
@@ -151,21 +184,29 @@ class EdgeInsertRedisDimCommand extends Command
             $this->info(sprintf('MQTT 订阅已启动 | %s', $this->nowString()));
             $this->info('订阅主题：'.implode(', ', $topics));
             $this->info(sprintf(
-                '普通：batch=%d interval=%dms channel=%d',
+                '普通：batch=%d interval=%dms channel=%d workers=%d',
                 $this->normalBatchSize,
                 $this->normalFlushIntervalMs,
                 $this->normalChannel->getCapacity(),
+                $this->normalWorkers,
             ));
             $this->info(sprintf(
-                '高优：batch=%d interval=%dms channel=%d',
+                '高优：batch=%d interval=%dms channel=%d workers=%d',
                 $this->highBatchSize,
                 $this->highFlushIntervalMs,
                 $this->highChannel->getCapacity(),
+                $this->highWorkers,
+            ));
+            $this->info(sprintf(
+                '死信：batch=%d interval=%dms channel=%d workers=%d',
+                $this->deadBatchSize,
+                $this->deadFlushIntervalMs,
+                $this->deadChannel->getCapacity(),
+                $this->deadWorkers,
             ));
             $this->info('按 Ctrl+C 停止');
             $this->info('=====================================');
 
-            // NanoMQ::subscribe() 只接受单个 string topic，循环订阅复用同一个回调
             $handler = function (string $topic, string $message): void {
                 if ($this->stopping) {
                     return;
@@ -228,7 +269,6 @@ class EdgeInsertRedisDimCommand extends Command
                 $this->mqtt->subscribe($topic, $handler);
             }
 
-            // 阻塞等待 MQTT 协程退出，无轮询、无 sleep
             $this->mqtt->wait();
 
             $this->info('[mqtt] 订阅协程已退出');
@@ -249,39 +289,28 @@ class EdgeInsertRedisDimCommand extends Command
 
     private function loadConfig(): void
     {
-        $this->normalBatchSize = $this->configInt(
-            'edge.mqtt.batch_size',
-            200,
-        );
-        $this->normalFlushIntervalMs = $this->configInt(
-            'edge.mqtt.flush_interval_ms',
-            100,
-        );
-        $normalChannelSize = $this->configInt(
-            'edge.mqtt.channel_size',
-            4096,
-        );
+        $this->normalBatchSize = $this->configInt('edge.mqtt.batch_size', 200);
+        $this->normalFlushIntervalMs = $this->configInt('edge.mqtt.flush_interval_ms', 100);
+        $normalChannelSize = $this->configInt('edge.mqtt.channel_size', 4096);
 
-        $this->highBatchSize = $this->configInt(
-            'edge.mqtt.high_batch_size',
-            10,
-        );
-        $this->highFlushIntervalMs = $this->configInt(
-            'edge.mqtt.high_flush_interval_ms',
-            20,
-        );
-        $highChannelSize = $this->configInt(
-            'edge.mqtt.high_channel_size',
-            512,
-        );
+        $this->highBatchSize = $this->configInt('edge.mqtt.high_batch_size', 10);
+        $this->highFlushIntervalMs = $this->configInt('edge.mqtt.high_flush_interval_ms', 20);
+        $highChannelSize = $this->configInt('edge.mqtt.high_channel_size', 512);
 
-        $this->maxPayloadLen = $this->configInt(
-            'edge.mqtt.max_payload_len',
-            65_536,
-        );
+        $this->deadBatchSize = $this->configInt('edge.mqtt.dead_batch_size', 50);
+        $this->deadFlushIntervalMs = $this->configInt('edge.mqtt.dead_flush_interval_ms', 1000);
+        $deadChannelSize = $this->configInt('edge.mqtt.dead_channel_size', 1024);
+
+        $this->maxPayloadLen = $this->configInt('edge.mqtt.max_payload_len', 65_536);
+
+        $this->normalWorkers = $this->configInt('edge.mqtt.normal_workers', 4);
+        $this->highWorkers = $this->configInt('edge.mqtt.high_workers', 2);
+        $this->deadWorkers = $this->configInt('edge.mqtt.dead_workers', 1);
+        $this->workerIdleTimeoutSec = $this->configInt('edge.mqtt.worker_idle_timeout', 5);
 
         $this->normalChannel = new Channel($normalChannelSize);
         $this->highChannel = new Channel($highChannelSize);
+        $this->deadChannel = new Channel($deadChannelSize);
     }
 
     private function initComponents(): void
@@ -364,7 +393,7 @@ class EdgeInsertRedisDimCommand extends Command
         if ($this->highChannel->isFull()) {
             $this->warn('[CHANNEL] 高优队列已满，降级写死信 device='.$device);
             $this->exporter->inc('edge_dead_letter_total');
-            $this->writeDeadLetter([$item], 'high_channel_full');
+            $this->pushDeadLetter([$item], 'high_channel_full');
 
             return;
         }
@@ -376,6 +405,23 @@ class EdgeInsertRedisDimCommand extends Command
         } catch (Throwable $e) {
             $this->error('[CHANNEL] 高优队列 push 失败：'.$e->getMessage());
             $this->exporter->inc('edge_dead_letter_total');
+        }
+    }
+
+    private function pushDeadLetter(array $batch, string $reason): void
+    {
+        $item = [
+            'batch' => $batch,
+            'error' => $reason,
+            'ts' => microtime(true),
+            '_enqueued_at' => microtime(true),
+        ];
+
+        try {
+            $this->deadChannel->push($item);
+            $this->deadBacklog++;
+        } catch (Throwable) {
+            // Channel 满：丢弃，避免死循环
         }
     }
 
@@ -405,157 +451,258 @@ class EdgeInsertRedisDimCommand extends Command
                     // ignore
                 }
 
-                // 唤醒两个 flusher
-                try {
-                    $this->normalChannel->push(null);
-                } catch (Throwable) {
-                    // ignore
-                }
+                // 唤醒所有 Worker
+                $this->wakeupChannel($this->normalChannel);
+                $this->wakeupChannel($this->highChannel);
+                $this->wakeupChannel($this->deadChannel);
 
-                try {
-                    $this->highChannel->push(null);
-                } catch (Throwable) {
-                    // ignore
-                }
+                // 等待 Worker 池排空
+                $this->drainWorkerPools();
             });
         }
     }
 
-    /* ==================== 普通 Flusher ==================== */
-
-    private function startNormalFlusher(): void
+    private function wakeupChannel(Channel $channel): void
     {
-        $flushIntervalMs = max(1, $this->normalFlushIntervalMs);
+        // 每个 Worker 唤醒一次
+        $capacity = $channel->getCapacity();
+        for ($i = 0; $i < $capacity; $i++) {
+            try {
+                $channel->push(null);
+            } catch (Throwable) {
+                break;
+            }
+        }
+    }
 
-        Coroutine::run(function () use ($flushIntervalMs): void {
-            $batch = [];
-            $capacity = max(1, $this->normalBatchSize);
-            $lastFlush = microtime(true);
+    private function drainWorkerPools(): void
+    {
+        $timeout = microtime(true) + $this->workerIdleTimeoutSec;
 
-            while (true) {
-                $now = microtime(true);
-                $elapsedMs = (int) (($now - $lastFlush) * 1000);
-                $timeoutMs = max(0, $flushIntervalMs - $elapsedMs);
+        while (microtime(true) < $timeout) {
+            $alive = 0;
 
-                $item = null;
-
+            foreach ([...$this->normalWorkerCoroutines, ...$this->highWorkerCoroutines, ...$this->deadWorkerCoroutines] as $coroutine) {
                 try {
-                    if ($timeoutMs > 0) {
-                        /** @var array<string, mixed>|null $item */
-                        $item = $this->normalChannel->pop($timeoutMs);
-                    } else {
-                        /** @var array<string, mixed>|null $item */
-                        $item = $this->normalChannel->pop();
+                    if ($coroutine->isAlive()) {
+                        $alive++;
                     }
                 } catch (Throwable) {
-                    continue;
+                    // ignore
                 }
+            }
 
-                // null = 停机唤醒信号
-                if ($item === null) {
-                    if ($batch !== []) {
-                        $this->flushNormalBatch($batch);
-                        $batch = [];
-                    }
+            if ($alive === 0) {
+                $this->info('[edge] 所有 Worker 已退出');
+                break;
+            }
 
-                    if ($this->stopping) {
-                        while (true) {
-                            try {
-                                /** @var array<string, mixed>|null $leftover */
-                                $leftover = $this->normalChannel->pop(self::DRAIN_POP_TIMEOUT_MS);
-                            } catch (Throwable) {
-                                break 2;
-                            }
+            usleep(100_000); // 100ms
+        }
+    }
 
-                            if ($leftover === null) {
-                                break;
-                            }
+    /* ==================== Worker 池启动 ==================== */
 
-                            $this->flushNormalBatch([$leftover]);
-                        }
-                    }
+    private function startNormalWorkerPool(): void
+    {
+        for ($i = 0; $i < $this->normalWorkers; $i++) {
+            $this->normalWorkerCoroutines[] = Coroutine::run(function (): void {
+                $this->runNormalWorker();
+            });
+        }
+    }
 
-                    continue;
+    private function startHighWorkerPool(): void
+    {
+        for ($i = 0; $i < $this->highWorkers; $i++) {
+            $this->highWorkerCoroutines[] = Coroutine::run(function (): void {
+                $this->runHighWorker();
+            });
+        }
+    }
+
+    private function startDeadLetterWorkerPool(): void
+    {
+        for ($i = 0; $i < $this->deadWorkers; $i++) {
+            $this->deadWorkerCoroutines[] = Coroutine::run(function (): void {
+                $this->runDeadLetterWorker();
+            });
+        }
+    }
+
+    /* ==================== 普通 Worker ==================== */
+
+    private function runNormalWorker(): void
+    {
+        $batch = [];
+        $capacity = max(1, $this->normalBatchSize);
+        $flushIntervalSec = max(0.001, $this->normalFlushIntervalMs / 1000);
+        $lastFlush = microtime(true);
+        $workerId = Coroutine::getCurrent()->getId();
+
+        $this->debugWorker('normal', $workerId, 'started');
+
+        while (true) {
+            if ($this->stopping && $this->normalChannel->isAvailable() === false) {
+                break;
+            }
+
+            $timeout = $this->stopping ? 0 : max(0, (int) (
+                ($flushIntervalSec - (microtime(true) - $lastFlush)) * 1000
+            ));
+
+            $item = null;
+            try {
+                if ($timeout > 0) {
+                    /** @var array<string, mixed>|null $item */
+                    $item = $this->normalChannel->pop($timeout);
+                } else {
+                    /** @var array<string, mixed>|null $item */
+                    $item = $this->normalChannel->pop(0);
                 }
+            } catch (Throwable) {
+                continue;
+            }
 
-                $batch[] = $item;
-                if (count($batch) >= $capacity) {
+            if ($item === null) {
+                if ($batch !== []) {
                     $this->flushNormalBatch($batch);
                     $batch = [];
                     $lastFlush = microtime(true);
                 }
+
+                if ($this->stopping) {
+                    break;
+                }
+                continue;
             }
 
-            $this->line('[flusher:normal] 已退出');
-        });
+            $batch[] = $item;
+            $this->activeNormalWorkers++;
+
+            if (count($batch) >= $capacity) {
+                $this->flushNormalBatch($batch);
+                $batch = [];
+                $lastFlush = microtime(true);
+            }
+        }
+
+        $this->activeNormalWorkers = max(0, $this->activeNormalWorkers - 1);
+        $this->debugWorker('normal', $workerId, 'stopped');
     }
 
-    /* ==================== 高优 Flusher ==================== */
+    /* ==================== 高优 Worker ==================== */
 
-    private function startHighFlusher(): void
+    private function runHighWorker(): void
     {
-        $flushIntervalMs = max(1, $this->highFlushIntervalMs);
+        $batch = [];
+        $capacity = max(1, $this->highBatchSize);
+        $flushIntervalSec = max(0.001, $this->highFlushIntervalMs / 1000);
+        $lastFlush = microtime(true);
+        $workerId = Coroutine::getCurrent()->getId();
 
-        Coroutine::run(function () use ($flushIntervalMs): void {
-            $batch = [];
-            $capacity = max(1, $this->highBatchSize);
-            $lastFlush = microtime(true);
+        $this->debugWorker('high', $workerId, 'started');
 
-            while (true) {
-                $now = microtime(true);
-                $elapsedMs = (int) (($now - $lastFlush) * 1000);
-                $timeoutMs = max(0, $flushIntervalMs - $elapsedMs);
+        while (true) {
+            $timeout = $this->stopping ? 0 : max(0, (int) (
+                ($flushIntervalSec - (microtime(true) - $lastFlush)) * 1000
+            ));
 
-                $item = null;
-
-                try {
-                    if ($timeoutMs > 0) {
-                        /** @var array<string, mixed>|null $item */
-                        $item = $this->highChannel->pop($timeoutMs);
-                    } else {
-                        /** @var array<string, mixed>|null $item */
-                        $item = $this->highChannel->pop();
-                    }
-                } catch (Throwable) {
-                    continue;
+            $item = null;
+            try {
+                if ($timeout > 0) {
+                    /** @var array<string, mixed>|null $item */
+                    $item = $this->highChannel->pop($timeout);
+                } else {
+                    /** @var array<string, mixed>|null $item */
+                    $item = $this->highChannel->pop(0);
                 }
+            } catch (Throwable) {
+                continue;
+            }
 
-                if ($item === null) {
-                    if ($batch !== []) {
-                        $this->flushHighBatch($batch);
-                        $batch = [];
-                    }
-
-                    if ($this->stopping) {
-                        while (true) {
-                            try {
-                                /** @var array<string, mixed>|null $leftover */
-                                $leftover = $this->highChannel->pop(self::DRAIN_POP_TIMEOUT_MS);
-                            } catch (Throwable) {
-                                break 2;
-                            }
-
-                            if ($leftover === null) {
-                                break;
-                            }
-
-                            $this->flushHighBatch([$leftover]);
-                        }
-                    }
-
-                    continue;
-                }
-
-                $batch[] = $item;
-                if (count($batch) >= $capacity) {
+            if ($item === null) {
+                if ($batch !== []) {
                     $this->flushHighBatch($batch);
                     $batch = [];
                     $lastFlush = microtime(true);
                 }
+
+                if ($this->stopping) {
+                    break;
+                }
+                continue;
             }
 
-            $this->line('[flusher:high] 已退出');
-        });
+            $batch[] = $item;
+            $this->activeHighWorkers++;
+
+            if (count($batch) >= $capacity) {
+                $this->flushHighBatch($batch);
+                $batch = [];
+                $lastFlush = microtime(true);
+            }
+        }
+
+        $this->activeHighWorkers = max(0, $this->activeHighWorkers - 1);
+        $this->debugWorker('high', $workerId, 'stopped');
+    }
+
+    /* ==================== 死信 Worker ==================== */
+
+    private function runDeadLetterWorker(): void
+    {
+        $batch = [];
+        $capacity = max(1, $this->deadBatchSize);
+        $flushIntervalSec = max(0.001, $this->deadFlushIntervalMs / 1000);
+        $lastFlush = microtime(true);
+        $workerId = Coroutine::getCurrent()->getId();
+
+        $this->debugWorker('dead', $workerId, 'started');
+
+        while (true) {
+            $timeout = $this->stopping ? 0 : max(0, (int) (
+                ($flushIntervalSec - (microtime(true) - $lastFlush)) * 1000
+            ));
+
+            $item = null;
+            try {
+                if ($timeout > 0) {
+                    /** @var array<string, mixed>|null $item */
+                    $item = $this->deadChannel->pop($timeout);
+                } else {
+                    /** @var array<string, mixed>|null $item */
+                    $item = $this->deadChannel->pop(0);
+                }
+            } catch (Throwable) {
+                continue;
+            }
+
+            if ($item === null) {
+                if ($batch !== []) {
+                    $this->flushDeadLetterBatch($batch);
+                    $batch = [];
+                    $lastFlush = microtime(true);
+                }
+
+                if ($this->stopping) {
+                    break;
+                }
+                continue;
+            }
+
+            $batch[] = $item;
+            $this->activeDeadWorkers++;
+
+            if (count($batch) >= $capacity) {
+                $this->flushDeadLetterBatch($batch);
+                $batch = [];
+                $lastFlush = microtime(true);
+            }
+        }
+
+        $this->activeDeadWorkers = max(0, $this->activeDeadWorkers - 1);
+        $this->debugWorker('dead', $workerId, 'stopped');
     }
 
     /* ==================== Redis 写入 ==================== */
@@ -569,15 +716,16 @@ class EdgeInsertRedisDimCommand extends Command
         $flushStart = microtime(true);
         $now = microtime(true);
         $waitSum = 0.0;
+
         foreach ($batch as $item) {
             $enqueuedAt = $item['_enqueued_at'] ?? $now;
             $waitSum += ($now - $enqueuedAt) * 1000;
         }
 
-        $success = false;
+        $count = count($batch);
 
         try {
-            withRedis(function (\Redis $conn) use ($batch): void {
+            withRedis(function (\Redis $conn) use ($count, $batch): void {
                 $conn->multi(\Redis::PIPELINE);
 
                 foreach ($batch as $item) {
@@ -597,41 +745,41 @@ class EdgeInsertRedisDimCommand extends Command
 
                 $results = $conn->exec();
 
-                if (is_array($results) && count($results) !== count($batch)) {
+                if (is_array($results) && count($results) !== $count) {
                     fwrite(STDERR, sprintf(
                         "[FLUSH-DIAG] normal pipeline 结果数异常 expect=%d actual=%d\n",
-                        count($batch),
+                        $count,
                         count($results),
                     ));
                 }
             });
 
-            $this->normalFlushedCount += count($batch);
-            $this->exporter->inc('edge_data_write_success_total', count($batch));
-            $this->normalBacklog -= count($batch);
-            $success = true;
+            $this->normalFlushedCount += $count;
+            $this->exporter->inc('edge_data_write_success_total', $count);
+            $this->normalBacklog = max(0, $this->normalBacklog - $count);
+
+            $elapsedMs = (microtime(true) - $flushStart) * 1000;
+            $this->lastNormalWaitMs = $waitSum / $count;
+            $this->normalFlushLatencySum += $elapsedMs;
+            $this->normalFlushTimes++;
 
             $this->line(sprintf(
-                '[FLUSH] batch=%d → %s',
-                count($batch),
+                '[FLUSH] batch=%d → %s (%.2fms)',
+                $count,
                 self::STREAM_DATA,
+                $elapsedMs,
             ));
         } catch (Throwable $e) {
             $this->error(sprintf(
                 '[FLUSH] 普通写入失败（%d 条）→ 死信：%s',
-                count($batch),
+                $count,
                 $e->getMessage(),
             ));
 
-            $this->exporter->inc('edge_redis_write_failed_total', count($batch));
-            $this->writeDeadLetter($batch, $e);
-        }
-
-        if ($success) {
-            $elapsedMs = (microtime(true) - $flushStart) * 1000;
-            $this->lastNormalWaitMs = $waitSum > 0 ? $waitSum / count($batch) : $elapsedMs / count($batch);
-            $this->normalFlushLatencySum += $elapsedMs;
-            $this->normalFlushTimes++;
+            $this->exporter->inc('edge_redis_write_failed_total', $count);
+            $this->pushDeadLetter($batch, $e->getMessage());
+        } finally {
+            $this->activeNormalWorkers = max(0, $this->activeNormalWorkers - $count);
         }
     }
 
@@ -644,13 +792,16 @@ class EdgeInsertRedisDimCommand extends Command
         $flushStart = microtime(true);
         $now = microtime(true);
         $waitSum = 0.0;
+
         foreach ($batch as $item) {
             $enqueuedAt = $item['_enqueued_at'] ?? $now;
             $waitSum += ($now - $enqueuedAt) * 1000;
         }
 
+        $count = count($batch);
+
         try {
-            withRedis(function (\Redis $conn) use ($batch): void {
+            withRedis(function (\Redis $conn) use ($count, $batch): void {
                 $conn->multi(\Redis::PIPELINE);
 
                 foreach ($batch as $item) {
@@ -670,68 +821,153 @@ class EdgeInsertRedisDimCommand extends Command
 
                 $results = $conn->exec();
 
-                if (is_array($results) && count($results) !== count($batch)) {
+                if (is_array($results) && count($results) !== $count) {
                     fwrite(STDERR, sprintf(
                         "[FLUSH-DIAG] high pipeline 结果数异常 expect=%d actual=%d\n",
-                        count($batch),
+                        $count,
                         count($results),
                     ));
                 }
             });
 
-            $this->highFlushedCount += count($batch);
-            $this->exporter->inc('edge_high_write_success_total', count($batch));
-            $this->highBacklog -= count($batch);
+            $this->highFlushedCount += $count;
+            $this->exporter->inc('edge_high_write_success_total', $count);
+            $this->highBacklog = max(0, $this->highBacklog - $count);
+
+            $elapsedMs = (microtime(true) - $flushStart) * 1000;
+            $this->lastHighWaitMs = $waitSum / $count;
+            $this->highFlushLatencySum += $elapsedMs;
+            $this->highFlushTimes++;
 
             $this->line(sprintf(
-                '[FLUSH:HIGH] batch=%d → %s',
-                count($batch),
+                '[FLUSH:HIGH] batch=%d → %s (%.2fms)',
+                $count,
                 self::STREAM_HIGH,
+                $elapsedMs,
             ));
         } catch (Throwable $e) {
             $this->error(sprintf(
                 '[FLUSH:HIGH] 高优写入失败（%d 条）→ 死信：%s',
-                count($batch),
+                $count,
                 $e->getMessage(),
             ));
 
-            $this->exporter->inc('edge_redis_write_failed_total', count($batch));
-            $this->writeDeadLetter($batch, $e);
+            $this->exporter->inc('edge_redis_write_failed_total', $count);
+            $this->pushDeadLetter($batch, $e->getMessage());
+        } finally {
+            $this->activeHighWorkers = max(0, $this->activeHighWorkers - $count);
         }
-
-        $elapsedMs = (microtime(true) - $flushStart) * 1000;
-        $this->lastHighWaitMs = $waitSum > 0 ? $waitSum / max(1, count($batch)) : $elapsedMs / max(1, count($batch));
-        $this->highFlushLatencySum += $elapsedMs;
-        $this->highFlushTimes++;
     }
 
-    private function writeDeadLetter(array $batch, Throwable|string $cause): void
+    private function flushDeadLetterBatch(array $batch): void
     {
-        $error = $cause instanceof Throwable ? $cause->getMessage() : $cause;
+        if ($batch === []) {
+            return;
+        }
+
+        $flushStart = microtime(true);
+        $now = microtime(true);
+        $waitSum = 0.0;
+
+        foreach ($batch as $item) {
+            $enqueuedAt = $item['_enqueued_at'] ?? $now;
+            $waitSum += ($now - $enqueuedAt) * 1000;
+        }
+
+        $count = count($batch);
 
         try {
-            withRedis(function (\Redis $conn) use ($batch, $error): void {
-                $conn->xAdd(
-                    self::STREAM_DEAD,
-                    '*',
-                    [
-                        'batch' => json_encode($batch, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
-                        'error' => $error,
-                        'ts' => sprintf('%.3f', microtime(true)),
-                    ],
-                    self::DEAD_MAX_LEN,
-                    true,
-                );
+            withRedis(function (\Redis $conn) use ($batch): void {
+                $conn->multi(\Redis::PIPELINE);
+
+                foreach ($batch as $item) {
+                    $conn->xAdd(
+                        self::STREAM_DEAD,
+                        '*',
+                        [
+                            'batch' => json_encode(
+                                $item['batch'] ?? $item,
+                                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE,
+                            ),
+                            'error' => $item['error'] ?? '',
+                            'ts' => sprintf('%.3f', $item['ts'] ?? microtime(true)),
+                        ],
+                        self::DEAD_MAX_LEN,
+                        true,
+                    );
+                }
+
+                $conn->exec();
             });
 
-            $this->deadCount += count($batch);
-            $this->exporter->inc('edge_dead_letter_total', count($batch));
-            // 写入死信也算"消费掉"，从积压中扣除（保守处理，统一从 normalBacklog 扣）
-            $this->normalBacklog = max(0, $this->normalBacklog - count($batch));
-            $this->warn('[DEAD] 已写入死信 '.self::STREAM_DEAD);
+            $this->deadFlushedCount += $count;
+            $this->exporter->inc('edge_dead_letter_total', $count);
+            $this->deadBacklog = max(0, $this->deadBacklog - $count);
+
+            $elapsedMs = (microtime(true) - $flushStart) * 1000;
+            $this->lastDeadWaitMs = $waitSum / $count;
+            $this->deadFlushLatencySum += $elapsedMs;
+            $this->deadFlushTimes++;
+
+            $this->warn(sprintf(
+                '[DEAD] batch=%d → %s (%.2fms)',
+                $count,
+                self::STREAM_DEAD,
+                $elapsedMs,
+            ));
         } catch (Throwable $e) {
-            fwrite(STDERR, '[FATAL] 死信写入也失败：'.$e->getMessage().PHP_EOL);
+            $this->error(sprintf(
+                '[DEAD] 死信写入失败（%d 条）：%s',
+                $count,
+                $e->getMessage(),
+            ));
+        } finally {
+            $this->activeDeadWorkers = max(0, $this->activeDeadWorkers - $count);
         }
+    }
+
+    /* ==================== Prometheus 指标 ==================== */
+
+    private function collectWorkerMetrics(): void
+    {
+        $this->exporter->set('edge_active_workers_normal', $this->activeNormalWorkers);
+        $this->exporter->set('edge_active_workers_high', $this->activeHighWorkers);
+        $this->exporter->set('edge_active_workers_dead', $this->activeDeadWorkers);
+
+        $this->exporter->set('edge_channel_backlog_normal', $this->normalBacklog);
+        $this->exporter->set('edge_channel_backlog_high', $this->highBacklog);
+        $this->exporter->set('edge_channel_backlog_dead', $this->deadBacklog);
+
+        $this->exporter->set('edge_message_wait_ms_normal', $this->lastNormalWaitMs);
+        $this->exporter->set('edge_message_wait_ms_high', $this->lastHighWaitMs);
+        $this->exporter->set('edge_message_wait_ms_dead', $this->lastDeadWaitMs);
+
+        $this->exporter->set(
+            'edge_flush_latency_ms_normal',
+            $this->normalFlushTimes > 0
+                ? $this->normalFlushLatencySum / $this->normalFlushTimes
+                : 0.0,
+        );
+        $this->exporter->set(
+            'edge_flush_latency_ms_high',
+            $this->highFlushTimes > 0
+                ? $this->highFlushLatencySum / $this->highFlushTimes
+                : 0.0,
+        );
+        $this->exporter->set(
+            'edge_flush_latency_ms_dead',
+            $this->deadFlushTimes > 0
+                ? $this->deadFlushLatencySum / $this->deadFlushTimes
+                : 0.0,
+        );
+
+        $this->exporter->set('edge_flushed_total_normal', $this->normalFlushedCount);
+        $this->exporter->set('edge_flushed_total_high', $this->highFlushedCount);
+        $this->exporter->set('edge_flushed_total_dead', $this->deadFlushedCount);
+
+        $this->exporter->set('edge_queue_backlog', $this->getBacklog());
+        $this->exporter->set('edge_qps', $this->calculateQps());
+        $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && ! $this->stopping ? 1 : 0);
     }
 
     /* ==================== Redis 连接池 ==================== */
@@ -763,17 +999,16 @@ class EdgeInsertRedisDimCommand extends Command
 
     private function getBacklog(): int
     {
-        return $this->normalBacklog + $this->highBacklog;
+        return $this->normalBacklog + $this->highBacklog + $this->deadBacklog;
     }
 
     private function calculateQps(): float
     {
         $now = microtime(true);
-        $current = $this->normalFlushedCount + $this->highFlushedCount;
+        $current = $this->normalFlushedCount + $this->highFlushedCount + $this->deadFlushedCount;
 
         $this->qpsWindow[$now] = $current;
 
-        // 只保留最近 5 秒
         $cutoff = $now - 5.0;
         foreach ($this->qpsWindow as $ts => $_) {
             if ($ts < $cutoff) {
@@ -797,7 +1032,7 @@ class EdgeInsertRedisDimCommand extends Command
     private function printStats(): void
     {
         $elapsed = max(0.001, microtime(true) - $this->startTime);
-        $totalFlushed = $this->normalFlushedCount + $this->highFlushedCount;
+        $totalFlushed = $this->normalFlushedCount + $this->highFlushedCount + $this->deadFlushedCount;
         $qps = $totalFlushed / $elapsed;
         $avgNormalMs = $this->normalFlushTimes > 0
             ? $this->normalFlushLatencySum / $this->normalFlushTimes
@@ -805,17 +1040,33 @@ class EdgeInsertRedisDimCommand extends Command
         $avgHighMs = $this->highFlushTimes > 0
             ? $this->highFlushLatencySum / $this->highFlushTimes
             : 0.0;
+        $avgDeadMs = $this->deadFlushTimes > 0
+            ? $this->deadFlushLatencySum / $this->deadFlushTimes
+            : 0.0;
 
         $this->info('========== 运行统计 ==========');
         $this->info(sprintf('运行时长：%.1fs', $elapsed));
         $this->info(sprintf('接收消息：%d', $this->receivedCount));
         $this->info(sprintf('普通写入：%d', $this->normalFlushedCount));
         $this->info(sprintf('高优写入：%d', $this->highFlushedCount));
+        $this->info(sprintf('死信写入：%d', $this->deadFlushedCount));
         $this->info(sprintf('丢弃消息：%d', $this->droppedCount));
-        $this->info(sprintf('死信消息：%d', $this->deadCount));
         $this->info(sprintf('总写入 QPS：%.1f msg/s', $qps));
         $this->info(sprintf('普通平均刷盘：%.2fms', $avgNormalMs));
         $this->info(sprintf('高优平均刷盘：%.2fms', $avgHighMs));
+        $this->info(sprintf('死信平均刷盘：%.2fms', $avgDeadMs));
+        $this->info(sprintf(
+            '积压：normal=%d high=%d dead=%d',
+            $this->normalBacklog,
+            $this->highBacklog,
+            $this->deadBacklog,
+        ));
+        $this->info(sprintf(
+            '活跃 Worker：normal=%d high=%d dead=%d',
+            $this->activeNormalWorkers,
+            $this->activeHighWorkers,
+            $this->activeDeadWorkers,
+        ));
         $this->info('==============================');
     }
 
@@ -836,22 +1087,28 @@ class EdgeInsertRedisDimCommand extends Command
         }
     }
 
+    private function debugWorker(string $priority, int $workerId, string $event): void
+    {
+        fwrite(STDERR, sprintf(
+            "[WORKER:%s] #%d %s\n",
+            $priority,
+            $workerId,
+            $event,
+        ));
+    }
+
     /**
-     * 获取服务器对外 IPv4 地址（CLI / 跨平台）
-     *
-     * @return array{0: string, 1: string} [scheme, ip]
+     * @return array{0: string, 1: string}
      */
     public function getServerIp(): array
     {
         $scheme = config('edge.metrics.scheme', 'http');
 
-        // 1) 配置优先
         $configured = config('edge.metrics.public_host');
         if ($configured && filter_var($configured, FILTER_VALIDATE_IP)) {
             return [$scheme, $configured];
         }
 
-        // 2) 外部回显（ifconfig.me 通、ipify 不通就靠它）
         foreach (['https://ifconfig.me', 'http://ipinfo.io/ip', 'http://icanhazip.com'] as $url) {
             $ctx = stream_context_create(['http' => ['timeout' => 2]]);
             $body = @file_get_contents($url, false, $ctx);
@@ -864,7 +1121,6 @@ class EdgeInsertRedisDimCommand extends Command
             }
         }
 
-        // 3) 兜底内网 IP
         $lines = [];
         @exec('ip -4 addr show 2>/dev/null', $lines);
         if (array_any($lines, fn ($line) => preg_match('/^\s+inet\s+([\d.]+)/', $line, $m) && ! str_starts_with($m[1], '127.'))) {

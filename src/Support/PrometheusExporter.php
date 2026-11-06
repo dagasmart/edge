@@ -20,6 +20,9 @@ class PrometheusExporter
     /** @var array<string, mixed> */
     protected array $metrics = [];
 
+    /** @var array<string, array{sum: float, count: int, buckets: array<float, int>}> */
+    protected array $histograms = [];
+
     protected bool $running = false;
 
     /** @var resource|null */
@@ -96,7 +99,79 @@ class PrometheusExporter
                 'help' => 'MQTT 连接状态（1=已连接，0=已断开）',
                 'value' => 0,
             ],
+
+            // ============ Worker 级指标（新增） ============
+
+            // 活跃 Worker 数
+            'edge_active_workers_normal' => [
+                'type' => 'gauge',
+                'help' => '普通 Worker 活跃数',
+                'value' => 0,
+            ],
+            'edge_active_workers_high' => [
+                'type' => 'gauge',
+                'help' => '高优 Worker 活跃数',
+                'value' => 0,
+            ],
+            'edge_active_workers_dead' => [
+                'type' => 'gauge',
+                'help' => '死信 Worker 活跃数',
+                'value' => 0,
+            ],
+
+            // Channel 积压
+            'edge_channel_backlog_normal' => [
+                'type' => 'gauge',
+                'help' => '普通 Channel 积压消息数',
+                'value' => 0,
+            ],
+            'edge_channel_backlog_high' => [
+                'type' => 'gauge',
+                'help' => '高优 Channel 积压消息数',
+                'value' => 0,
+            ],
+            'edge_channel_backlog_dead' => [
+                'type' => 'gauge',
+                'help' => '死信 Channel 积压消息数',
+                'value' => 0,
+            ],
+
+            // 平均 flush 耗时
+            'edge_flush_latency_ms_normal' => [
+                'type' => 'gauge',
+                'help' => '普通 Worker 平均 flush 耗时（毫秒）',
+                'value' => 0,
+            ],
+            'edge_flush_latency_ms_high' => [
+                'type' => 'gauge',
+                'help' => '高优 Worker 平均 flush 耗时（毫秒）',
+                'value' => 0,
+            ],
+            'edge_flush_latency_ms_dead' => [
+                'type' => 'gauge',
+                'help' => '死信 Worker 平均 flush 耗时（毫秒）',
+                'value' => 0,
+            ],
+
+            // 已刷盘总数
+            'edge_flushed_total_normal' => [
+                'type' => 'counter',
+                'help' => '普通 Worker 已刷盘消息总数',
+                'value' => 0,
+            ],
+            'edge_flushed_total_high' => [
+                'type' => 'counter',
+                'help' => '高优 Worker 已刷盘消息总数',
+                'value' => 0,
+            ],
+            'edge_flushed_total_dead' => [
+                'type' => 'counter',
+                'help' => '死信 Worker 已刷盘消息总数',
+                'value' => 0,
+            ],
         ];
+
+        $this->histograms = [];
     }
 
     /**
@@ -120,6 +195,39 @@ class PrometheusExporter
     }
 
     /**
+     * 记录直方图观测值（flush 耗时分布）
+     *
+     * @param string $name  指标名，如 edge_flush_duration_ms
+     * @param float  $value 观测值（毫秒）
+     */
+    public function observe(string $name, float $value): void
+    {
+        $this->histograms[$name] ??= [
+            'sum' => 0.0,
+            'count' => 0,
+            'buckets' => [],
+        ];
+
+        $this->histograms[$name]['sum'] += $value;
+        $this->histograms[$name]['count']++;
+
+        $buckets = config('edge.mqtt.histogram_buckets', [1, 5, 10, 50, 100, 500, 1000, 5000]);
+
+        foreach ($buckets as $b) {
+            $b = (float) $b;
+            if ($value <= $b) {
+                $this->histograms[$name]['buckets'][$b]
+                    = ($this->histograms[$name]['buckets'][$b] ?? 0) + 1;
+            }
+        }
+
+        // +Inf bucket
+        $inf = INF;
+        $this->histograms[$name]['buckets'][$inf]
+            = ($this->histograms[$name]['buckets'][$inf] ?? 0) + 1;
+    }
+
+    /**
      * 获取当前指标快照（供外部使用）
      */
     public function getMetrics(): array
@@ -128,9 +236,19 @@ class PrometheusExporter
     }
 
     /**
-     * 构建 Prometheus 文本格式
+     * 获取直方图快照
+     *
+     * @return array<string, mixed>
      */
-    public static function buildMetrics(array $metrics): string
+    public function getHistograms(): array
+    {
+        return $this->histograms;
+    }
+
+    /**
+     * 构建 Prometheus 文本格式（支持 gauge/counter + histogram）
+     */
+    public static function buildMetrics(array $metrics, array $histograms = []): string
     {
         $lines = [];
 
@@ -142,7 +260,34 @@ class PrometheusExporter
                 $lines[] = "# TYPE {$name} {$info['type']}";
             }
             $lines[] = sprintf('%s %s', $name, $info['value']);
-            $lines[] = ''; // 每条指标后空行，符合 Prometheus 格式
+            $lines[] = '';
+        }
+
+        // 直方图格式：_bucket{le} / _sum / _count
+        foreach ($histograms as $name => $h) {
+            $lines[] = "# HELP {$name} {$name}";
+            $lines[] = "# TYPE {$name} histogram";
+
+            $buckets = $h['buckets'] ?? [];
+            // 按 le 排序，+Inf 放最后
+            uksort($buckets, function ($a, $b): int {
+                if (! is_numeric($a) && $a !== INF) return 0;
+                if (! is_numeric($b) && $b !== INF) return 0;
+                if ($a === INF) return 1;
+                if ($b === INF) return -1;
+                return $a <=> $b;
+            });
+
+            $cum = 0;
+            foreach ($buckets as $le => $count) {
+                $cum += $count;
+                $leStr = is_infinite((float) $le) ? '+Inf' : rtrim(rtrim(sprintf('%.6F', (float) $le), '0'), '.');
+                $lines[] = sprintf('%s_bucket{le="%s"} %d', $name, $leStr, $cum);
+            }
+
+            $lines[] = sprintf('%s_sum %s', $name, rtrim(rtrim(sprintf('%.6F', $h['sum'] ?? 0.0), '0'), '.'));
+            $lines[] = sprintf('%s_count %d', $name, $h['count'] ?? 0);
+            $lines[] = '';
         }
 
         return implode("\n", $lines);
@@ -151,7 +296,7 @@ class PrometheusExporter
     /**
      * 将指标转换为结构化数组（用于 JSON 接口）
      */
-    public static function metricsToArray(array $metrics): array
+    public static function metricsToArray(array $metrics, array $histograms = []): array
     {
         $result = [];
         foreach ($metrics as $name => $info) {
@@ -162,6 +307,20 @@ class PrometheusExporter
                 'value' => $info['value'],
             ];
         }
+
+        foreach ($histograms as $name => $h) {
+            $result[] = [
+                'name' => $name,
+                'type' => 'histogram',
+                'help' => $name,
+                'value' => [
+                    'sum' => $h['sum'] ?? 0.0,
+                    'count' => $h['count'] ?? 0,
+                    'buckets' => $h['buckets'] ?? [],
+                ],
+            ];
+        }
+
         return $result;
     }
 
@@ -285,11 +444,14 @@ class PrometheusExporter
                         $path = self::parsePath($request);
 
                         if ($path === '/api/metrics') {
-                            // JSON 接口
+                            // JSON 接口 —— 传入直方图
                             $body = json_encode([
                                 'code' => 0,
                                 'msg' => 'success',
-                                'data' => self::metricsToArray($metrics),
+                                'data' => self::metricsToArray(
+                                    $metrics,
+                                    $this->histograms,
+                                ),
                             ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
                             if ($body === false) {
@@ -304,7 +466,10 @@ class PrometheusExporter
                                 .$body;
                         } else {
                             // Prometheus 默认文本格式（/metrics 或其他路径）
-                            $body = self::buildMetrics($metrics);
+                            $body = self::buildMetrics(
+                                $metrics,
+                                $this->histograms,
+                            );
 
                             $resp = "HTTP/1.1 200 OK\r\n"
                                 ."Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
