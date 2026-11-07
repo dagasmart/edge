@@ -444,7 +444,8 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         }
 
         // ★ 认证成功 → 标记活跃，TTL 120s，供入库侧自适应统计
-        markClientAlive($clientId, $username, 120);
+        $ttl = (int) getenv('MQTT_KEEP_ALIVE_INTERVAL') ?: 120;
+        markClientAlive($clientId, $username, $ttl);
 
         EdgeAuthContext::setAuth($username, $clientId);
 
