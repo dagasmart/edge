@@ -15,19 +15,24 @@ use Swow\Signal;
 use Throwable;
 
 /**
- * 订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（Worker Pool 版）
+ * 订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（Worker Pool 版 + Auto-Scaler）
  *
  * 架构：
  *   MQTT 接收协程
  *     ├─ 高优 topic → highChannel → HighWorkerPool → stream:device:high
  *     ├─ 普通 topic → normalChannel → NormalWorkerPool → stream:device:data
- *     └─ 写入失败 → deadChannel → DeadLetterWorkerPool → stream:device:dead
+ *     ├─ 写入失败 → deadChannel → DeadLetterWorkerPool → stream:device:dead
+ *     └─ Auto-Scaler：根据认证侧 edge:client:alive:* 在线数自适应调节 worker/batch/采样
  */
 class EdgeInsertRedisDimCommand extends Command
 {
-    protected $signature = 'edge:insert-redis-dim';
+    protected $signature = 'edge:insert-redis-dim
+        {--auto-scale=1 : 启用自动伸缩(0/1)}
+        {--auto-scale-interval=30 : 自动伸缩评估间隔(秒)}
+        {--sample-rate-min=0.2 : 最小采样率(低负载时)}
+        {--sample-rate-max=1.0 : 最大采样率}';
 
-    protected $description = '订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream';
+    protected $description = '订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（含自适应调节）';
 
     /* ==================== Stream ==================== */
     private const string STREAM_HIGH = 'stream:device:high';
@@ -104,6 +109,27 @@ class EdgeInsertRedisDimCommand extends Command
 
     private int $activeDeadWorkers = 0;
 
+    /* ==================== Auto-Scaler 状态 ==================== */
+    private bool $autoScaleEnabled = true;
+
+    private int $autoScaleIntervalSec = 30;
+
+    private float $sampleRateMin = 0.2;
+
+    private float $sampleRateMax = 1.0;
+
+    private float $sampleRate = 1.0;
+
+    private int $targetNormalWorkers = 4;
+
+    private int $targetHighWorkers = 2;
+
+    private int $activeClientCount = 0;
+
+    private int $lastScanTime = 0;
+
+    private int $cachedClientCount = 1;
+
     /* ==================== 统计 ==================== */
     private int $receivedCount = 0;
 
@@ -176,6 +202,11 @@ class EdgeInsertRedisDimCommand extends Command
         $this->startHighWorkerPool();
         $this->startDeadLetterWorkerPool();
 
+        // ★ 启动 Auto-Scaler
+        if ($this->autoScaleEnabled) {
+            $this->startAutoScaler();
+        }
+
         // 启动期探针：失败直接终止，避免订阅后才发现连不上
         $this->probeMqttConnectivity();
 
@@ -212,6 +243,13 @@ class EdgeInsertRedisDimCommand extends Command
                     $this->deadFlushIntervalMs,
                     $this->deadChannel->getCapacity(),
                     $this->deadWorkers,
+                ));
+                $this->info(sprintf(
+                    'AutoScale=%s interval=%ds sample=%.2f~%.2f',
+                    $this->autoScaleEnabled ? 'on' : 'off',
+                    $this->autoScaleIntervalSec,
+                    $this->sampleRateMin,
+                    $this->sampleRateMax,
                 ));
                 $this->info('按 Ctrl+C 停止');
                 $this->info('=====================================');
@@ -256,6 +294,15 @@ class EdgeInsertRedisDimCommand extends Command
                         $device,
                         $payloadLen,
                     ));
+
+                    // ★ 采样门控：非高优 topic 按采样率丢弃
+                    if (! $this->router->isHighPriority($topic) && $this->sampleRate < 1.0) {
+                        if ((mt_rand(1, 10000) / 10000.0) > $this->sampleRate) {
+                            $this->droppedCount++;
+                            $this->exporter->inc('edge_dropped_by_sampling_total');
+                            return;
+                        }
+                    }
 
                     $item = [
                         'topic' => $topic,
@@ -302,6 +349,198 @@ class EdgeInsertRedisDimCommand extends Command
         $this->info('[edge:insert-redis] 已停止');
 
         return 0;
+    }
+
+    /* ==================== ★ Auto-Scaler ==================== */
+
+    private function startAutoScaler(): void
+    {
+        Coroutine::run(function (): void {
+            $this->info('[auto-scaler] started');
+            while (! $this->stopping) {
+                // 分段 sleep，及时响应停机
+                $deadline = time() + $this->autoScaleIntervalSec;
+                while (time() < $deadline && ! $this->stopping) {
+                    usleep(500_000);
+                }
+
+                if ($this->stopping) {
+                    break;
+                }
+
+                $clientCount = $this->getActiveClientCount();
+                $this->activeClientCount = $clientCount;
+
+                // ---- 目标 worker 数 ----
+                $targetNormal = match (true) {
+                    $clientCount <= 3   => 1,
+                    $clientCount <= 10  => 2,
+                    $clientCount <= 30  => 3,
+                    $clientCount <= 100 => 5,
+                    $clientCount <= 300 => 8,
+                    default             => 12,
+                };
+
+                $targetHigh = match (true) {
+                    $clientCount <= 5   => 1,
+                    $clientCount <= 50  => 2,
+                    default             => 3,
+                };
+
+                // ---- 动态 batch size ----
+                $newBatchSize = max(10, min(500, (int) ($clientCount * 2 + 20)));
+
+                // ---- 动态 flush 间隔 ----
+                $newFlushInterval = match (true) {
+                    $clientCount <= 3   => 1000,
+                    $clientCount <= 10  => 500,
+                    $clientCount <= 30  => 200,
+                    default             => $this->normalFlushIntervalMs,
+                };
+
+                // ---- 采样率 ----
+                if ($clientCount <= 3) {
+                    $newSampleRate = $this->sampleRateMin;
+                } elseif ($clientCount <= 10) {
+                    $newSampleRate = 0.5;
+                } else {
+                    $newSampleRate = $this->sampleRateMax;
+                }
+
+                // ---- 应用变更 ----
+                $changed = false;
+
+                if ($targetNormal !== $this->targetNormalWorkers) {
+                    $this->scaleNormalWorkers($targetNormal);
+                    $this->targetNormalWorkers = $targetNormal;
+                    $changed = true;
+                }
+
+                if ($targetHigh !== $this->targetHighWorkers) {
+                    $this->scaleHighWorkers($targetHigh);
+                    $this->targetHighWorkers = $targetHigh;
+                    $changed = true;
+                }
+
+                // batch/flush/采样 实时生效（不需要重启 worker）
+                $this->normalBatchSize = $newBatchSize;
+                $this->normalFlushIntervalMs = $newFlushInterval;
+                $this->sampleRate = $newSampleRate;
+
+                // Prometheus 指标
+                $this->exporter->set('edge_active_clients', $clientCount);
+                $this->exporter->set('edge_target_workers_normal', $targetNormal);
+                $this->exporter->set('edge_target_workers_high', $targetHigh);
+                $this->exporter->set('edge_sample_rate', $newSampleRate);
+                $this->exporter->set('edge_current_batch_size', $newBatchSize);
+
+                if ($changed || $clientCount <= 5) {
+                    $this->info(sprintf(
+                        '[auto-scaler] clients=%d | normal=%d high=%d | batch=%d | flush=%dms | sample=%.2f',
+                        $clientCount,
+                        $targetNormal,
+                        $targetHigh,
+                        $newBatchSize,
+                        $newFlushInterval,
+                        $newSampleRate
+                    ));
+                }
+            }
+            $this->info('[auto-scaler] stopped');
+        });
+    }
+
+    private function scaleNormalWorkers(int $target): void
+    {
+        $current = count($this->normalWorkerCoroutines);
+
+        if ($target > $current) {
+            // 扩容：启动新 worker
+            $toAdd = $target - $current;
+            for ($i = 0; $i < $toAdd; $i++) {
+                $this->normalWorkerCoroutines[] = Coroutine::run(function (): void {
+                    $this->runNormalWorker();
+                });
+            }
+            $this->normalWorkers = $target;
+            $this->info(sprintf('[auto-scaler] normal workers %d → %d (+%d)', $current, $target, $toAdd));
+        } elseif ($target < $current) {
+            // 缩容：push null 让多余 worker 退出
+            $toStop = $current - $target;
+            for ($i = 0; $i < $toStop; $i++) {
+                try {
+                    $this->normalChannel->push(null);
+                } catch (Throwable) {
+                    break;
+                }
+            }
+            $this->normalWorkers = $target;
+            $this->info(sprintf('[auto-scaler] normal workers %d → %d (-%d)', $current, $target, $toStop));
+        }
+    }
+
+    private function scaleHighWorkers(int $target): void
+    {
+        $current = count($this->highWorkerCoroutines);
+
+        if ($target > $current) {
+            $toAdd = $target - $current;
+            for ($i = 0; $i < $toAdd; $i++) {
+                $this->highWorkerCoroutines[] = Coroutine::run(function (): void {
+                    $this->runHighWorker();
+                });
+            }
+            $this->highWorkers = $target;
+            $this->info(sprintf('[auto-scaler] high workers %d → %d (+%d)', $current, $target, $toAdd));
+        } elseif ($target < $current) {
+            $toStop = $current - $target;
+            for ($i = 0; $i < $toStop; $i++) {
+                try {
+                    $this->highChannel->push(null);
+                } catch (Throwable) {
+                    break;
+                }
+            }
+            $this->highWorkers = $target;
+            $this->info(sprintf('[auto-scaler] high workers %d → %d (-%d)', $current, $target, $toStop));
+        }
+    }
+
+    /**
+     * 从认证侧标记的 Redis key 统计活跃客户端数量
+     * 30s 内复用缓存，避免频繁 SCAN
+     */
+    private function getActiveClientCount(): int
+    {
+        $now = time();
+
+        if (($now - $this->lastScanTime) < 30) {
+            return $this->cachedClientCount;
+        }
+
+        try {
+            $count = withRedisForKey(
+                'edge:client:alive:*',
+                static function (\Redis $conn): int {
+                    $n = 0;
+                    $it = null;
+                    do {
+                        $keys = $conn->scan($it, 'edge:client:alive:*', 500);
+                        if (! empty($keys) && is_array($keys)) {
+                            $n += count($keys);
+                        }
+                    } while ($it > 0);
+                    return $n;
+                }
+            );
+
+            $this->cachedClientCount = $count > 0 ? $count : 1;
+            $this->lastScanTime = $now;
+            return $this->cachedClientCount;
+        } catch (Throwable $e) {
+            fwrite(STDERR, '[getActiveClientCount] ' . $e->getMessage() . PHP_EOL);
+            return $this->cachedClientCount;
+        }
     }
 
     /* ==================== MQTT 连通性探针 ==================== */
@@ -575,6 +814,15 @@ class EdgeInsertRedisDimCommand extends Command
         $this->deadWorkers = $this->configInt('edge.mqtt.dead_workers', 1);
         $this->workerIdleTimeoutSec = $this->configInt('edge.mqtt.worker_idle_timeout', 5);
 
+        // ★ Auto-scaler 配置
+        $this->autoScaleEnabled = ((int) $this->option('auto-scale')) === 1;
+        $this->autoScaleIntervalSec = max(10, (int) $this->option('auto-scale-interval'));
+        $this->sampleRateMin = (float) $this->option('sample-rate-min');
+        $this->sampleRateMax = (float) $this->option('sample-rate-max');
+
+        $this->targetNormalWorkers = $this->normalWorkers;
+        $this->targetHighWorkers = $this->highWorkers;
+
         $this->normalChannel = new Channel($normalChannelSize);
         $this->highChannel = new Channel($highChannelSize);
         $this->deadChannel = new Channel($deadChannelSize);
@@ -797,7 +1045,7 @@ class EdgeInsertRedisDimCommand extends Command
         }
     }
 
-    /* ==================== 普通 Worker ==================== */
+    /* ==================== 普通 Worker（支持缩容退出）==================== */
 
     private function runNormalWorker(): void
     {
@@ -808,6 +1056,7 @@ class EdgeInsertRedisDimCommand extends Command
         $workerId = Coroutine::getCurrent()->getId();
 
         $this->debugWorker('normal', $workerId, 'started');
+        $this->activeNormalWorkers++;
 
         while (true) {
             if ($this->stopping && $this->normalChannel->isAvailable() === false) {
@@ -831,11 +1080,18 @@ class EdgeInsertRedisDimCommand extends Command
                 continue;
             }
 
+            // ★ null = 缩容信号 或 停机信号
             if ($item === null) {
                 if ($batch !== []) {
                     $this->flushNormalBatch($batch);
                     $batch = [];
                     $lastFlush = microtime(true);
+                }
+
+                // 缩容：如果当前 worker 数已超过目标，退出
+                $currentAlive = $this->countAliveWorkers($this->normalWorkerCoroutines);
+                if ($currentAlive > $this->targetNormalWorkers) {
+                    break;
                 }
 
                 if ($this->stopping) {
@@ -845,7 +1101,6 @@ class EdgeInsertRedisDimCommand extends Command
             }
 
             $batch[] = $item;
-            $this->activeNormalWorkers++;
 
             if (count($batch) >= $capacity) {
                 $this->flushNormalBatch($batch);
@@ -858,7 +1113,7 @@ class EdgeInsertRedisDimCommand extends Command
         $this->debugWorker('normal', $workerId, 'stopped');
     }
 
-    /* ==================== 高优 Worker ==================== */
+    /* ==================== 高优 Worker（支持缩容退出）==================== */
 
     private function runHighWorker(): void
     {
@@ -869,6 +1124,7 @@ class EdgeInsertRedisDimCommand extends Command
         $workerId = Coroutine::getCurrent()->getId();
 
         $this->debugWorker('high', $workerId, 'started');
+        $this->activeHighWorkers++;
 
         while (true) {
             $timeout = $this->stopping ? 0 : max(0, (int) (
@@ -895,6 +1151,12 @@ class EdgeInsertRedisDimCommand extends Command
                     $lastFlush = microtime(true);
                 }
 
+                // 缩容检查
+                $currentAlive = $this->countAliveWorkers($this->highWorkerCoroutines);
+                if ($currentAlive > $this->targetHighWorkers) {
+                    break;
+                }
+
                 if ($this->stopping) {
                     break;
                 }
@@ -902,7 +1164,6 @@ class EdgeInsertRedisDimCommand extends Command
             }
 
             $batch[] = $item;
-            $this->activeHighWorkers++;
 
             if (count($batch) >= $capacity) {
                 $this->flushHighBatch($batch);
@@ -915,7 +1176,7 @@ class EdgeInsertRedisDimCommand extends Command
         $this->debugWorker('high', $workerId, 'stopped');
     }
 
-    /* ==================== 死信 Worker ==================== */
+    /* ==================== 死信 Worker（不变）==================== */
 
     private function runDeadLetterWorker(): void
     {
@@ -926,6 +1187,7 @@ class EdgeInsertRedisDimCommand extends Command
         $workerId = Coroutine::getCurrent()->getId();
 
         $this->debugWorker('dead', $workerId, 'started');
+        $this->activeDeadWorkers++;
 
         while (true) {
             $timeout = $this->stopping ? 0 : max(0, (int) (
@@ -959,7 +1221,6 @@ class EdgeInsertRedisDimCommand extends Command
             }
 
             $batch[] = $item;
-            $this->activeDeadWorkers++;
 
             if (count($batch) >= $capacity) {
                 $this->flushDeadLetterBatch($batch);
@@ -970,6 +1231,24 @@ class EdgeInsertRedisDimCommand extends Command
 
         $this->activeDeadWorkers = max(0, $this->activeDeadWorkers - 1);
         $this->debugWorker('dead', $workerId, 'stopped');
+    }
+
+    /**
+     * 统计存活 worker 数
+     */
+    private function countAliveWorkers(array $coroutines): int
+    {
+        $alive = 0;
+        foreach ($coroutines as $coroutine) {
+            try {
+                if ($coroutine->isAlive()) {
+                    $alive++;
+                }
+            } catch (Throwable) {
+                // ignore
+            }
+        }
+        return $alive;
     }
 
     /* ==================== Redis 写入 ==================== */
@@ -1049,7 +1328,6 @@ class EdgeInsertRedisDimCommand extends Command
             $this->exporter->inc('edge_redis_write_failed_total', $count);
             $this->pushDeadLetter($batch, $e->getMessage());
         }
-        // activeNormalWorkers 由 Worker 生命周期管理，finally 不再递减
     }
 
     private function flushHighBatch(array $batch): void
@@ -1127,7 +1405,6 @@ class EdgeInsertRedisDimCommand extends Command
             $this->exporter->inc('edge_redis_write_failed_total', $count);
             $this->pushDeadLetter($batch, $e->getMessage());
         }
-        // activeHighWorkers 由 Worker 生命周期管理，finally 不再递减
     }
 
     private function flushDeadLetterBatch(array $batch): void
@@ -1196,10 +1473,9 @@ class EdgeInsertRedisDimCommand extends Command
                 $e->getMessage(),
             ));
         }
-        // activeDeadWorkers 由 Worker 生命周期管理，finally 不再递减
     }
 
-    /* ==================== Prometheus 指标 ==================== */
+    /* ==================== Prometheus 指标（追加 auto-scale 指标）==================== */
 
     private function collectWorkerMetrics(): void
     {
@@ -1242,7 +1518,15 @@ class EdgeInsertRedisDimCommand extends Command
         $this->exporter->set('edge_qps', $this->calculateQps());
         $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && ! $this->stopping ? 1 : 0);
 
-        // 直方图占位：让 Prometheus 发现指标名，实际分布数据来自 $exporter->histograms
+        // ★ Auto-scale 指标
+        $this->exporter->set('edge_active_clients', $this->activeClientCount);
+        $this->exporter->set('edge_target_workers_normal', $this->targetNormalWorkers);
+        $this->exporter->set('edge_target_workers_high', $this->targetHighWorkers);
+        $this->exporter->set('edge_sample_rate', $this->sampleRate);
+        $this->exporter->set('edge_current_batch_size', $this->normalBatchSize);
+        $this->exporter->set('edge_current_flush_interval_ms', $this->normalFlushIntervalMs);
+
+        // 直方图占位
         $this->exporter->set('edge_flush_duration_ms_normal', 0);
         $this->exporter->set('edge_flush_duration_ms_high', 0);
         $this->exporter->set('edge_flush_duration_ms_dead', 0);
@@ -1328,7 +1612,9 @@ class EdgeInsertRedisDimCommand extends Command
         $this->info(sprintf('普通写入：%d', $this->normalFlushedCount));
         $this->info(sprintf('高优写入：%d', $this->highFlushedCount));
         $this->info(sprintf('死信写入：%d', $this->deadFlushedCount));
-        $this->info(sprintf('丢弃消息：%d', $this->droppedCount));
+        $this->info(sprintf('丢弃消息：%d（采样+超限）', $this->droppedCount));
+        $this->info(sprintf('活跃客户端：%d', $this->activeClientCount));
+        $this->info(sprintf('采样率：%.2f', $this->sampleRate));
         $this->info(sprintf('总写入 QPS：%.1f msg/s', $qps));
         $this->info(sprintf('普通平均刷盘：%.2fms', $avgNormalMs));
         $this->info(sprintf('高优平均刷盘：%.2fms', $avgHighMs));
@@ -1340,10 +1626,12 @@ class EdgeInsertRedisDimCommand extends Command
             $this->deadBacklog,
         ));
         $this->info(sprintf(
-            '活跃 Worker：normal=%d high=%d dead=%d',
+            '活跃 Worker：normal=%d high=%d dead=%d (target: n=%d h=%d)',
             $this->activeNormalWorkers,
             $this->activeHighWorkers,
             $this->activeDeadWorkers,
+            $this->targetNormalWorkers,
+            $this->targetHighWorkers,
         ));
         $this->info('==============================');
     }

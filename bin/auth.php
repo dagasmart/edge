@@ -18,14 +18,52 @@ function authRespond(ServerConnection $conn, bool $allow, string $reason, int $h
         : ($allow ? 200 : 403);
 
     respondJson($conn, [
-        'result'  => $allow ? 'allow' : 'deny',
-        'code'    => $allow ? 0 : 1,
+        'result' => $allow ? 'allow' : 'deny',
+        'code' => $allow ? 0 : 1,
         'message' => $allow ? 'success' : $reason,
-        'data'    => [
+        'data' => [
             'result' => $allow ? 'allow' : 'deny',
             'reason' => $reason,
         ],
     ], $status);
+}
+
+/**
+ * 标记客户端活跃（认证成功时调用）
+ *
+ * ★ TTL = 120s，每认证成功一次续期
+ * ★ 掉线/断连后最多 2 分钟自动过期，入库侧统计自动收敛
+ * ★ 按 clientId 路由 key，分片模式下落到正确 shard
+ */
+function markClientAlive(string $clientId, string $username, int $ttl = 120): void
+{
+    $key = 'edge:client:alive:'.$clientId;
+    try {
+        withRedisForKey($key, static function (Redis $conn) use ($key, $ttl, $clientId, $username): void {
+            $conn->setex($key, $ttl, json_encode([
+                'client_id' => $clientId,
+                'username' => $username,
+                'ts' => microtime(true),
+            ], JSON_UNESCAPED_UNICODE));
+        });
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[markClientAlive] '.$e->getMessage().PHP_EOL);
+    }
+}
+
+/**
+ * 主动清除活跃标记（disconnect webhook 调用，非必须，TTL 兜底即可）
+ */
+function unmarkClientAlive(string $clientId): void
+{
+    $key = 'edge:client:alive:'.$clientId;
+    try {
+        withRedisForKey($key, static function (Redis $conn) use ($key): void {
+            $conn->del($key);
+        });
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[unmarkClientAlive] '.$e->getMessage().PHP_EOL);
+    }
 }
 
 /**
@@ -36,9 +74,10 @@ function authRespond(ServerConnection $conn, bool $allow, string $reason, int $h
 function getDeviceSecret(string $clientId, string $username): ?string
 {
     // 1. 优先完整格式
-    $key = 'device:secret:' . $clientId . ':' . $username;
+    $key = 'device:secret:'.$clientId.':'.$username;
     $val = withRedisForKey($key, static function (Redis $conn) use ($key): mixed {
         $v = $conn->get($key);
+
         return $v !== false ? (string) $v : null;
     });
     if ($val !== null && $val !== '') {
@@ -46,9 +85,10 @@ function getDeviceSecret(string $clientId, string $username): ?string
     }
 
     // 2. 兜底：兼容旧格式 device:secret:{username}
-    $legacyKey = 'device:secret:' . $username;
+    $legacyKey = 'device:secret:'.$username;
     $val = withRedisForKey($legacyKey, static function (Redis $conn) use ($legacyKey): mixed {
         $v = $conn->get($legacyKey);
+
         return $v !== false ? (string) $v : null;
     });
     if ($val !== null && $val !== '') {
@@ -60,6 +100,7 @@ function getDeviceSecret(string $clientId, string $username): ?string
         } catch (Throwable) {
             // 回填失败不影响本次认证
         }
+
         return $val;
     }
 
@@ -76,6 +117,7 @@ function getDeviceSecret(string $clientId, string $username): ?string
         } catch (Throwable) {
             // 回填失败不影响本次认证
         }
+
         return $secret;
     }
 
@@ -87,20 +129,22 @@ function fallbackToPg(string $clientId, string $username): ?string
     $baseUrl = authFallbackUrl();
     if ($baseUrl === '') {
         debugLog('fallbackToPg: EDGE_AUTH_FALLBACK_URL not configured');
+
         return null;
     }
 
     $token = (string) getenv('EDGE_INTERNAL_TOKEN');
     if ($token === '') {
         debugLog('fallbackToPg: EDGE_INTERNAL_TOKEN not configured');
+
         return null;
     }
 
     $url = rtrim($baseUrl, '/')
-        . '/extension/edge/auth/fallback'
-        . '?client_id=' . rawurlencode($clientId)
-        . '&username=' . rawurlencode($username)
-        . '&service=nano';
+        .'/extension/edge/auth/fallback'
+        .'?client_id='.rawurlencode($clientId)
+        .'&username='.rawurlencode($username)
+        .'&service=nano';
 
     try {
         $ch = curl_init($url);
@@ -109,7 +153,7 @@ function fallbackToPg(string $clientId, string $username): ?string
             CURLOPT_TIMEOUT => 2,
             CURLOPT_CONNECTTIMEOUT => 1,
             CURLOPT_HTTPHEADER => [
-                'X-Edge-Internal: ' . $token,
+                'X-Edge-Internal: '.$token,
                 'Accept: application/json',
             ],
         ]);
@@ -120,7 +164,8 @@ function fallbackToPg(string $clientId, string $username): ?string
         curl_close($ch);
 
         if ($error !== '') {
-            fwrite(STDERR, '[fallbackToPg] curl error: ' . $error . PHP_EOL);
+            fwrite(STDERR, '[fallbackToPg] curl error: '.$error.PHP_EOL);
+
             return null;
         }
 
@@ -131,6 +176,7 @@ function fallbackToPg(string $clientId, string $username): ?string
                 $clientId,
                 $username
             ));
+
             return null;
         }
 
@@ -141,7 +187,8 @@ function fallbackToPg(string $clientId, string $username): ?string
 
         return (string) $data['password'];
     } catch (Throwable $e) {
-        fwrite(STDERR, '[fallbackToPg] ' . $e->getMessage() . PHP_EOL);
+        fwrite(STDERR, '[fallbackToPg] '.$e->getMessage().PHP_EOL);
+
         return null;
     }
 }
@@ -166,10 +213,12 @@ function authFallbackUrl(): string
             $scheme = ($parts['scheme'] ?? 'http');
 
             if ($port !== null) {
-                return $scheme . '://' . $host . ':' . $port;
+                return $scheme.'://'.$host.':'.$port;
             }
-            return $scheme . '://' . $host;
+
+            return $scheme.'://'.$host;
         }
+
         return '';
     }
 
@@ -183,7 +232,7 @@ function authFallbackUrl(): string
         $port = 8000;
     }
 
-    return 'http://' . $host . ':' . $port;
+    return 'http://'.$host.':'.$port;
 }
 
 function authenticateDevice(string $clientId, string $username, string $password): array
@@ -213,8 +262,8 @@ function acquireUserOnline(
     int $ttl = 300,
     int $retryWindow = 30
 ): bool {
-    $key = 'auth:online:' . $username;
-    $retryKey = 'auth:retry:' . $username . ':' . $clientId;
+    $key = 'auth:online:'.$username;
+    $retryKey = 'auth:retry:'.$username.':'.$clientId;
 
     $script = <<<'LUA'
 local cur = redis.call('GET', KEYS[1])
@@ -270,7 +319,7 @@ LUA;
 
         return $ret === 1;
     } catch (Throwable $e) {
-        fwrite(STDERR, '[acquireUserOnline] ' . $e->getMessage() . PHP_EOL);
+        fwrite(STDERR, '[acquireUserOnline] '.$e->getMessage().PHP_EOL);
 
         return false;
     }
@@ -278,8 +327,8 @@ LUA;
 
 function releaseUserOnline(string $username, string $clientId): void
 {
-    $key = 'auth:online:' . $username;
-    $retryKey = 'auth:retry:' . $username . ':' . $clientId;
+    $key = 'auth:online:'.$username;
+    $retryKey = 'auth:retry:'.$username.':'.$clientId;
 
     $script = <<<'LUA'
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -297,7 +346,7 @@ LUA;
             }
         );
     } catch (Throwable $e) {
-        fwrite(STDERR, '[releaseUserOnline] ' . $e->getMessage() . PHP_EOL);
+        fwrite(STDERR, '[releaseUserOnline] '.$e->getMessage().PHP_EOL);
     }
 }
 
@@ -359,7 +408,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         return;
     }
 
-    $rateKey = 'rate:' . $clientId;
+    $rateKey = 'rate:'.$clientId;
     if (rateLimited($rateKey)) {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
@@ -385,14 +434,17 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         }
 
         // ★ 按 clientId 路由清除 fail/block 计数
-        $failKey = 'fail:' . $clientId;
-        $blockKey = 'block:' . $clientId;
+        $failKey = 'fail:'.$clientId;
+        $blockKey = 'block:'.$clientId;
         try {
             withRedisForKey($failKey, static function (Redis $conn) use ($failKey, $blockKey): void {
                 $conn->del($failKey, $blockKey);
             });
         } catch (Throwable) {
         }
+
+        // ★ 认证成功 → 标记活跃，TTL 120s，供入库侧自适应统计
+        markClientAlive($clientId, $username, 120);
 
         EdgeAuthContext::setAuth($username, $clientId);
 
@@ -409,7 +461,7 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
                 releaseUserOnline($authedUsername, $authedClientId);
             }
         } catch (Throwable $e) {
-            fwrite(STDERR, '[release-online] ' . $e->getMessage() . PHP_EOL);
+            fwrite(STDERR, '[release-online] '.$e->getMessage().PHP_EOL);
         } finally {
             EdgeAuthContext::clear();
         }
