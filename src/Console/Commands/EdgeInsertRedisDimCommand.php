@@ -22,10 +22,10 @@ use Throwable;
  *     ├─ 高优 topic → highChannel → HighWorkerPool → stream:device:high
  *     ├─ 普通 topic → normalChannel → NormalWorkerPool → stream:device:data
  *     ├─ 写入失败 → deadChannel → DeadLetterWorkerPool → stream:device:dead
- *     └─ Auto-Scaler：根据入库侧 edge:device:active:* 在线数自适应调节 worker/batch/采样
+ *     └─ Auto-Scaler：根据入库侧 device:active:* 在线数自适应调节 worker/batch/采样
  *
- * ★ 认证侧与入库侧解耦：auth.php 不再写 edge:client:alive:*
- * ★ 心跳 topic 匹配即续期 edge:device:active:{sn}（payload 异常也续）
+ * ★ 认证侧与入库侧解耦：auth.php 不再写 device:alive:*
+ * ★ 心跳 topic 匹配即续期 device:active:{sn}（payload 异常也续）
  */
 class EdgeInsertRedisDimCommand extends Command
 {
@@ -34,7 +34,7 @@ class EdgeInsertRedisDimCommand extends Command
         {--auto-scale-interval=30 : 自动伸缩评估间隔(秒)}
         {--sample-rate-min=0.2 : 最小采样率(低负载时)}
         {--sample-rate-max=1.0 : 最大采样率}
-        {--device-active-ttl=120 : 设备活跃 key TTL(秒)}
+        {--device-active-ttl= : 设备活跃 key TTL(秒)}
         {--heartbeat-topic=heartbeat/response : 心跳 topic}';
 
     protected $description = '订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（含自适应调节）';
@@ -378,7 +378,7 @@ class EdgeInsertRedisDimCommand extends Command
     /* ==================== ★ 心跳续期 ==================== */
 
     /**
-     * 写 edge:device:active:{sn} EX ttl
+     * 写 device:active:{sn} EX ttl
      * key 集中落在 shard 0（helper.php redisExtractRouteValue 显式声明）
      */
     protected function renewDeviceActive(string $sn): void
@@ -556,7 +556,7 @@ class EdgeInsertRedisDimCommand extends Command
 
     /**
      * 从入库侧心跳续期的 Redis key 统计活跃设备数量
-     * SCAN edge:device:active:* 只在 shard 0 上执行（所有 key 集中存储）
+     * SCAN device:active:* 只在 shard 0 上执行（所有 key 集中存储）
      * 30s 内复用缓存，避免频繁 SCAN
      */
     private function getActiveClientCount(): int
@@ -568,7 +568,7 @@ class EdgeInsertRedisDimCommand extends Command
         }
 
         try {
-            $pattern = 'edge:device:active:*';
+            $pattern = 'device:active:*';
             $count = withRedisForKey(
                 $pattern,
                 static function (\Redis $conn) use ($pattern): int {
