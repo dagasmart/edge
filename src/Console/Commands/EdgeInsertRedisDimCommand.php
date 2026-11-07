@@ -32,42 +32,61 @@ class EdgeInsertRedisDimCommand extends Command
 
     /* ==================== Stream ==================== */
     private const string STREAM_HIGH = 'stream:device:high';
+
     private const string STREAM_DATA = 'stream:device:data';
+
     private const string STREAM_DEAD = 'stream:device:dead';
+
     private const string STREAM_HEARTBEAT = 'stream:device:heartbeat';
+
     private const int STREAM_MAX_LEN = 50_000;
+
     private const int DEAD_MAX_LEN = 10_000;
+
     private const int HEARTBEAT_MAX_LEN = 100_000;
 
     /* ==================== 组件 ==================== */
     private PrometheusExporter $exporter;
+
     private PriorityRouter $router;
+
     private MultiDimAdaptiveBatch $adaptiveBatch;
 
     /* ==================== 普通 Channel ==================== */
     private Channel $normalChannel;
+
     private int $normalBatchSize;
+
     private int $normalFlushIntervalMs;
 
     /* ==================== 高优 Channel ==================== */
     private Channel $highChannel;
+
     private int $highBatchSize;
+
     private int $highFlushIntervalMs;
 
     /* ==================== 死信 Channel ==================== */
     private Channel $deadChannel;
+
     private int $deadBatchSize;
+
     private int $deadFlushIntervalMs;
 
     /* ==================== 公共 ==================== */
     private int $maxPayloadLen;
+
     private bool $stopping = false;
+
     private ?NanoMQ $mqtt = null;
 
     /* ==================== Worker 池配置 ==================== */
     private int $normalWorkers;
+
     private int $highWorkers;
+
     private int $deadWorkers;
+
     private int $workerIdleTimeoutSec;
 
     /* ==================== Worker 协程引用 ==================== */
@@ -82,47 +101,77 @@ class EdgeInsertRedisDimCommand extends Command
 
     /* ==================== 活跃 Worker 计数 ==================== */
     private int $activeNormalWorkers = 0;
+
     private int $activeHighWorkers = 0;
+
     private int $activeDeadWorkers = 0;
 
     /* ==================== Auto-Scaler 状态 ==================== */
     private bool $autoScaleEnabled = true;
+
     private int $autoScaleIntervalSec = 30;
+
     private float $sampleRateMin = 0.2;
+
     private float $sampleRateMax = 1.0;
+
     private float $sampleRate = 1.0;
+
     private int $targetNormalWorkers = 4;
+
     private int $targetHighWorkers = 2;
+
     private int $activeClientCount = 0;
+
     private int $lastScanTime = 0;
+
     private int $cachedClientCount = 1;
 
     /* ==================== ★ 心跳配置 ==================== */
     private int $deviceActiveTtl = 120;
+
     private string $heartbeatTopic = 'heartbeat/response';
-    private bool $heartbeatWriteStream = true; // ★ 开关：心跳是否写 Redis Stream
+
+    private bool $heartbeatWriteStream = true;
 
     /* ==================== 统计 ==================== */
     private int $receivedCount = 0;
+
     private int $normalFlushedCount = 0;
+
     private int $highFlushedCount = 0;
+
     private int $deadFlushedCount = 0;
+
     private int $heartbeatFlushedCount = 0;
+
     private int $droppedCount = 0;
+
     private float $normalFlushLatencySum = 0.0;
+
     private int $normalFlushTimes = 0;
+
     private float $highFlushLatencySum = 0.0;
+
     private int $highFlushTimes = 0;
+
     private float $deadFlushLatencySum = 0.0;
+
     private int $deadFlushTimes = 0;
+
     private float $startTime;
+
     private float $lastNormalWaitMs = 0.0;
+
     private float $lastHighWaitMs = 0.0;
+
     private float $lastDeadWaitMs = 0.0;
 
     /** 自维护积压 */
     private int $normalBacklog = 0;
+
     private int $highBacklog = 0;
+
     private int $deadBacklog = 0;
 
     /** @var array<float, int> */
@@ -131,7 +180,7 @@ class EdgeInsertRedisDimCommand extends Command
     public function handle(): int
     {
         $this->startTime = microtime(true);
-        $this->info('[edge:insert-redis] 启动，PID=' . getmypid());
+        $this->info('[edge:insert-redis] 启动，PID='.getmypid());
 
         $this->loadConfig();
         $this->initComponents();
@@ -141,7 +190,6 @@ class EdgeInsertRedisDimCommand extends Command
         $metricsPort = $this->configInt('edge.metrics.port', 9090);
         $metricsHost = config('edge.metrics.host', '0.0.0.0');
 
-        // ★ Windows 上 0.0.0.0 有时 bind 了但连不进来，强制转 127.0.0.1
         if ($metricsHost === '0.0.0.0') {
             $metricsHost = '127.0.0.1';
         }
@@ -159,32 +207,37 @@ class EdgeInsertRedisDimCommand extends Command
         echo "[metrics] Prometheus 预览 {$scheme}://{$serverIp}:{$metricsPort}/metrics\n";
         echo "[metrics] Prometheus 接口 {$scheme}://{$serverIp}:{$metricsPort}/api/metrics\n";
 
-        // 启动 Worker 池
         $this->startNormalWorkerPool();
         $this->startHighWorkerPool();
         $this->startDeadLetterWorkerPool();
 
-        // ★ 启动 Auto-Scaler
         if ($this->autoScaleEnabled) {
             $this->startAutoScaler();
         }
 
-        // 启动期探针
         $this->probeMqttConnectivity();
-
-        // 运行期定时探针
         $this->startPeriodicMqttProbe();
 
         $topics = $this->resolveTopics();
 
-        // MQTT 连接 + 自动重连循环
-        while (! $this->stopping) {
+        // ★ 重连配置
+        $maxReconnects = 10;
+        $reconnectCount = 0;
+        $reconnectDelay = 3;
+
+        while (true) {
+            // ★ 循环顶部检查停止信号
+            if ($this->stopping) {
+                $this->info('[edge] 收到停止信号，不再重连，退出中...');
+                break;
+            }
+
             try {
                 $this->mqtt = new NanoMQ;
 
                 $this->info('=====================================');
                 $this->info(sprintf('MQTT 订阅已启动 | %s', $this->nowString()));
-                $this->info('订阅主题：' . implode(', ', $topics));
+                $this->info('订阅主题：'.implode(', ', $topics));
                 $this->info(sprintf(
                     '普通：batch=%d interval=%dms channel=%d workers=%d',
                     $this->normalBatchSize,
@@ -258,7 +311,7 @@ class EdgeInsertRedisDimCommand extends Command
                             $device = strtoupper((string) $data->sn);
                         }
                     } catch (Throwable) {
-                        // 非法 payload 仍写入，由下游处理
+                        // ignore
                     }
 
                     $this->line(sprintf(
@@ -268,7 +321,6 @@ class EdgeInsertRedisDimCommand extends Command
                         $payloadLen,
                     ));
 
-                    // ★★★ 心跳 topic → 续期 + 条件入库 ★★★
                     $isHeartbeat = ($topic === $this->heartbeatTopic);
                     if ($isHeartbeat) {
                         $activeKey = ($device !== 'unknown') ? $device : null;
@@ -276,14 +328,11 @@ class EdgeInsertRedisDimCommand extends Command
                             $this->renewDeviceActive($activeKey);
                         }
 
-                        // ★ 开关关闭 → 只续期，不入库
                         if (! $this->heartbeatWriteStream) {
                             return;
                         }
-                        // 开关打开 → 继续往下走入库逻辑
                     }
 
-                    // ★ 采样门控（心跳不参与采样，全部保留）
                     if (! $isHeartbeat && ! $this->router->isHighPriority($topic) && $this->sampleRate < 1.0) {
                         if ((mt_rand(1, 10000) / 10000.0) > $this->sampleRate) {
                             $this->droppedCount++;
@@ -305,7 +354,6 @@ class EdgeInsertRedisDimCommand extends Command
                     $this->exporter->inc('edge_received_total');
                     $this->qpsWindow[] = microtime(true);
 
-                    // ★ 心跳 → 高优通道（复用 highChannel）
                     if ($isHeartbeat) {
                         $this->routeToHighChannel($item, $device);
                     } elseif ($this->router->isHighPriority($topic)) {
@@ -319,23 +367,123 @@ class EdgeInsertRedisDimCommand extends Command
                     $this->mqtt->subscribe($topic, $handler);
                 }
 
-                $this->mqtt->wait();
+                // ★ 记录连接建立时间
+                $connectedAt = microtime(true);
+
+                // ★ 内层等待循环：每 1 秒检查信号 + 协程状态
+                while ($this->mqtt->isRunning()) {
+                    if ($this->stopping) {
+                        $this->info('[edge] 收到停止信号，正在退出...');
+                        try {
+                            $this->mqtt->disconnect();
+                        } catch (Throwable) {
+                            // ignore
+                        }
+                        break 2;
+                    }
+
+                    sleep(1);
+                }
 
                 if ($this->stopping) {
                     break;
                 }
 
-                $this->warn('[mqtt] 连接断开，3 秒后重连...');
-                sleep(3);
+                // ★ 判断连接持续时间
+                $connectionDuration = microtime(true) - $connectedAt;
+
+                if ($connectionDuration >= 10.0) {
+                    $reconnectCount = 0;
+                    $this->info(sprintf(
+                        '[mqtt] 连接稳定 %.1fs，重连计数已重置',
+                        $connectionDuration,
+                    ));
+                } else {
+                    $reconnectCount++;
+                    $this->warn(sprintf(
+                        '[mqtt] 连接断开（持续 %.1fs，第 %d/%d 次重连）...',
+                        $connectionDuration,
+                        $reconnectCount,
+                        $maxReconnects,
+                    ));
+                }
+
+                if ($reconnectCount >= $maxReconnects) {
+                    $this->error(sprintf(
+                        '[mqtt] 连续重连 %d 次失败，放弃连接，进程退出（PID=%d）',
+                        $maxReconnects,
+                        getmypid(),
+                    ));
+                    $this->printStats();
+                    $this->exporter->stop();
+
+                    return 1;
+                }
+
+                $this->warn(sprintf('[mqtt] %d 秒后重连...', $reconnectDelay));
+
+                // ★ 可中断的重连延迟
+                $elapsed = 0;
+                while ($elapsed < $reconnectDelay) {
+                    if ($this->stopping) {
+                        break 2;
+                    }
+                    sleep(1);
+                    $elapsed++;
+                }
+
             } catch (Throwable $e) {
                 if ($this->stopping) {
                     break;
                 }
 
-                $this->error('[mqtt] 连接异常：' . $e->getMessage() . '，3 秒后重连...');
-                sleep(3);
+                $reconnectCount++;
+                $this->error(sprintf(
+                    '[mqtt] 连接异常：%s（第 %d/%d 次）',
+                    $e->getMessage(),
+                    $reconnectCount,
+                    $maxReconnects,
+                ));
+
+                if ($reconnectCount >= $maxReconnects) {
+                    $this->error(sprintf(
+                        '[mqtt] 连续重连 %d 次失败，放弃连接，进程退出（PID=%d）',
+                        $maxReconnects,
+                        getmypid(),
+                    ));
+                    $this->printStats();
+                    $this->exporter->stop();
+
+                    return 1;
+                }
+
+                $this->error(sprintf('[mqtt] %d 秒后重连...', $reconnectDelay));
+
+                // ★ 可中断的重连延迟
+                $elapsed = 0;
+                while ($elapsed < $reconnectDelay) {
+                    if ($this->stopping) {
+                        break 2;
+                    }
+                    sleep(1);
+                    $elapsed++;
+                }
             }
         }
+
+        // ★★★ 信号退出：快速清理，跳过 drain ★★★
+        if ($this->stopping) {
+            $this->info('[edge] 快速退出模式');
+            $this->printStats();
+            $this->info('[edge:insert-redis] 已停止');
+            exit(0);
+        }
+
+        // ★ 正常退出才走完整清理
+        $this->wakeupChannel($this->normalChannel);
+        $this->wakeupChannel($this->highChannel);
+        $this->wakeupChannel($this->deadChannel);
+        $this->drainWorkerPools();
 
         $this->printStats();
         $this->exporter->stop();
@@ -348,7 +496,7 @@ class EdgeInsertRedisDimCommand extends Command
 
     protected function renewDeviceActive(string $sn): void
     {
-        $key = 'device:active:' . $sn;
+        $key = 'device:active:'.$sn;
         $ttl = $this->deviceActiveTtl;
 
         try {
@@ -360,7 +508,7 @@ class EdgeInsertRedisDimCommand extends Command
             });
             $this->exporter->inc('edge_heartbeat_renew_total');
         } catch (Throwable $e) {
-            fwrite(STDERR, '[renewDeviceActive] ' . $e->getMessage() . PHP_EOL);
+            fwrite(STDERR, '[renewDeviceActive] '.$e->getMessage().PHP_EOL);
         }
     }
 
@@ -546,7 +694,7 @@ class EdgeInsertRedisDimCommand extends Command
 
             return $this->cachedClientCount;
         } catch (Throwable $e) {
-            fwrite(STDERR, '[getActiveClientCount] ' . $e->getMessage() . PHP_EOL);
+            fwrite(STDERR, '[getActiveClientCount] '.$e->getMessage().PHP_EOL);
 
             return $this->cachedClientCount;
         }
@@ -601,6 +749,7 @@ class EdgeInsertRedisDimCommand extends Command
         $interval = $this->configInt('edge.mqtt.probe_interval_sec', 30);
         if ($interval <= 0) {
             $this->info('[mqtt-probe:periodic] 已禁用（probe_interval_sec <= 0）');
+
             return;
         }
 
@@ -810,12 +959,12 @@ class EdgeInsertRedisDimCommand extends Command
         // ★ 心跳续期配置
         $opt = $this->option('device-active-ttl');
         $this->deviceActiveTtl = max(10, (int) (
-        $opt === null || $opt === '' ? config('edge.mqtt.device_active_ttl', 120) : $opt
+            $opt === null || $opt === '' ? config('edge.mqtt.device_active_ttl', 120) : $opt
         ));
 
         $this->heartbeatTopic = $this->option('heartbeat-topic') ?: 'heartbeat/response';
 
-        // ★ 心跳写 Stream 开关（命令行参数 > config > 默认 true）
+        // ★ 心跳写 Stream 开关
         $hbWriteOpt = $this->option('heartbeat-write-stream');
         $this->heartbeatWriteStream = match ($hbWriteOpt) {
             '0' => false,
@@ -889,7 +1038,7 @@ class EdgeInsertRedisDimCommand extends Command
     private function routeToNormalChannel(array $item, string $device): void
     {
         if ($this->normalChannel->isFull()) {
-            $this->warn('[CHANNEL] 普通队列已满，丢弃 device=' . $device);
+            $this->warn('[CHANNEL] 普通队列已满，丢弃 device='.$device);
             $this->droppedCount++;
             $this->exporter->inc('edge_dead_letter_total');
 
@@ -901,7 +1050,7 @@ class EdgeInsertRedisDimCommand extends Command
             $this->receivedCount++;
             $this->normalBacklog++;
         } catch (Throwable $e) {
-            $this->error('[CHANNEL] 普通队列 push 失败：' . $e->getMessage());
+            $this->error('[CHANNEL] 普通队列 push 失败：'.$e->getMessage());
             $this->droppedCount++;
         }
     }
@@ -909,7 +1058,7 @@ class EdgeInsertRedisDimCommand extends Command
     private function routeToHighChannel(array $item, string $device): void
     {
         if ($this->highChannel->isFull()) {
-            $this->warn('[CHANNEL] 高优队列已满，降级写死信 device=' . $device);
+            $this->warn('[CHANNEL] 高优队列已满，降级写死信 device='.$device);
             $this->exporter->inc('edge_dead_letter_total');
             $this->pushDeadLetter([$item], 'high_channel_full');
 
@@ -921,7 +1070,7 @@ class EdgeInsertRedisDimCommand extends Command
             $this->receivedCount++;
             $this->highBacklog++;
         } catch (Throwable $e) {
-            $this->error('[CHANNEL] 高优队列 push 失败：' . $e->getMessage());
+            $this->error('[CHANNEL] 高优队列 push 失败：'.$e->getMessage());
             $this->exporter->inc('edge_dead_letter_total');
         }
     }
@@ -963,17 +1112,8 @@ class EdgeInsertRedisDimCommand extends Command
                 $this->warn(sprintf('[signal] 收到 %d，准备优雅停机', $sig));
                 $this->stopping = true;
 
-                try {
-                    $this->mqtt?->disconnect();
-                } catch (Throwable) {
-                    // ignore
-                }
-
-                $this->wakeupChannel($this->normalChannel);
-                $this->wakeupChannel($this->highChannel);
-                $this->wakeupChannel($this->deadChannel);
-
-                $this->drainWorkerPools();
+                // ★ 不再在这里调 disconnect/drainWorkerPools/wakeupChannel
+                // 让主循环自己检查 stopping 标志来退出
             });
         }
     }
@@ -1349,7 +1489,6 @@ class EdgeInsertRedisDimCommand extends Command
                 $conn->multi(\Redis::PIPELINE);
 
                 foreach ($batch as $item) {
-                    // ★ 心跳 → STREAM_HEARTBEAT，其他 → STREAM_HIGH
                     $isHb = $item['is_heartbeat'] ?? false;
                     $stream = $isHb ? self::STREAM_HEARTBEAT : self::STREAM_HIGH;
                     $maxLen = $isHb ? self::HEARTBEAT_MAX_LEN : self::STREAM_MAX_LEN;
@@ -1379,7 +1518,6 @@ class EdgeInsertRedisDimCommand extends Command
                 }
             });
 
-            // ★ 分别统计
             $hbCount = 0;
             $highCount = 0;
             foreach ($batch as $item) {
@@ -1533,7 +1671,6 @@ class EdgeInsertRedisDimCommand extends Command
         $this->exporter->set('edge_qps', $this->calculateQps());
         $this->exporter->set('edge_mqtt_connected', $this->mqtt !== null && ! $this->stopping ? 1 : 0);
 
-        // ★ Auto-scale 指标
         $this->exporter->set('edge_active_clients', $this->activeClientCount);
         $this->exporter->set('edge_target_workers_normal', $this->targetNormalWorkers);
         $this->exporter->set('edge_target_workers_high', $this->targetHighWorkers);
@@ -1541,7 +1678,6 @@ class EdgeInsertRedisDimCommand extends Command
         $this->exporter->set('edge_current_batch_size', $this->normalBatchSize);
         $this->exporter->set('edge_current_flush_interval_ms', $this->normalFlushIntervalMs);
 
-        // ★ 心跳开关状态指标
         $this->exporter->set('edge_heartbeat_write_stream_enabled', $this->heartbeatWriteStream ? 1 : 0);
     }
 
