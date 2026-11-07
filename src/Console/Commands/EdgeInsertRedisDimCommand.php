@@ -22,7 +22,10 @@ use Throwable;
  *     ├─ 高优 topic → highChannel → HighWorkerPool → stream:device:high
  *     ├─ 普通 topic → normalChannel → NormalWorkerPool → stream:device:data
  *     ├─ 写入失败 → deadChannel → DeadLetterWorkerPool → stream:device:dead
- *     └─ Auto-Scaler：根据认证侧 edge:client:alive:* 在线数自适应调节 worker/batch/采样
+ *     └─ Auto-Scaler：根据入库侧 edge:device:active:* 在线数自适应调节 worker/batch/采样
+ *
+ * ★ 认证侧与入库侧解耦：auth.php 不再写 edge:client:alive:*
+ * ★ 心跳 topic 匹配即续期 edge:device:active:{sn}（payload 异常也续）
  */
 class EdgeInsertRedisDimCommand extends Command
 {
@@ -30,7 +33,9 @@ class EdgeInsertRedisDimCommand extends Command
         {--auto-scale=1 : 启用自动伸缩(0/1)}
         {--auto-scale-interval=30 : 自动伸缩评估间隔(秒)}
         {--sample-rate-min=0.2 : 最小采样率(低负载时)}
-        {--sample-rate-max=1.0 : 最大采样率}';
+        {--sample-rate-max=1.0 : 最大采样率}
+        {--device-active-ttl=120 : 设备活跃 key TTL(秒)}
+        {--heartbeat-topic=heartbeat/response : 心跳 topic}';
 
     protected $description = '订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（含自适应调节）';
 
@@ -44,9 +49,6 @@ class EdgeInsertRedisDimCommand extends Command
     private const int STREAM_MAX_LEN = 50_000;
 
     private const int DEAD_MAX_LEN = 10_000;
-
-    /* ==================== 停机排空 ==================== */
-    private const int DRAIN_POP_TIMEOUT_MS = 50;
 
     /* ==================== 组件 ==================== */
     private PrometheusExporter $exporter;
@@ -129,6 +131,11 @@ class EdgeInsertRedisDimCommand extends Command
     private int $lastScanTime = 0;
 
     private int $cachedClientCount = 1;
+
+    /* ==================== ★ 心跳续期配置 ==================== */
+    private int $deviceActiveTtl = 120;
+
+    private string $heartbeatTopic = 'heartbeat/response';
 
     /* ==================== 统计 ==================== */
     private int $receivedCount = 0;
@@ -251,6 +258,11 @@ class EdgeInsertRedisDimCommand extends Command
                     $this->sampleRateMin,
                     $this->sampleRateMax,
                 ));
+                $this->info(sprintf(
+                    '心跳续期：topic=%s ttl=%ds',
+                    $this->heartbeatTopic,
+                    $this->deviceActiveTtl,
+                ));
                 $this->info('按 Ctrl+C 停止');
                 $this->info('=====================================');
 
@@ -295,11 +307,23 @@ class EdgeInsertRedisDimCommand extends Command
                         $payloadLen,
                     ));
 
+                    // ★ 心跳 topic → 无条件续期（payload 异常也续，topic 本身就是心跳信号）
+                    if ($topic === $this->heartbeatTopic) {
+                        $activeKey = ($device !== 'unknown') ? $device : null;
+                        if ($activeKey !== null && $activeKey !== '') {
+                            $this->renewDeviceActive($activeKey);
+                        }
+
+                        // 心跳消息不进入数据入库流程
+                        return;
+                    }
+
                     // ★ 采样门控：非高优 topic 按采样率丢弃
                     if (! $this->router->isHighPriority($topic) && $this->sampleRate < 1.0) {
                         if ((mt_rand(1, 10000) / 10000.0) > $this->sampleRate) {
                             $this->droppedCount++;
                             $this->exporter->inc('edge_dropped_by_sampling_total');
+
                             return;
                         }
                     }
@@ -351,6 +375,30 @@ class EdgeInsertRedisDimCommand extends Command
         return 0;
     }
 
+    /* ==================== ★ 心跳续期 ==================== */
+
+    /**
+     * 写 edge:device:active:{sn} EX ttl
+     * key 集中落在 shard 0（helper.php redisExtractRouteValue 显式声明）
+     */
+    protected function renewDeviceActive(string $sn): void
+    {
+        $key = 'device:active:'.$sn;
+        $ttl = $this->deviceActiveTtl;
+
+        try {
+            withRedisForKey($key, function (\Redis $conn) use ($key, $sn, $ttl): void {
+                $conn->setex($key, $ttl, json_encode([
+                    'sn' => $sn,
+                    'ts' => time(),
+                ], JSON_UNESCAPED_SLASHES));
+            });
+            $this->exporter->inc('edge_heartbeat_renew_total');
+        } catch (Throwable $e) {
+            fwrite(STDERR, '[renewDeviceActive] '.$e->getMessage().PHP_EOL);
+        }
+    }
+
     /* ==================== ★ Auto-Scaler ==================== */
 
     private function startAutoScaler(): void
@@ -373,18 +421,18 @@ class EdgeInsertRedisDimCommand extends Command
 
                 // ---- 目标 worker 数 ----
                 $targetNormal = match (true) {
-                    $clientCount <= 3   => 1,
-                    $clientCount <= 10  => 2,
-                    $clientCount <= 30  => 3,
+                    $clientCount <= 3 => 1,
+                    $clientCount <= 10 => 2,
+                    $clientCount <= 30 => 3,
                     $clientCount <= 100 => 5,
                     $clientCount <= 300 => 8,
-                    default             => 12,
+                    default => 12,
                 };
 
                 $targetHigh = match (true) {
-                    $clientCount <= 5   => 1,
-                    $clientCount <= 50  => 2,
-                    default             => 3,
+                    $clientCount <= 5 => 1,
+                    $clientCount <= 50 => 2,
+                    default => 3,
                 };
 
                 // ---- 动态 batch size ----
@@ -392,10 +440,10 @@ class EdgeInsertRedisDimCommand extends Command
 
                 // ---- 动态 flush 间隔 ----
                 $newFlushInterval = match (true) {
-                    $clientCount <= 3   => 1000,
-                    $clientCount <= 10  => 500,
-                    $clientCount <= 30  => 200,
-                    default             => $this->normalFlushIntervalMs,
+                    $clientCount <= 3 => 1000,
+                    $clientCount <= 10 => 500,
+                    $clientCount <= 30 => 200,
+                    default => $this->normalFlushIntervalMs,
                 };
 
                 // ---- 采样率 ----
@@ -507,7 +555,8 @@ class EdgeInsertRedisDimCommand extends Command
     }
 
     /**
-     * 从认证侧标记的 Redis key 统计活跃客户端数量
+     * 从入库侧心跳续期的 Redis key 统计活跃设备数量
+     * SCAN edge:device:active:* 只在 shard 0 上执行（所有 key 集中存储）
      * 30s 内复用缓存，避免频繁 SCAN
      */
     private function getActiveClientCount(): int
@@ -519,26 +568,30 @@ class EdgeInsertRedisDimCommand extends Command
         }
 
         try {
+            $pattern = 'edge:device:active:*';
             $count = withRedisForKey(
-                'edge:client:alive:*',
-                static function (\Redis $conn): int {
+                $pattern,
+                static function (\Redis $conn) use ($pattern): int {
                     $n = 0;
                     $it = null;
                     do {
-                        $keys = $conn->scan($it, 'edge:client:alive:*', 500);
+                        $keys = $conn->scan($it, $pattern, 500);
                         if (! empty($keys) && is_array($keys)) {
                             $n += count($keys);
                         }
                     } while ($it > 0);
+
                     return $n;
                 }
             );
 
             $this->cachedClientCount = $count > 0 ? $count : 1;
             $this->lastScanTime = $now;
+
             return $this->cachedClientCount;
         } catch (Throwable $e) {
-            fwrite(STDERR, '[getActiveClientCount] ' . $e->getMessage() . PHP_EOL);
+            fwrite(STDERR, '[getActiveClientCount] '.$e->getMessage().PHP_EOL);
+
             return $this->cachedClientCount;
         }
     }
@@ -820,6 +873,13 @@ class EdgeInsertRedisDimCommand extends Command
         $this->sampleRateMin = (float) $this->option('sample-rate-min');
         $this->sampleRateMax = (float) $this->option('sample-rate-max');
 
+        // ★ 心跳续期配置（命令行参数 > config > 默认 120）
+        $this->deviceActiveTtl = max(10, (int) (
+            $this->option('device-active-ttl')
+                ?: config('edge.mqtt.device_active_ttl', 120)
+        ));
+        $this->heartbeatTopic = $this->option('heartbeat-topic') ?: 'heartbeat/response';
+
         $this->targetNormalWorkers = $this->normalWorkers;
         $this->targetHighWorkers = $this->highWorkers;
 
@@ -1097,6 +1157,7 @@ class EdgeInsertRedisDimCommand extends Command
                 if ($this->stopping) {
                     break;
                 }
+
                 continue;
             }
 
@@ -1160,6 +1221,7 @@ class EdgeInsertRedisDimCommand extends Command
                 if ($this->stopping) {
                     break;
                 }
+
                 continue;
             }
 
@@ -1217,6 +1279,7 @@ class EdgeInsertRedisDimCommand extends Command
                 if ($this->stopping) {
                     break;
                 }
+
                 continue;
             }
 
@@ -1248,6 +1311,7 @@ class EdgeInsertRedisDimCommand extends Command
                 // ignore
             }
         }
+
         return $alive;
     }
 
@@ -1525,6 +1589,9 @@ class EdgeInsertRedisDimCommand extends Command
         $this->exporter->set('edge_sample_rate', $this->sampleRate);
         $this->exporter->set('edge_current_batch_size', $this->normalBatchSize);
         $this->exporter->set('edge_current_flush_interval_ms', $this->normalFlushIntervalMs);
+
+        // ★ 心跳续期指标
+        $this->exporter->set('edge_heartbeat_renew_total', 0); // counter 由 inc() 维护
 
         // 直方图占位
         $this->exporter->set('edge_flush_duration_ms_normal', 0);

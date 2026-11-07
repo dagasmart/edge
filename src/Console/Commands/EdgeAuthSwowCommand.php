@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace DagaSmart\Edge\Console\Commands;
@@ -29,6 +30,7 @@ class EdgeAuthSwowCommand extends Command
     {
         if (! extension_loaded('swow')) {
             $this->error('Swow extension not loaded.');
+
             return self::FAILURE;
         }
 
@@ -58,6 +60,7 @@ class EdgeAuthSwowCommand extends Command
 
         if ($workers < 1) {
             $this->error('workers must be >= 1');
+
             return self::FAILURE;
         }
 
@@ -68,6 +71,7 @@ class EdgeAuthSwowCommand extends Command
         $serverFile = base_path('extensions/edge/bin/server.php');
         if (! is_file($serverFile)) {
             $this->error("Server file not found: {$serverFile}");
+
             return self::FAILURE;
         }
 
@@ -80,17 +84,18 @@ class EdgeAuthSwowCommand extends Command
             }
 
             $this->info("Starting Edge Auth Server on port {$port} (single worker)...");
-            $this->info('Laravel base_path: ' . base_path());
-            $this->info('PHP ' . PHP_VERSION . ' | Swow ' . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
+            $this->info('Laravel base_path: '.base_path());
+            $this->info('PHP '.PHP_VERSION.' | Swow '.(defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
 
             require $serverFile;
+
             return self::SUCCESS;
         }
 
         // ========== Linux + pcntl ==========
         $this->info('Starting Edge Auth Server...');
-        $this->info('Laravel base_path: ' . base_path());
-        $this->info('PHP ' . PHP_VERSION . ' | Swow ' . (defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
+        $this->info('Laravel base_path: '.base_path());
+        $this->info('PHP '.PHP_VERSION.' | Swow '.(defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
         $this->info("Port: {$port} | Workers: {$workers} | Mode: REUSEPORT fork");
         $this->info("Server file: {$serverFile}");
 
@@ -123,7 +128,7 @@ class EdgeAuthSwowCommand extends Command
             usleep(100000);
         }
 
-        $this->info("All {$workers} workers forked. Parent pid=" . getmypid());
+        $this->info("All {$workers} workers forked. Parent pid=".getmypid());
 
         // 父进程永久阻塞循环
         while ($this->children !== []) {
@@ -159,6 +164,7 @@ class EdgeAuthSwowCommand extends Command
         }
 
         $this->info('Parent process exiting.');
+
         return self::SUCCESS;
     }
 
@@ -168,6 +174,7 @@ class EdgeAuthSwowCommand extends Command
 
         if ($pid === -1) {
             $this->error("Failed to fork worker {$workerId}");
+
             return;
         }
 
@@ -194,7 +201,7 @@ class EdgeAuthSwowCommand extends Command
             if (is_file($bootstrapFile)) {
                 require_once $bootstrapFile;
             } else {
-                fwrite(STDERR, "FATAL: bootstrap.php not found at {$bootstrapFile}" . PHP_EOL);
+                fwrite(STDERR, "FATAL: bootstrap.php not found at {$bootstrapFile}".PHP_EOL);
                 exit(1);
             }
 
@@ -260,6 +267,7 @@ class EdgeAuthSwowCommand extends Command
             // reload 完成，重置状态让主循环继续
             $this->stopping = false;
             $this->info('Reload complete. Workers will be respawned by main loop.');
+
             return;
         }
 

@@ -29,44 +29,6 @@ function authRespond(ServerConnection $conn, bool $allow, string $reason, int $h
 }
 
 /**
- * 标记客户端活跃（认证成功时调用）
- *
- * ★ TTL = 120s，每认证成功一次续期
- * ★ 掉线/断连后最多 2 分钟自动过期，入库侧统计自动收敛
- * ★ 按 clientId 路由 key，分片模式下落到正确 shard
- */
-function markClientAlive(string $clientId, string $username, int $ttl = 120): void
-{
-    $key = 'edge:client:alive:'.$clientId;
-    try {
-        withRedisForKey($key, static function (Redis $conn) use ($key, $ttl, $clientId, $username): void {
-            $conn->setex($key, $ttl, json_encode([
-                'client_id' => $clientId,
-                'username' => $username,
-                'ts' => microtime(true),
-            ], JSON_UNESCAPED_UNICODE));
-        });
-    } catch (Throwable $e) {
-        fwrite(STDERR, '[markClientAlive] '.$e->getMessage().PHP_EOL);
-    }
-}
-
-/**
- * 主动清除活跃标记（disconnect webhook 调用，非必须，TTL 兜底即可）
- */
-function unmarkClientAlive(string $clientId): void
-{
-    $key = 'edge:client:alive:'.$clientId;
-    try {
-        withRedisForKey($key, static function (Redis $conn) use ($key): void {
-            $conn->del($key);
-        });
-    } catch (Throwable $e) {
-        fwrite(STDERR, '[unmarkClientAlive] '.$e->getMessage().PHP_EOL);
-    }
-}
-
-/**
  * 获取设备密钥
  *
  * ★ 所有 Redis 操作显式按 key 路由，确保分片模式下落到正确 shard
@@ -442,10 +404,6 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
             });
         } catch (Throwable) {
         }
-
-        // ★ 认证成功 → 标记活跃，TTL 120s，供入库侧自适应统计
-        $ttl = (int) getenv('MQTT_KEEP_ALIVE_INTERVAL') ?: 120;
-        markClientAlive($clientId, $username, $ttl);
 
         EdgeAuthContext::setAuth($username, $clientId);
 

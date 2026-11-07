@@ -24,6 +24,9 @@ return [
         'dead_batch_size' => 50,
         'dead_flush_interval_ms' => 1000,
 
+        // 心跳续期 ttl（入库侧 device:active:{sn/client} 的过期时间）
+        'device_active_ttl' => 60,
+
         // 多主题订阅：数组 / 逗号分隔字符串 / 单字符串，支持 +/# 通配符
         'topics' => [
             'heartbeat/response', // MQTT 心跳 topic

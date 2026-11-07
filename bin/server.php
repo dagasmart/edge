@@ -2,13 +2,14 @@
 
 declare(strict_types=1);
 
-use Dagasmart\Edge\Support\EdgeAuthContext;
+use DagaSmart\Edge\Support\EdgeAuthContext;
+use DagaSmart\Edge\Support\RedisShardManager;
 use Swow\Coroutine;
 use Swow\Psr7\Server\Server;
 use Swow\Signal;
 use Swow\Socket;
 
-require_once __DIR__ . '/bootstrap.php';
+require_once __DIR__.'/bootstrap.php';
 
 // ---------- 配置常量 ----------
 if (! defined('AUTH_PORT')) {
@@ -68,47 +69,18 @@ if (! defined('AUTH_HTTP_PREFIX')) {
 }
 
 // ---------- 加载业务文件 ----------
-require_once __DIR__ . '/helper.php';
-require_once __DIR__ . '/hmac.php';
-require_once __DIR__ . '/auth.php';
+require_once __DIR__.'/helper.php';
+require_once __DIR__.'/hmac.php';
+require_once __DIR__.'/auth.php';
 
 // ---------- 初始化 ----------
 $ready = false;
 $poolReady = false;
 $startTime = microtime(true);
 
-$shardCount = 0;
 try {
-    // 解析分片配置，确定运行模式
-    $shards = parseRedisShardList();
-    $shardCount = count($shards);
-
-    if ($shardCount > 0) {
-        // 分片模式：忽略 REDIS_*，使用 EDGE_REDIS_* 配置
-        fwrite(
-            STDOUT,
-            sprintf(
-                '[EdgeAuth] Redis sharded mode: %d shards, pool_size=%d, db=%d' . PHP_EOL,
-                $shardCount,
-                EDGE_REDIS_POOL_SIZE,
-                EDGE_REDIS_DB
-            )
-        );
-        redisPoolInit(EDGE_REDIS_POOL_SIZE, EDGE_REDIS_DB);
-    } else {
-        // 单实例退化模式：完全兼容原行为
-        fwrite(
-            STDOUT,
-            sprintf(
-                '[EdgeAuth] Redis single mode (legacy): %s:%d/%d, pool_size=%d' . PHP_EOL,
-                REDIS_HOST,
-                REDIS_PORT,
-                REDIS_DB,
-                REDIS_POOL_SIZE
-            )
-        );
-        redisPoolInit(REDIS_POOL_SIZE, REDIS_DB);
-    }
+    // 统一走 RedisShardManager：内部自动判断分片 / 单实例
+    RedisShardManager::init(EDGE_REDIS_POOL_SIZE, EDGE_REDIS_DB);
 
     $st = redisPoolStats();
     $mode = $st['mode'] ?? 'unknown';
@@ -124,7 +96,7 @@ try {
     fwrite(
         STDOUT,
         sprintf(
-            '[EdgeAuth] Redis pool initialized: mode=%s, shards=%d, free=%d/%d' . PHP_EOL,
+            '[EdgeAuth] Redis pool initialized: mode=%s, shards=%d, free=%d/%d'.PHP_EOL,
             $mode,
             $st['shard_count'] ?? 1,
             $totalFree,
@@ -132,7 +104,7 @@ try {
         )
     );
 } catch (Throwable $e) {
-    fwrite(STDERR, '[EdgeAuth] Redis INIT FAILED: ' . $e->getMessage() . PHP_EOL);
+    fwrite(STDERR, '[EdgeAuth] Redis INIT FAILED: '.$e->getMessage().PHP_EOL);
 }
 
 localCacheInit();
@@ -147,8 +119,8 @@ if ($initialConcurrency < MAX_CONCURRENCY) {
 deviceConcurrencyInit(MAX_CONCURRENCY_PER_DEVICE, 300);
 
 $initTime = microtime(true) - $startTime;
-fwrite(STDOUT, '[EdgeAuth] Server READY (cold start, Redis pool filling in background)' . PHP_EOL);
-fwrite(STDOUT, '[EdgeAuth] Init took ' . round($initTime, 2) . 's' . PHP_EOL);
+fwrite(STDOUT, '[EdgeAuth] Server READY (cold start, Redis pool filling in background)'.PHP_EOL);
+fwrite(STDOUT, '[EdgeAuth] Init took '.round($initTime, 2).'s'.PHP_EOL);
 
 // ---------- Server ----------
 $server = new Server;
@@ -165,14 +137,14 @@ $server->bind('0.0.0.0', AUTH_PORT, $bindFlags)
 
 fwrite(
     STDOUT,
-    '[EdgeAuth] Listening on 0.0.0.0:' . AUTH_PORT
-    . ($isWindows ? ' (single-process, no REUSEPORT)' : ' (REUSEPORT)') . PHP_EOL
+    '[EdgeAuth] Listening on 0.0.0.0:'.AUTH_PORT
+    .($isWindows ? ' (single-process, no REUSEPORT)' : ' (REUSEPORT)').PHP_EOL
 );
 
 $workerId = $GLOBALS['worker_id'] ?? 0;
 if (! $isWindows && $workerId > 0) {
     $delay = $workerId * 0.5;
-    fwrite(STDOUT, "[EdgeAuth] Worker {$workerId} warm-up delay: {$delay}s" . PHP_EOL);
+    fwrite(STDOUT, "[EdgeAuth] Worker {$workerId} warm-up delay: {$delay}s".PHP_EOL);
     usleep((int) ($delay * 1000000));
 }
 
@@ -184,7 +156,7 @@ $signalHandler = static function (int $signo) use (&$running, &$server): void {
         SIGINT => 'SIGINT',
         default => "signal {$signo}",
     };
-    fwrite(STDOUT, "[EdgeAuth] {$name} received via Swow\Signal, shutting down" . PHP_EOL);
+    fwrite(STDOUT, "[EdgeAuth] {$name} received via Swow\Signal, shutting down".PHP_EOL);
     $running = false;
 
     try {
@@ -221,7 +193,7 @@ while ($running) {
 
         $msg = $e->getMessage();
         if (! str_contains($msg, 'closed') && ! str_contains($msg, 'reset') && ! str_contains($msg, 'timed out')) {
-            fwrite(STDERR, '[accept] ' . $msg . PHP_EOL);
+            fwrite(STDERR, '[accept] '.$msg.PHP_EOL);
         }
 
         continue;
@@ -235,7 +207,7 @@ while ($running) {
                 } catch (Throwable $e) {
                     $msg = $e->getMessage();
                     if (! str_contains($msg, 'closed') && ! str_contains($msg, 'reset') && ! str_contains($msg, 'timed out')) {
-                        fwrite(STDERR, '[recv] ' . $msg . PHP_EOL);
+                        fwrite(STDERR, '[recv] '.$msg.PHP_EOL);
                     }
                     break;
                 }
@@ -246,7 +218,7 @@ while ($running) {
 
                     if (redisPoolIsReady(0.8)) {
                         $ready = true;
-                        fwrite(STDOUT, '[EdgeAuth] Pool reached 80%, gate OPEN' . PHP_EOL);
+                        fwrite(STDOUT, '[EdgeAuth] Pool reached 80%, gate OPEN'.PHP_EOL);
                     } else {
                         $allowRatio = min(1.0, $uptime / 3.0 * 0.3);
                         if ($uptime < 3.0 && mt_rand(1, 100) / 100 > $allowRatio) {
@@ -268,7 +240,7 @@ while ($running) {
                 }
 
                 $path = $req->getUri()->getPath();
-                $path = '/' . ltrim($path, '/');
+                $path = '/'.ltrim($path, '/');
                 $path = rtrim($path, '/');
                 if ($path === '' || $path === '/') {
                     $path = '/';
@@ -371,17 +343,17 @@ while ($running) {
                                 'method' => $req->getMethod(),
                                 'path' => $path,
                                 'endpoints' => [
-                                    'auth' => AUTH_HTTP_PREFIX . '/auth (POST)',
-                                    'super' => AUTH_HTTP_PREFIX . '/super (POST)',
-                                    'acl' => AUTH_HTTP_PREFIX . '/acl (POST)',
-                                    'health' => AUTH_HTTP_PREFIX . '/health (GET)',
-                                    'metrics' => AUTH_HTTP_PREFIX . '/metrics (GET)',
+                                    'auth' => AUTH_HTTP_PREFIX.'/auth (POST)',
+                                    'super' => AUTH_HTTP_PREFIX.'/super (POST)',
+                                    'acl' => AUTH_HTTP_PREFIX.'/acl (POST)',
+                                    'health' => AUTH_HTTP_PREFIX.'/health (GET)',
+                                    'metrics' => AUTH_HTTP_PREFIX.'/metrics (GET)',
                                 ],
                             ], 200);
                             break;
                     }
                 } catch (Throwable $innerE) {
-                    fwrite(STDERR, '[handler-error] ' . $innerE->getMessage() . PHP_EOL);
+                    fwrite(STDERR, '[handler-error] '.$innerE->getMessage().PHP_EOL);
                     try {
                         respondJson($conn, ['error' => 'internal', 'msg' => $innerE->getMessage()], 500);
                     } catch (Throwable) {
@@ -396,7 +368,7 @@ while ($running) {
         } catch (Throwable $e) {
             $msg = $e->getMessage();
             if (! str_contains($msg, 'closed') && ! str_contains($msg, 'reset') && ! str_contains($msg, 'timed out')) {
-                fwrite(STDERR, '[coroutine-fatal] ' . $msg . PHP_EOL);
+                fwrite(STDERR, '[coroutine-fatal] '.$msg.PHP_EOL);
             }
         } finally {
             // handleAuth 的 finally 已经负责 releaseUserOnline + clear
@@ -411,4 +383,4 @@ while ($running) {
     });
 }
 
-fwrite(STDOUT, '[EdgeAuth] shutdown gracefully' . PHP_EOL);
+fwrite(STDOUT, '[EdgeAuth] shutdown gracefully'.PHP_EOL);
