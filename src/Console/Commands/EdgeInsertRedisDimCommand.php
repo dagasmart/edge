@@ -874,10 +874,11 @@ class EdgeInsertRedisDimCommand extends Command
         $this->sampleRateMax = (float) $this->option('sample-rate-max');
 
         // ★ 心跳续期配置（命令行参数 > config > 默认 120）
+        $opt = $this->option('device-active-ttl');
         $this->deviceActiveTtl = max(10, (int) (
-            $this->option('device-active-ttl')
-                ?: config('edge.mqtt.device_active_ttl', 120)
+        $opt === null || $opt === '' ? config('edge.mqtt.device_active_ttl', 120) : $opt
         ));
+
         $this->heartbeatTopic = $this->option('heartbeat-topic') ?: 'heartbeat/response';
 
         $this->targetNormalWorkers = $this->normalWorkers;
