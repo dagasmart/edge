@@ -42,70 +42,98 @@ class PrometheusExporter
     public function reset(): void
     {
         $this->metrics = [
-            // 接收总量
+            // ============ 接收 ============
             'edge_received_total' => [
                 'type' => 'counter',
                 'help' => '从 MQTT 接收到的消息总数',
                 'value' => 0,
             ],
-            // 高优写入成功
+
+            // ============ 写入成功 ============
             'edge_high_write_success_total' => [
                 'type' => 'counter',
                 'help' => '成功写入高优 Redis Stream 的消息总数',
                 'value' => 0,
             ],
-            // 普通写入成功
             'edge_data_write_success_total' => [
                 'type' => 'counter',
                 'help' => '成功写入普通 Redis Stream 的消息总数',
                 'value' => 0,
             ],
-            // 死信总量
             'edge_dead_letter_total' => [
                 'type' => 'counter',
                 'help' => '进入死信队列的消息总数',
                 'value' => 0,
             ],
-            // 当前队列积压
-            'edge_queue_backlog' => [
-                'type' => 'gauge',
-                'help' => '当前 Channel 中的积压消息数',
+
+            // ============ 丢弃 ============
+            'edge_dropped_by_sampling_total' => [
+                'type' => 'counter',
+                'help' => '因采样被丢弃的消息总数',
                 'value' => 0,
             ],
-            // 普通 Channel 等待时间
-            'edge_message_wait_ms_normal' => [
-                'type' => 'gauge',
-                'help' => '普通通道消息平均等待时间（毫秒）',
-                'value' => 0,
-            ],
-            // 高优 Channel 等待时间
-            'edge_message_wait_ms_high' => [
-                'type' => 'gauge',
-                'help' => '高优通道消息平均等待时间（毫秒）',
-                'value' => 0,
-            ],
-            // QPS
-            'edge_qps' => [
-                'type' => 'gauge',
-                'help' => '当前每秒处理消息数',
-                'value' => 0,
-            ],
-            // Redis 写入失败
             'edge_redis_write_failed_total' => [
                 'type' => 'counter',
                 'help' => 'Redis 写入失败总数',
                 'value' => 0,
             ],
-            // MQTT 连接状态
+
+            // ============ 心跳续期 ============
+            'edge_heartbeat_renew_total' => [
+                'type' => 'counter',
+                'help' => '心跳续期 device:active:* 总次数',
+                'value' => 0,
+            ],
+
+            // ============ MQTT 探针 ============
+            'edge_mqtt_probe_failed_total' => [
+                'type' => 'counter',
+                'help' => 'MQTT 连通性探测失败总次数',
+                'value' => 0,
+            ],
+            'edge_mqtt_probe_consecutive_failures' => [
+                'type' => 'gauge',
+                'help' => 'MQTT 连续探测失败次数',
+                'value' => 0,
+            ],
             'edge_mqtt_connected' => [
                 'type' => 'gauge',
                 'help' => 'MQTT 连接状态（1=已连接，0=已断开）',
                 'value' => 0,
             ],
 
-            // ============ Worker 级指标 ============
+            // ============ 积压 ============
+            'edge_queue_backlog' => [
+                'type' => 'gauge',
+                'help' => '当前 Channel 中的积压消息数',
+                'value' => 0,
+            ],
 
-            // 活跃 Worker 数
+            // ============ 等待时间 ============
+            'edge_message_wait_ms_normal' => [
+                'type' => 'gauge',
+                'help' => '普通通道消息平均等待时间（毫秒）',
+                'value' => 0.0,
+            ],
+            'edge_message_wait_ms_high' => [
+                'type' => 'gauge',
+                'help' => '高优通道消息平均等待时间（毫秒）',
+                'value' => 0.0,
+            ],
+            'edge_message_wait_ms_dead' => [
+                'type' => 'gauge',
+                'help' => '死信通道消息平均等待时间（毫秒）',
+                'value' => 0.0,
+            ],
+
+            // ============ QPS ============
+            'edge_qps' => [
+                'type' => 'gauge',
+                'help' => '当前每秒处理消息数',
+                'value' => 0.0,
+            ],
+
+            // ============ Worker 活跃数 ============
             'edge_active_workers_normal' => [
                 'type' => 'gauge',
                 'help' => '普通 Worker 活跃数',
@@ -122,7 +150,7 @@ class PrometheusExporter
                 'value' => 0,
             ],
 
-            // Channel 积压
+            // ============ Channel 积压 ============
             'edge_channel_backlog_normal' => [
                 'type' => 'gauge',
                 'help' => '普通 Channel 积压消息数',
@@ -139,24 +167,24 @@ class PrometheusExporter
                 'value' => 0,
             ],
 
-            // 平均 flush 耗时
+            // ============ 平均 flush 耗时 ============
             'edge_flush_latency_ms_normal' => [
                 'type' => 'gauge',
                 'help' => '普通 Worker 平均 flush 耗时（毫秒）',
-                'value' => 0,
+                'value' => 0.0,
             ],
             'edge_flush_latency_ms_high' => [
                 'type' => 'gauge',
                 'help' => '高优 Worker 平均 flush 耗时（毫秒）',
-                'value' => 0,
+                'value' => 0.0,
             ],
             'edge_flush_latency_ms_dead' => [
                 'type' => 'gauge',
                 'help' => '死信 Worker 平均 flush 耗时（毫秒）',
-                'value' => 0,
+                'value' => 0.0,
             ],
 
-            // 已刷盘总数
+            // ============ 已刷盘总数 ============
             'edge_flushed_total_normal' => [
                 'type' => 'counter',
                 'help' => '普通 Worker 已刷盘消息总数',
@@ -173,8 +201,39 @@ class PrometheusExporter
                 'value' => 0,
             ],
 
-            // ============ 直方图（观测值，由 observe() 写入 $histograms） ============
-            // 这里只做占位，实际数据来自 $this->histograms
+            // ============ 活跃客户端 ============
+            'edge_active_clients' => [
+                'type' => 'gauge',
+                'help' => '当前活跃客户端（设备）数',
+                'value' => 0,
+            ],
+
+            // ============ Auto-Scaler ============
+            'edge_target_workers_normal' => [
+                'type' => 'gauge',
+                'help' => 'Auto-Scaler 目标普通 Worker 数',
+                'value' => 0,
+            ],
+            'edge_target_workers_high' => [
+                'type' => 'gauge',
+                'help' => 'Auto-Scaler 目标高优 Worker 数',
+                'value' => 0,
+            ],
+            'edge_sample_rate' => [
+                'type' => 'gauge',
+                'help' => '当前采样率',
+                'value' => 1.0,
+            ],
+            'edge_current_batch_size' => [
+                'type' => 'gauge',
+                'help' => '当前自适应 batch 大小',
+                'value' => 0,
+            ],
+            'edge_current_flush_interval_ms' => [
+                'type' => 'gauge',
+                'help' => '当前刷盘间隔（毫秒）',
+                'value' => 0,
+            ],
         ];
 
         $this->histograms = [];
