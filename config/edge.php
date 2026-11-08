@@ -30,15 +30,18 @@ return [
         // 多主题订阅：数组 / 逗号分隔字符串 / 单字符串，支持 +/# 通配符
         'topics' => [
             'heartbeat/response', // MQTT 心跳 topic
+            'face/+/request',     // ★ 设备请求 topic（如 face/{client_id}/request）
+            'face/+/response',    // ★ 设备响应 topic（如 face/{client_id}/response）
         ],
 
-        // 高优先级主题（前缀匹配，命中则走高优 Channel）
+        // 高优先级主题（MQTT + 通配符匹配，命中则走高优 Channel）
         'high_priority_topics' => [
-            'face/*/response',  // 获取下发命令返回值 topic，MQTT 服务端需要订阅
-            'face/response',    // 推送人脸识别结果 topic
-            'qr/response',      // 二维码数据 topic
-            'online/response',  // mqtt 上线 topic
-            'will/+/response',  // 推送遗嘱 topic
+            'face/+/response',    // ★ * 改 + ，匹配 face/{client_id}/response
+            'face/+/request',     // ★ 新增：设备请求走高优
+            'face/response',      // 推送人脸识别结果 topic（无 client_id 变体）
+            'qr/response',        // 二维码数据 topic
+            'online/response',    // mqtt 上线 topic
+            'will/+/response',    // 推送遗嘱 topic
         ],
 
         // 高优 Channel 配置
