@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace DagaSmart\Edge\Engine;
 
-use PhpMqtt\Client\Exceptions\MqttClientException;
 use PhpMqtt\Client\Facades\MQTT;
 use PhpMqtt\Client\MqttClient;
+use PhpMqtt\Client\Exceptions\MqttClientException;
 use Swow\Channel;
 use Swow\Coroutine;
 use Throwable;
@@ -21,6 +21,8 @@ class NanoMQ
 
     private bool $stopping = false;
 
+    private int $lastPrecheckFail = 0;
+
     public function __construct()
     {
         $this->exitChannel = new Channel(1);
@@ -31,7 +33,7 @@ class NanoMQ
         try {
             MQTT::publish($topic, $message);
         } catch (Throwable $e) {
-            fwrite(STDERR, '[MQTT] publish 异常：'.$e->getMessage().PHP_EOL);
+            fwrite(STDERR, '[MQTT] publish 异常：' . $e->getMessage() . PHP_EOL);
         }
 
         return $this;
@@ -50,17 +52,47 @@ class NanoMQ
 
             while (! $this->stopping) {
                 try {
+                    // ★ TCP 预检
+                    $host = config('edge.mqtt.host', '127.0.0.1');
+                    $port = (int) config('edge.mqtt.port', 1883);
+
+                    $sock = @stream_socket_client(
+                        "tcp://{$host}:{$port}",
+                        $errno,
+                        $errstr,
+                        3
+                    );
+
+                    if ($sock === false) {
+                        if ((time() - $this->lastPrecheckFail) > 30) {
+                            fwrite(STDERR, sprintf(
+                                "[MQTT] 预检 %s:%d 不可达（%s），静默等待...\n",
+                                $host, $port, $errstr ?: 'unknown'
+                            ));
+                            $this->lastPrecheckFail = time();
+                        }
+
+                        $this->clearConnection();
+                        sleep(min($retryDelay, 10));
+                        $retryDelay = min($retryDelay * 2, $maxRetryDelay);
+                        continue;
+                    }
+
+                    fclose($sock);
+                    $this->lastPrecheckFail = 0;
+
+                    // ★ 预检通过，建立 MQTT 连接
                     $mqtt = $this->connection = MQTT::connection();
 
-                    fwrite(STDERR, '[MQTT] 连接成功 | client_id='.$mqtt->getClientId()
-                        .' | 订阅 topics='.implode(', ', $topics).PHP_EOL);
+                    fwrite(STDERR, '[MQTT] 连接成功 | client_id=' . $mqtt->getClientId()
+                        . ' | 订阅 topics=' . implode(', ', $topics) . PHP_EOL);
 
                     foreach ($topics as $t) {
                         $mqtt->subscribe($t, function (string $topic, string $message) use ($callback): void {
                             try {
                                 call_user_func($callback, $topic, $message);
                             } catch (Throwable $e) {
-                                fwrite(STDERR, '[MQTT] 回调异常：'.$e->getMessage().PHP_EOL);
+                                fwrite(STDERR, '[MQTT] 回调异常：' . $e->getMessage() . PHP_EOL);
                             }
                         }, 0);
                     }
@@ -82,15 +114,18 @@ class NanoMQ
                     $msg = $e->getMessage();
                     $code = $e->getCode();
 
-                    if ($code === 66
+                    // ★ 错误码 1 = CONNECTION_FAILED，静默
+                    if ($code === 1 || $code === 66
                         || str_contains($msg, 'reached EOF')
                         || str_contains($msg, 'Transferring data')
                         || str_contains($msg, 'feof()')
                         || str_contains($msg, 'socket')
+                        || str_contains($msg, 'data transfer')
+                        || str_contains($msg, 'connection')
                     ) {
                         // 静默
                     } else {
-                        fwrite(STDERR, '[MQTT] 订阅异常：'.$msg.PHP_EOL);
+                        fwrite(STDERR, '[MQTT] 订阅异常：' . $msg . PHP_EOL);
                     }
 
                     $this->clearConnection();
@@ -104,16 +139,16 @@ class NanoMQ
 
                     $msg = $e->getMessage();
 
-                    // feof() null / socket / stream 错误 → 静默
                     if (str_contains($msg, 'feof()')
                         || str_contains($msg, 'socket')
                         || str_contains($msg, 'stream')
                         || str_contains($msg, 'reached EOF')
                         || str_contains($msg, 'Transferring data')
+                        || str_contains($msg, 'data transfer')
                     ) {
                         // 静默
                     } else {
-                        fwrite(STDERR, '[MQTT] 未知异常：'.$msg.PHP_EOL);
+                        fwrite(STDERR, '[MQTT] 未知异常：' . $msg . PHP_EOL);
                     }
 
                     $this->clearConnection();
@@ -133,7 +168,16 @@ class NanoMQ
 
     private function clearConnection(): void
     {
+        $conn = $this->connection;
         $this->connection = null;
+
+        if ($conn !== null) {
+            try {
+                $conn->interrupt();
+            } catch (Throwable) {
+                // ignore
+            }
+        }
 
         try {
             MQTT::disconnect();
