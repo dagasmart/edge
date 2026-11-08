@@ -312,6 +312,53 @@ LUA;
     }
 }
 
+/* =========================================================
+ * Disconnect webhook handler
+ * ★ NanoMQ 断开连接时调用，释放 online 锁
+ * ========================================================= */
+
+function handleDisconnect(ServerConnection $conn, ServerRequest $req): void
+{
+    $body = (string) $req->getBody();
+    $contentType = strtolower($req->getHeaderLine('Content-Type'));
+
+    if (str_contains($contentType, 'application/json')) {
+        $data = json_decode($body, true) ?? [];
+    } else {
+        $data = [];
+        parse_str($body, $data);
+    }
+
+    $clientId = trim((string) (
+        $data['clientid'] ?? $data['client_id'] ?? $data['clientId'] ?? ''
+    ));
+    $username = trim((string) (
+        $data['username'] ?? $data['user'] ?? ''
+    ));
+
+    if ($clientId === '' || $username === '') {
+        respondJson($conn, [
+            'result' => 'error',
+            'reason' => 'missing client_id / username',
+        ], 400);
+
+        return;
+    }
+
+    releaseUserOnline($username, $clientId);
+
+    fwrite(STDOUT, sprintf(
+        '[EdgeAuth] [disconnect] SN=%s clientId=%s online lock released'.PHP_EOL,
+        $username,
+        $clientId
+    ));
+
+    respondJson($conn, [
+        'result' => 'ok',
+        'released' => true,
+    ], 200);
+}
+
 function handleAuth(ServerConnection $conn, ServerRequest $req): void
 {
     $body = (string) $req->getBody();
@@ -407,23 +454,20 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
         EdgeAuthContext::setAuth($username, $clientId);
 
+        // ★ 认证成功，获取 online 锁（TTL=300s 兜底）
+        acquireUserOnline($username, $clientId);
+
         metricsInc('auth_ok');
         authRespond($conn, true, 'ok');
     } finally {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
 
-        try {
-            $authedUsername = EdgeAuthContext::getUsername();
-            $authedClientId = EdgeAuthContext::getClientId();
-            if ($authedUsername !== null && $authedClientId !== null) {
-                releaseUserOnline($authedUsername, $authedClientId);
-            }
-        } catch (Throwable $e) {
-            fwrite(STDERR, '[release-online] '.$e->getMessage().PHP_EOL);
-        } finally {
-            EdgeAuthContext::clear();
-        }
+        // ★ 不再在这里释放 online 锁！
+        // 锁由 disconnect webhook（handleDisconnect）显式释放
+        // Lua 脚本中 SET EX 300 提供 TTL 兜底，防止 disconnect 丢失导致永久死锁
+
+        EdgeAuthContext::clear();
     }
 }
 

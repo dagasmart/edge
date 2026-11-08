@@ -75,6 +75,7 @@ require_once __DIR__.'/auth.php';
 $ready = false;
 $poolReady = false;
 $startTime = microtime(true);
+$GLOBALS['startTime'] = $startTime;
 
 try {
     RedisShardManager::init(EDGE_REDIS_POOL_SIZE, EDGE_REDIS_DB);
@@ -215,11 +216,30 @@ while ($running) {
                 if (! $ready) {
                     if (redisPoolIsReady(0.8)) {
                         $ready = true;
+
+                        // ---- 标准化 Gate OPEN 日志（只输出，不写入）----
+                        $elapsed = round(microtime(true) - $GLOBALS['startTime'] ?? $startTime, 2);
+                        $wid = $GLOBALS['worker_id'] ?? 0;
+                        $stats = redisPoolStats();
+                        $shards = $stats['shards'] ?? [];
+
+                        $totalFree = 0;
+                        $totalCap = 0;
+                        foreach ($shards as $s) {
+                            $totalFree += $s['free'] ?? 0;
+                            $totalCap += $s['capacity'] ?? 0;
+                        }
+
                         fwrite(STDOUT, sprintf(
-                            '[EdgeAuth] Gate OPEN after %.2fs, pool stats: %s'.PHP_EOL,
-                            microtime(true) - $startTime,
-                            json_encode(redisPoolStats())
+                            '[EdgeAuth] [Worker %d] Gate OPEN | elapsed=%.2fs | pool=%d/%d (%.0f%%) | mode=%s'.PHP_EOL,
+                            $wid,
+                            $elapsed,
+                            $totalFree,
+                            $totalCap,
+                            $totalCap > 0 ? ($totalFree / $totalCap * 100) : 0,
+                            $stats['mode'] ?? 'unknown'
                         ));
+                        // ---- 结束 ----
                     } else {
                         // 未就绪：所有请求直接 deny，NanoMQ 不会重试
                         respondJson($conn, [
@@ -254,6 +274,10 @@ while ($running) {
                             handleAuth($conn, $req);
                             break;
 
+                        case '/admin-api/extension/edge/disconnect':
+                            handleDisconnect($conn, $req);
+                            break;
+
                         case '/admin-api/extension/edge/super':
                             handleSuper($conn, $req);
                             break;
@@ -264,7 +288,7 @@ while ($running) {
 
                         case '/admin-api/extension/edge/health':
                             $stats = redisPoolStats();
-                            $uptime = microtime(true) - $startTime;
+                            $uptime = microtime(true) - $GLOBALS['startTime'];
 
                             $shards = $stats['shards'] ?? [];
                             $totalFree = 0;

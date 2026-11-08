@@ -85,7 +85,7 @@ class EdgeAuthSwowCommand extends Command
 
             $this->info("Starting Edge Auth Server on port {$port} (single worker)...");
             $this->info('Laravel base_path: '.base_path());
-            $this->info('PHP '.PHP_VERSION.' | Swow '.(defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
+            $this->info('PHP '.PHP_VERSION.' | Swow '.(phpversion('swow') ?: 'unknown'));
 
             require $serverFile;
 
@@ -95,7 +95,7 @@ class EdgeAuthSwowCommand extends Command
         // ========== Linux + pcntl ==========
         $this->info('Starting Edge Auth Server...');
         $this->info('Laravel base_path: '.base_path());
-        $this->info('PHP '.PHP_VERSION.' | Swow '.(defined('SWOW_VERSION') ? SWOW_VERSION : 'unknown'));
+        $this->info('PHP '.PHP_VERSION.' | Swow '.(phpversion('swow') ?: 'unknown'));
         $this->info("Port: {$port} | Workers: {$workers} | Mode: REUSEPORT fork");
         $this->info("Server file: {$serverFile}");
 
