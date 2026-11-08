@@ -17,7 +17,7 @@ use Illuminate\Support\Facades\DB;
 // 必须放在最前：后续代码可能用到 EdgeAuthContext（如 server.php 的 use 声明）
 (function (): void {
     $classes = [
-        'Dagasmart\\Edge\\Support\\EdgeAuthContext' => __DIR__.'/../src/Support/EdgeAuthContext.php',
+        'DagaSmart\\Edge\\Support\\EdgeAuthContext' => __DIR__.'/../src/Support/EdgeAuthContext.php',
     ];
     foreach ($classes as $class => $file) {
         if (! class_exists($class, false) && is_file($file)) {

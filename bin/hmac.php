@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-use Dagasmart\Edge\Support\EdgeAuthContext;
+use DagaSmart\Edge\Support\EdgeAuthContext;
 use DagaSmart\Edge\Support\HmacValidator;
 use Swow\Channel;
 use Swow\Coroutine;
@@ -128,5 +128,5 @@ function hmacAuthenticate(string $clientId, string $username, string $password):
 
 /* =========================================================
  * 注意：attachAuthReason / detachAuthReason 已废弃
- * 统一使用 Dagasmart\Edge\Support\EdgeAuthContext
+ * 统一使用 DagaSmart\Edge\Support\EdgeAuthContext
  * ========================================================= */

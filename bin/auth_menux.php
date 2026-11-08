@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-use Dagasmart\Edge\Support\EdgeAuthContext;
+use DagaSmart\Edge\Support\EdgeAuthContext;
 use Swow\Psr7\Message\ServerRequest;
 use Swow\Psr7\Server\ServerConnection;
 

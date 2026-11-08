@@ -58,7 +58,7 @@ return new class extends Migration
                 $table->index('service');
                 $table->index(['client_id', 'username']);
                 $table->index(['username', 'active', 'service']);
-                $table->unique(['username', 'service'])->nullsNotDistinct();
+                $table->unique(['client_id', 'username', 'service'])->nullsNotDistinct();
             });
         }
 

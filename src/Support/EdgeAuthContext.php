@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Dagasmart\Edge\Support;
+namespace DagaSmart\Edge\Support;
 
 use Swow\Coroutine;
 

@@ -35,8 +35,6 @@ if (! defined('REDIS_POOL_SIZE')) {
 
 // ---- 分片 Redis（优先）----
 if (! defined('EDGE_REDIS_SHARDS')) {
-    // 格式：host:port[:password][@db],...
-    // 留空则退化为单实例（完全兼容原行为）
     define('EDGE_REDIS_SHARDS', '');
 }
 if (! defined('EDGE_REDIS_POOL_SIZE')) {
@@ -79,7 +77,6 @@ $poolReady = false;
 $startTime = microtime(true);
 
 try {
-    // 统一走 RedisShardManager：内部自动判断分片 / 单实例
     RedisShardManager::init(EDGE_REDIS_POOL_SIZE, EDGE_REDIS_DB);
 
     $st = redisPoolStats();
@@ -212,30 +209,35 @@ while ($running) {
                     break;
                 }
 
-                // ★ 冷启动门禁：未就绪时返回 deny，HTTP 200
+                // =========================================================
+                // ★ 冷启动门禁（简化版）：全部 deny 直到池子 ready
+                // =========================================================
                 if (! $ready) {
-                    $uptime = microtime(true) - $startTime;
-
                     if (redisPoolIsReady(0.8)) {
                         $ready = true;
-                        fwrite(STDOUT, '[EdgeAuth] Pool reached 80%, gate OPEN'.PHP_EOL);
+                        fwrite(STDOUT, sprintf(
+                            '[EdgeAuth] Gate OPEN after %.2fs, pool stats: %s'.PHP_EOL,
+                            microtime(true) - $startTime,
+                            json_encode(redisPoolStats())
+                        ));
                     } else {
-                        $allowRatio = min(1.0, $uptime / 3.0 * 0.3);
-                        if ($uptime < 3.0 && mt_rand(1, 100) / 100 > $allowRatio) {
-                            // ★ 关键：顶层 result=deny + HTTP 200，避免 NanoMQ 把 503 当 ignore
-                            respondJson($conn, [
+                        // 未就绪：所有请求直接 deny，NanoMQ 不会重试
+                        respondJson($conn, [
+                            'result'        => 'deny',
+                            'is_superuser'  => false,
+                            'code'          => 1,
+                            'message'       => 'service_warming_up',
+                            'data'          => [
                                 'result' => 'deny',
-                                'is_superuser' => false,
-                                'code' => 1,
-                                'message' => 'service_warming_up',
-                                'data' => [
-                                    'result' => 'deny',
-                                    'reason' => 'service_warming_up',
-                                ],
-                            ], 200);
+                                'reason' => 'service_warming_up',
+                            ],
+                        ], 200);
 
-                            continue;
+                        // 短连接直接断开，避免空转
+                        if (! $conn->shouldKeepAlive()) {
+                            break;
                         }
+                        continue;
                     }
                 }
 
@@ -371,8 +373,6 @@ while ($running) {
                 fwrite(STDERR, '[coroutine-fatal] '.$msg.PHP_EOL);
             }
         } finally {
-            // handleAuth 的 finally 已经负责 releaseUserOnline + clear
-            // 这里只需防御性清理（防止非 auth 路径或异常提前返回时泄漏）
             EdgeAuthContext::clear();
 
             try {
