@@ -8,6 +8,7 @@ use DagaSmart\Edge\Engine\NanoMQ;
 use DagaSmart\Edge\Support\MultiDimAdaptiveBatch;
 use DagaSmart\Edge\Support\PriorityRouter;
 use DagaSmart\Edge\Support\PrometheusExporter;
+use DagaSmart\Edge\Support\RedisShardManager;
 use Illuminate\Console\Command;
 use Swow\Channel;
 use Swow\Coroutine;
@@ -15,7 +16,7 @@ use Swow\Signal;
 use Throwable;
 
 /**
- * 订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（Worker Pool 版 + Auto-Scaler）
+ * 订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（分片版 + Worker Pool + Auto-Scaler）
  */
 class EdgeInsertRedisDimCommand extends Command
 {
@@ -26,14 +27,15 @@ class EdgeInsertRedisDimCommand extends Command
         {--sample-rate-max=1.0 : 最大采样率}
         {--device-active-ttl= : 设备活跃 key TTL(秒)}
         {--heartbeat-topic=heartbeat/response : 心跳 topic}
-        {--heartbeat-write-stream=1 : 心跳是否写入 Redis Stream(0/1)}';
+        {--heartbeat-write-stream=1 : 心跳是否写入 Redis Stream(0/1)}
+        {--shard-count=2 : Stream 分片数量}';
 
-    protected $description = '订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（含自适应调节）';
+    protected $description = '订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（分片版）';
 
-    /* ==================== Stream ==================== */
-    private const string STREAM_HIGH = 'stream:device:high';
+    /* ==================== Stream（分片版） ==================== */
+    private const string STREAM_HIGH_PREFIX = 'stream:device:high:';
 
-    private const string STREAM_DATA = 'stream:device:data';
+    private const string STREAM_DATA_PREFIX = 'stream:device:data:';
 
     private const string STREAM_DEAD = 'stream:device:dead';
 
@@ -44,6 +46,9 @@ class EdgeInsertRedisDimCommand extends Command
     private const int DEAD_MAX_LEN = 10_000;
 
     private const int HEARTBEAT_MAX_LEN = 100_000;
+
+    /* ==================== 分片配置 ==================== */
+    private int $shardCount = 2;
 
     /* ==================== 组件 ==================== */
     private PrometheusExporter $exporter;
@@ -127,25 +132,24 @@ class EdgeInsertRedisDimCommand extends Command
 
     private int $cachedClientCount = 0;
 
-    /* ==================== ★ 心跳配置 ==================== */
+    /* ==================== 心跳配置 ==================== */
     private int $deviceActiveTtl = 120;
 
     private string $heartbeatTopic = 'heartbeat/response';
 
     private bool $heartbeatWriteStream = true;
 
-    /* ==================== ★ 心跳内存计数（替代 scan） ==================== */
-    /** @var array<string, int> 设备SN => 最后活跃时间 */
+    /* ==================== 心跳内存计数 ==================== */
+    /** @var array<string, int> */
     private array $activeDevices = [];
 
-    /** @var array<string, int> 设备SN => 最后 Redis 续期间隔 */
+    /** @var array<string, int> */
     private array $lastRenewTime = [];
 
     private int $activeDeviceCount = 0;
 
     private int $lastExpireScan = 0;
 
-    /** @var int 续期间隔秒数（30s 内不重复写 Redis） */
     private int $renewIntervalSec = 30;
 
     /* ==================== 统计 ==================== */
@@ -194,28 +198,30 @@ class EdgeInsertRedisDimCommand extends Command
     public function handle(): int
     {
         $this->startTime = microtime(true);
-        $this->info('[edge:insert-redis] 启动，PID='.getmypid());
+        $this->info('[edge:insert-redis-dim] 启动（分片版），PID=' . getmypid());
+
+        $this->shardCount = max(1, (int) $this->option('shard-count'));
 
         $this->loadConfig();
         $this->initComponents();
         $this->initRedisPool();
         $this->registerSignalHandlers();
 
+        // ★ 初始化分片管理器
+        RedisShardManager::init();
+
         $metricsPort = $this->configInt('edge.metrics.port', 9090);
         $metricsHost = config('edge.metrics.host', '0.0.0.0');
-
         if ($metricsHost === '0.0.0.0') {
             $metricsHost = '127.0.0.1';
         }
 
         $this->exporter->startMetricsServer($metricsPort, $metricsHost, function (): array {
             $this->collectWorkerMetrics();
-
             return $this->exporter->getMetrics();
         });
 
         [$scheme, $serverIp] = $this->getServerIp();
-
         $this->info(sprintf('[metrics] Prometheus 监听 %s:%d', $metricsHost, $metricsPort));
         $this->info(sprintf('[metrics] Prometheus 本地 %s://%s:%d', $scheme, $serverIp, $metricsPort));
         echo "[metrics] Prometheus 预览 {$scheme}://{$serverIp}:{$metricsPort}/metrics\n";
@@ -249,7 +255,8 @@ class EdgeInsertRedisDimCommand extends Command
 
                 $this->info('=====================================');
                 $this->info(sprintf('MQTT 订阅已启动 | %s', $this->nowString()));
-                $this->info('订阅主题：'.implode(', ', $topics));
+                $this->info(sprintf('分片数：%d | Stream 前缀：%s', $this->shardCount, self::STREAM_DATA_PREFIX));
+                $this->info('订阅主题：' . implode(', ', $topics));
                 $this->info(sprintf(
                     '普通：batch=%d interval=%dms channel=%d workers=%d',
                     $this->normalBatchSize,
@@ -307,7 +314,6 @@ class EdgeInsertRedisDimCommand extends Command
                         ));
                         $this->droppedCount++;
                         $this->exporter->inc('edge_redis_write_failed_total');
-
                         return;
                     }
 
@@ -340,7 +346,6 @@ class EdgeInsertRedisDimCommand extends Command
                         if ($activeKey !== null && $activeKey !== '') {
                             $this->renewDeviceActive($activeKey);
                         }
-
                         if (! $this->heartbeatWriteStream) {
                             return;
                         }
@@ -350,10 +355,12 @@ class EdgeInsertRedisDimCommand extends Command
                         if ((mt_rand(1, 10000) / 10000.0) > $this->sampleRate) {
                             $this->droppedCount++;
                             $this->exporter->inc('edge_dropped_by_sampling_total');
-
                             return;
                         }
                     }
+
+                    // ★ 计算分片号
+                    $shardNo = $this->calcShard($device);
 
                     $item = [
                         'topic' => $topic,
@@ -362,6 +369,7 @@ class EdgeInsertRedisDimCommand extends Command
                         'ts' => sprintf('%.3f', microtime(true)),
                         '_enqueued_at' => microtime(true),
                         'is_heartbeat' => $isHeartbeat,
+                        'shard_no' => $shardNo,
                     ];
 
                     $this->exporter->inc('edge_received_total');
@@ -376,11 +384,9 @@ class EdgeInsertRedisDimCommand extends Command
                     }
                 };
 
-                // ★ 一次性传所有 topic，只建一个 MQTT 连接
                 $this->mqtt->subscribeMultiple($topics, $handler);
 
                 $connectedAt = microtime(true);
-
                 while ($this->mqtt->isRunning()) {
                     if ($this->stopping) {
                         $this->info('[edge] 收到停止信号，正在退出...');
@@ -391,7 +397,6 @@ class EdgeInsertRedisDimCommand extends Command
                         }
                         break 2;
                     }
-
                     sleep(1);
                 }
 
@@ -400,13 +405,9 @@ class EdgeInsertRedisDimCommand extends Command
                 }
 
                 $connectionDuration = microtime(true) - $connectedAt;
-
                 if ($connectionDuration >= 10.0) {
                     $reconnectCount = 0;
-                    $this->info(sprintf(
-                        '[mqtt] 连接稳定 %.1fs，重连计数已重置',
-                        $connectionDuration,
-                    ));
+                    $this->info(sprintf('[mqtt] 连接稳定 %.1fs，重连计数已重置', $connectionDuration));
                 } else {
                     $reconnectCount++;
                     $this->warn(sprintf(
@@ -418,19 +419,13 @@ class EdgeInsertRedisDimCommand extends Command
                 }
 
                 if ($reconnectCount >= $maxReconnects) {
-                    $this->error(sprintf(
-                        '[mqtt] 连续重连 %d 次失败，放弃连接，进程退出（PID=%d）',
-                        $maxReconnects,
-                        getmypid(),
-                    ));
+                    $this->error(sprintf('[mqtt] 连续重连 %d 次失败，放弃连接，进程退出（PID=%d）', $maxReconnects, getmypid()));
                     $this->printStats();
                     $this->exporter->stop();
-
                     return 1;
                 }
 
                 $this->warn(sprintf('[mqtt] %d 秒后重连...', $reconnectDelay));
-
                 $elapsed = 0;
                 while ($elapsed < $reconnectDelay) {
                     if ($this->stopping) {
@@ -446,27 +441,16 @@ class EdgeInsertRedisDimCommand extends Command
                 }
 
                 $reconnectCount++;
-                $this->error(sprintf(
-                    '[mqtt] 连接异常：%s（第 %d/%d 次）',
-                    $e->getMessage(),
-                    $reconnectCount,
-                    $maxReconnects,
-                ));
+                $this->error(sprintf('[mqtt] 连接异常：%s（第 %d/%d 次）', $e->getMessage(), $reconnectCount, $maxReconnects));
 
                 if ($reconnectCount >= $maxReconnects) {
-                    $this->error(sprintf(
-                        '[mqtt] 连续重连 %d 次失败，放弃连接，进程退出（PID=%d）',
-                        $maxReconnects,
-                        getmypid(),
-                    ));
+                    $this->error(sprintf('[mqtt] 连续重连 %d 次失败，放弃连接，进程退出（PID=%d）', $maxReconnects, getmypid()));
                     $this->printStats();
                     $this->exporter->stop();
-
                     return 1;
                 }
 
                 $this->error(sprintf('[mqtt] %d 秒后重连...', $reconnectDelay));
-
                 $elapsed = 0;
                 while ($elapsed < $reconnectDelay) {
                     if ($this->stopping) {
@@ -481,7 +465,7 @@ class EdgeInsertRedisDimCommand extends Command
         if ($this->stopping) {
             $this->info('[edge] 快速退出模式');
             $this->printStats();
-            $this->info('[edge:insert-redis] 已停止');
+            $this->info('[edge:insert-redis-dim] 已停止');
             exit(0);
         }
 
@@ -492,19 +476,38 @@ class EdgeInsertRedisDimCommand extends Command
 
         $this->printStats();
         $this->exporter->stop();
-        $this->info('[edge:insert-redis] 已停止');
+        $this->info('[edge:insert-redis-dim] 已停止');
 
         return 0;
     }
 
-    /* ==================== ★ 心跳续期（内存计数 + 间隔合并） ==================== */
+    /* ==================== ★ 分片路由 ==================== */
+
+    private function calcShard(string $device): int
+    {
+        if ($device === 'unknown' || $device === '') {
+            return 0;
+        }
+        return (crc32($device) & 0x7FFFFFFF) % $this->shardCount;
+    }
+
+    private function getDataStreamKey(int $shardNo): string
+    {
+        return self::STREAM_DATA_PREFIX . $shardNo;
+    }
+
+    private function getHighStreamKey(int $shardNo): string
+    {
+        return self::STREAM_HIGH_PREFIX . $shardNo;
+    }
+
+    /* ==================== 心跳续期 ==================== */
 
     protected function renewDeviceActive(string $sn): void
     {
         $now = time();
         $lastRenew = $this->lastRenewTime[$sn] ?? 0;
 
-        // ★ 30s 内不重复写 Redis，只更新内存
         if (($now - $lastRenew) < $this->renewIntervalSec) {
             if (! isset($this->activeDevices[$sn])) {
                 $this->activeDevices[$sn] = $now;
@@ -515,7 +518,7 @@ class EdgeInsertRedisDimCommand extends Command
             return;
         }
 
-        $key = 'device:active:'.$sn;
+        $key = 'device:active:' . $sn;
         $ttl = $this->deviceActiveTtl;
 
         try {
@@ -534,11 +537,11 @@ class EdgeInsertRedisDimCommand extends Command
             $this->activeDevices[$sn] = $now;
 
         } catch (Throwable $e) {
-            fwrite(STDERR, '[renewDeviceActive] '.$e->getMessage().PHP_EOL);
+            fwrite(STDERR, '[renewDeviceActive] ' . $e->getMessage() . PHP_EOL);
         }
     }
 
-    /* ==================== ★ Auto-Scaler ==================== */
+    /* ==================== Auto-Scaler ==================== */
 
     private function startAutoScaler(): void
     {
@@ -557,7 +560,6 @@ class EdgeInsertRedisDimCommand extends Command
                 $clientCount = $this->getActiveClientCount();
                 $this->activeClientCount = $clientCount;
 
-                // ---- 目标 worker 数 ----
                 $targetNormal = match (true) {
                     $clientCount <= 3 => 1,
                     $clientCount <= 10 => 2,
@@ -573,10 +575,8 @@ class EdgeInsertRedisDimCommand extends Command
                     default => 3,
                 };
 
-                // ---- 动态 batch size ----
                 $newBatchSize = max(10, min(500, (int) ($clientCount * 2 + 20)));
 
-                // ---- 动态 flush 间隔 ----
                 $newFlushInterval = match (true) {
                     $clientCount <= 3 => 1000,
                     $clientCount <= 10 => 500,
@@ -584,7 +584,6 @@ class EdgeInsertRedisDimCommand extends Command
                     default => $this->normalFlushIntervalMs,
                 };
 
-                // ---- 采样率 ----
                 if ($clientCount <= 3) {
                     $newSampleRate = $this->sampleRateMin;
                 } elseif ($clientCount <= 10) {
@@ -593,7 +592,6 @@ class EdgeInsertRedisDimCommand extends Command
                     $newSampleRate = $this->sampleRateMax;
                 }
 
-                // ---- 应用变更 ----
                 $changed = false;
 
                 if ($targetNormal !== $this->targetNormalWorkers) {
@@ -612,7 +610,6 @@ class EdgeInsertRedisDimCommand extends Command
                 $this->normalFlushIntervalMs = $newFlushInterval;
                 $this->sampleRate = $newSampleRate;
 
-                // Prometheus 指标
                 $this->exporter->set('edge_active_clients', $clientCount);
                 $this->exporter->set('edge_target_workers_normal', $targetNormal);
                 $this->exporter->set('edge_target_workers_high', $targetHigh);
@@ -689,14 +686,10 @@ class EdgeInsertRedisDimCommand extends Command
         }
     }
 
-    /**
-     * ★ 内存计数版 — 零 Redis scan
-     */
     private function getActiveClientCount(): int
     {
         $now = time();
 
-        // ★ 每 30s 做一次过期淘汰
         if (($now - $this->lastExpireScan) >= 30) {
             $expired = [];
             foreach ($this->activeDevices as $sn => $lastSeen) {
@@ -738,41 +731,26 @@ class EdgeInsertRedisDimCommand extends Command
             $result = $this->probeOnce($attempts, $maxAttempts);
 
             if ($result['ok']) {
-                $this->info(sprintf(
-                    '[mqtt-probe] %s 可达（%.2fms）',
-                    $result['target'],
-                    $result['elapsed_ms'],
-                ));
-
+                $this->info(sprintf('[mqtt-probe] %s 可达（%.2fms）', $result['target'], $result['elapsed_ms']));
                 return;
             }
 
             $lastError = $result['error'];
-            $this->warn(sprintf(
-                '[mqtt-probe] 第 %d 次探测失败（%.2fms）：%s',
-                $attempts,
-                $result['elapsed_ms'],
-                $lastError,
-            ));
+            $this->warn(sprintf('[mqtt-probe] 第 %d 次探测失败（%.2fms）：%s', $attempts, $result['elapsed_ms'], $lastError));
 
             if ($attempts < $maxAttempts) {
                 usleep(200_000);
             }
         }
 
-        throw new \RuntimeException(sprintf(
-            '[mqtt-probe] MQTT 连通性探测失败，已重试 %d 次：%s，进程终止',
-            $maxRetries,
-            $lastError,
-        ));
+        throw new \RuntimeException(sprintf('[mqtt-probe] MQTT 连通性探测失败，已重试 %d 次：%s，进程终止', $maxRetries, $lastError));
     }
 
     private function startPeriodicMqttProbe(): void
     {
         $interval = $this->configInt('edge.mqtt.probe_interval_sec', 30);
         if ($interval <= 0) {
-            $this->info('[mqtt-probe:periodic] 已禁用（probe_interval_sec <= 0）');
-
+            $this->info('[mqtt-probe:periodic] 已禁用');
             return;
         }
 
@@ -795,46 +773,28 @@ class EdgeInsertRedisDimCommand extends Command
 
                 if ($result['ok']) {
                     if ($wasFailing) {
-                        $this->info(sprintf(
-                            '[mqtt-probe:periodic] 恢复，%s 可达（%.2fms）',
-                            $result['target'],
-                            $result['elapsed_ms'],
-                        ));
+                        $this->info(sprintf('[mqtt-probe:periodic] 恢复，%s 可达（%.2fms）', $result['target'], $result['elapsed_ms']));
                         $wasFailing = false;
                     }
 
                     $consecutiveFailures = 0;
                     $this->exporter->set('edge_mqtt_probe_consecutive_failures', 0);
-
                     continue;
                 }
 
                 $consecutiveFailures++;
                 $this->exporter->set('edge_mqtt_probe_consecutive_failures', $consecutiveFailures);
 
-                $this->warn(sprintf(
-                    '[mqtt-probe:periodic] 第 %d 次失败（%.2fms）：%s',
-                    $consecutiveFailures,
-                    $result['elapsed_ms'],
-                    $result['error'],
-                ));
+                $this->warn(sprintf('[mqtt-probe:periodic] 第 %d 次失败（%.2fms）：%s', $consecutiveFailures, $result['elapsed_ms'], $result['error']));
 
                 if ($consecutiveFailures >= $threshold && ! $wasFailing) {
-                    $this->error(sprintf(
-                        '[mqtt-probe:periodic] 连续失败 %d 次，MQTT 可能不可达（阈值=%d）',
-                        $consecutiveFailures,
-                        $threshold,
-                    ));
+                    $this->error(sprintf('[mqtt-probe:periodic] 连续失败 %d 次，MQTT 可能不可达（阈值=%d）', $consecutiveFailures, $threshold));
                     $wasFailing = true;
                 }
             }
         });
 
-        $this->info(sprintf(
-            '[mqtt-probe:periodic] 已启动，间隔 %ds，失败阈值 %d 次',
-            $interval,
-            $threshold,
-        ));
+        $this->info(sprintf('[mqtt-probe:periodic] 已启动，间隔 %ds，失败阈值 %d 次', $interval, $threshold));
     }
 
     private function probeOnce(int $attempt = 0, int $maxAttempts = 0): array
@@ -854,24 +814,11 @@ class EdgeInsertRedisDimCommand extends Command
         $start = microtime(true);
 
         if ($attempt > 0 && $maxAttempts > 0) {
-            $this->info(sprintf(
-                '[mqtt-probe] 探测 %s（第 %d/%d 次，超时 %.1fs）...',
-                $target,
-                $attempt,
-                $maxAttempts,
-                $timeout,
-            ));
+            $this->info(sprintf('[mqtt-probe] 探测 %s（第 %d/%d 次，超时 %.1fs）...', $target, $attempt, $maxAttempts, $timeout));
         }
 
         $timeoutInt = (int) ceil($timeout);
-        $socket = @stream_socket_client(
-            $target,
-            $errno,
-            $errstr,
-            $timeoutInt > 0 ? $timeoutInt : null,
-            STREAM_CLIENT_CONNECT,
-            $context,
-        );
+        $socket = @stream_socket_client($target, $errno, $errstr, $timeoutInt > 0 ? $timeoutInt : null, STREAM_CLIENT_CONNECT, $context);
 
         $elapsedMs = (microtime(true) - $start) * 1000;
 
@@ -909,13 +856,11 @@ class EdgeInsertRedisDimCommand extends Command
             return stream_context_create([]);
         }
 
-        $options = [
-            'ssl' => [
-                'verify_peer' => (bool) config('edge.mqtt.tls.verify_peer', false),
-                'verify_peer_name' => (bool) config('edge.mqtt.tls.verify_peer_name', true),
-                'allow_self_signed' => (bool) config('edge.mqtt.tls.allow_self_signed', false),
-            ],
-        ];
+        $options = ['ssl' => [
+            'verify_peer' => (bool) config('edge.mqtt.tls.verify_peer', false),
+            'verify_peer_name' => (bool) config('edge.mqtt.tls.verify_peer_name', true),
+            'allow_self_signed' => (bool) config('edge.mqtt.tls.allow_self_signed', false),
+        ]];
 
         $cafile = config('edge.mqtt.tls.cafile');
         if (is_string($cafile) && $cafile !== '') {
@@ -1008,11 +953,7 @@ class EdgeInsertRedisDimCommand extends Command
         $adaptMax = $this->configInt('edge.mqtt.adapt_max_batch', 2000);
         $adaptAlpha = (float) config('edge.mqtt.adapt_alpha', 0.3);
 
-        $this->adaptiveBatch = new MultiDimAdaptiveBatch(
-            min: $adaptMin,
-            max: $adaptMax,
-            alpha: $adaptAlpha,
-        );
+        $this->adaptiveBatch = new MultiDimAdaptiveBatch(min: $adaptMin, max: $adaptMax, alpha: $adaptAlpha);
 
         $this->router = new PriorityRouter(
             highPriorityTopics: $this->resolveHighPriorityTopics(),
@@ -1026,11 +967,9 @@ class EdgeInsertRedisDimCommand extends Command
     private function resolveTopics(): array
     {
         $topics = config('edge.mqtt.topics', ['heartbeat/response']);
-
         if (is_string($topics)) {
             $topics = array_filter(array_map('trim', explode(',', $topics)));
         }
-
         return array_values((array) $topics);
     }
 
@@ -1045,11 +984,9 @@ class EdgeInsertRedisDimCommand extends Command
             'device/+/control',
             'device/+/command',
         ]);
-
         if (is_string($topics)) {
             $topics = array_filter(array_map('trim', explode(',', $topics)));
         }
-
         return array_values((array) $topics);
     }
 
@@ -1058,10 +995,9 @@ class EdgeInsertRedisDimCommand extends Command
     private function routeToNormalChannel(array $item, string $device): void
     {
         if ($this->normalChannel->isFull()) {
-            $this->warn('[CHANNEL] 普通队列已满，丢弃 device='.$device);
+            $this->warn('[CHANNEL] 普通队列已满，丢弃 device=' . $device);
             $this->droppedCount++;
             $this->exporter->inc('edge_dead_letter_total');
-
             return;
         }
 
@@ -1070,7 +1006,7 @@ class EdgeInsertRedisDimCommand extends Command
             $this->receivedCount++;
             $this->normalBacklog++;
         } catch (Throwable $e) {
-            $this->error('[CHANNEL] 普通队列 push 失败：'.$e->getMessage());
+            $this->error('[CHANNEL] 普通队列 push 失败：' . $e->getMessage());
             $this->droppedCount++;
         }
     }
@@ -1078,10 +1014,9 @@ class EdgeInsertRedisDimCommand extends Command
     private function routeToHighChannel(array $item, string $device): void
     {
         if ($this->highChannel->isFull()) {
-            $this->warn('[CHANNEL] 高优队列已满，降级写死信 device='.$device);
+            $this->warn('[CHANNEL] 高优队列已满，降级写死信 device=' . $device);
             $this->exporter->inc('edge_dead_letter_total');
             $this->pushDeadLetter([$item], 'high_channel_full');
-
             return;
         }
 
@@ -1090,7 +1025,7 @@ class EdgeInsertRedisDimCommand extends Command
             $this->receivedCount++;
             $this->highBacklog++;
         } catch (Throwable $e) {
-            $this->error('[CHANNEL] 高优队列 push 失败：'.$e->getMessage());
+            $this->error('[CHANNEL] 高优队列 push 失败：' . $e->getMessage());
             $this->exporter->inc('edge_dead_letter_total');
         }
     }
@@ -1153,7 +1088,6 @@ class EdgeInsertRedisDimCommand extends Command
 
         while (microtime(true) < $timeout) {
             $alive = 0;
-
             foreach ([...$this->normalWorkerCoroutines, ...$this->highWorkerCoroutines, ...$this->deadWorkerCoroutines] as $coroutine) {
                 try {
                     if ($coroutine->isAlive()) {
@@ -1202,7 +1136,7 @@ class EdgeInsertRedisDimCommand extends Command
         }
     }
 
-    /* ==================== 普通 Worker ==================== */
+    /* ==================== 普通 Worker（分片版） ==================== */
 
     private function runNormalWorker(): void
     {
@@ -1269,7 +1203,7 @@ class EdgeInsertRedisDimCommand extends Command
         $this->debugWorker('normal', $workerId, 'stopped');
     }
 
-    /* ==================== 高优 Worker ==================== */
+    /* ==================== 高优 Worker（分片版） ==================== */
 
     private function runHighWorker(): void
     {
@@ -1332,7 +1266,7 @@ class EdgeInsertRedisDimCommand extends Command
         $this->debugWorker('high', $workerId, 'stopped');
     }
 
-    /* ==================== 死信 Worker ==================== */
+    /* ==================== 死信 Worker（不变） ==================== */
 
     private function runDeadLetterWorker(): void
     {
@@ -1402,11 +1336,10 @@ class EdgeInsertRedisDimCommand extends Command
                 // ignore
             }
         }
-
         return $alive;
     }
 
-    /* ==================== Redis 写入 ==================== */
+    /* ==================== Redis 写入（分片版） ==================== */
 
     private function flushNormalBatch(array $batch): void
     {
@@ -1415,70 +1348,72 @@ class EdgeInsertRedisDimCommand extends Command
         }
 
         $flushStart = microtime(true);
-        $now = microtime(true);
-        $waitSum = 0.0;
-
-        foreach ($batch as $item) {
-            $enqueuedAt = $item['_enqueued_at'] ?? $now;
-            $waitSum += ($now - $enqueuedAt) * 1000;
-        }
-
         $count = count($batch);
 
         try {
-            withRedis(function (\Redis $conn) use ($count, $batch): void {
-                $conn->multi(\Redis::PIPELINE);
+            // ★ 按分片分组
+            $shardBatches = [];
+            foreach ($batch as $item) {
+                $shardNo = $item['shard_no'] ?? 0;
+                $shardBatches[$shardNo][] = $item;
+            }
 
-                foreach ($batch as $item) {
-                    $conn->xAdd(
-                        self::STREAM_DATA,
-                        '*',
-                        [
-                            'topic' => $item['topic'],
-                            'payload' => $item['payload'],
-                            'device' => $item['device'],
-                            'ts' => $item['ts'],
-                        ],
-                        self::STREAM_MAX_LEN,
-                        true,
-                    );
+            foreach ($shardBatches as $shardNo => $items) {
+                $conn = RedisShardManager::popByShard($shardNo);
+                if ($conn === null) {
+                    $this->error(sprintf('[FLUSH] 无法获取分片 %d 的 Redis 连接', $shardNo));
+                    continue;
                 }
 
-                $results = $conn->exec();
+                try {
+                    $streamKey = $this->getDataStreamKey($shardNo);
+                    $conn->multi(\Redis::PIPELINE);
 
-                if (is_array($results) && count($results) !== $count) {
-                    fwrite(STDERR, sprintf(
-                        "[FLUSH-DIAG] normal pipeline 结果数异常 expect=%d actual=%d\n",
-                        $count,
-                        count($results),
-                    ));
+                    foreach ($items as $item) {
+                        $conn->xAdd(
+                            $streamKey,
+                            '*',
+                            [
+                                'topic' => $item['topic'],
+                                'payload' => $item['payload'],
+                                'device' => $item['device'],
+                                'ts' => $item['ts'],
+                            ],
+                            self::STREAM_MAX_LEN,
+                            true,
+                        );
+                    }
+
+                    $results = $conn->exec();
+                    if (is_array($results) && count($results) !== count($items)) {
+                        fwrite(STDERR, sprintf(
+                            "[FLUSH-DIAG] shard=%d pipeline 结果异常 expect=%d actual=%d\n",
+                            $shardNo, count($items), count($results)
+                        ));
+                    }
+                } finally {
+                    RedisShardManager::pushByShard($shardNo, $conn);
                 }
-            });
+            }
 
             $this->normalFlushedCount += $count;
             $this->exporter->inc('edge_data_write_success_total', $count);
             $this->normalBacklog = max(0, $this->normalBacklog - $count);
 
             $elapsedMs = (microtime(true) - $flushStart) * 1000;
-            $this->lastNormalWaitMs = $waitSum / $count;
             $this->normalFlushLatencySum += $elapsedMs;
             $this->normalFlushTimes++;
 
             $this->exporter->observe('edge_flush_duration_ms_normal', $elapsedMs);
 
             $this->line(sprintf(
-                '[FLUSH] batch=%d → %s (%.2fms)',
+                '[FLUSH] batch=%d → %d 个分片 (%.2fms)',
                 $count,
-                self::STREAM_DATA,
+                count($shardBatches),
                 $elapsedMs,
             ));
         } catch (Throwable $e) {
-            $this->error(sprintf(
-                '[FLUSH] 普通写入失败（%d 条）→ 死信：%s',
-                $count,
-                $e->getMessage(),
-            ));
-
+            $this->error(sprintf('[FLUSH] 普通写入失败（%d 条）→ 死信：%s', $count, $e->getMessage()));
             $this->exporter->inc('edge_redis_write_failed_total', $count);
             $this->pushDeadLetter($batch, $e->getMessage());
         }
@@ -1491,87 +1426,68 @@ class EdgeInsertRedisDimCommand extends Command
         }
 
         $flushStart = microtime(true);
-        $now = microtime(true);
-        $waitSum = 0.0;
-
-        foreach ($batch as $item) {
-            $enqueuedAt = $item['_enqueued_at'] ?? $now;
-            $waitSum += ($now - $enqueuedAt) * 1000;
-        }
-
         $count = count($batch);
 
         try {
-            withRedis(function (\Redis $conn) use ($count, $batch): void {
-                $conn->multi(\Redis::PIPELINE);
-
-                foreach ($batch as $item) {
-                    $isHb = $item['is_heartbeat'] ?? false;
-                    $stream = $isHb ? self::STREAM_HEARTBEAT : self::STREAM_HIGH;
-                    $maxLen = $isHb ? self::HEARTBEAT_MAX_LEN : self::STREAM_MAX_LEN;
-
-                    $conn->xAdd(
-                        $stream,
-                        '*',
-                        [
-                            'topic' => $item['topic'],
-                            'payload' => $item['payload'],
-                            'device' => $item['device'],
-                            'ts' => $item['ts'],
-                        ],
-                        $maxLen,
-                        true,
-                    );
-                }
-
-                $results = $conn->exec();
-
-                if (is_array($results) && count($results) !== $count) {
-                    fwrite(STDERR, sprintf(
-                        "[FLUSH-DIAG] high pipeline 结果数异常 expect=%d actual=%d\n",
-                        $count,
-                        count($results),
-                    ));
-                }
-            });
-
-            $hbCount = 0;
-            $highCount = 0;
+            // ★ 高优也按分片分组
+            $shardBatches = [];
             foreach ($batch as $item) {
-                if ($item['is_heartbeat'] ?? false) {
-                    $hbCount++;
-                } else {
-                    $highCount++;
+                $shardNo = $item['shard_no'] ?? 0;
+                $shardBatches[$shardNo][] = $item;
+            }
+
+            foreach ($shardBatches as $shardNo => $items) {
+                $conn = RedisShardManager::popByShard($shardNo);
+                if ($conn === null) {
+                    continue;
+                }
+
+                try {
+                    $conn->multi(\Redis::PIPELINE);
+
+                    foreach ($items as $item) {
+                        $isHb = $item['is_heartbeat'] ?? false;
+                        if ($isHb) {
+                            $stream = self::STREAM_HEARTBEAT;
+                            $maxLen = self::HEARTBEAT_MAX_LEN;
+                        } else {
+                            $stream = $this->getHighStreamKey($shardNo);
+                            $maxLen = self::STREAM_MAX_LEN;
+                        }
+
+                        $conn->xAdd(
+                            $stream,
+                            '*',
+                            [
+                                'topic' => $item['topic'],
+                                'payload' => $item['payload'],
+                                'device' => $item['device'],
+                                'ts' => $item['ts'],
+                            ],
+                            $maxLen,
+                            true,
+                        );
+                    }
+
+                    $conn->exec();
+                } finally {
+                    RedisShardManager::pushByShard($shardNo, $conn);
                 }
             }
 
-            $this->highFlushedCount += $highCount;
-            $this->heartbeatFlushedCount += $hbCount;
-            $this->exporter->inc('edge_high_write_success_total', $highCount);
-            $this->exporter->inc('edge_heartbeat_written_total', $hbCount);
+            $this->highFlushedCount += $count;
+            $this->exporter->inc('edge_high_write_success_total', $count);
             $this->highBacklog = max(0, $this->highBacklog - $count);
 
             $elapsedMs = (microtime(true) - $flushStart) * 1000;
-            $this->lastHighWaitMs = $waitSum / $count;
             $this->highFlushLatencySum += $elapsedMs;
             $this->highFlushTimes++;
 
             $this->exporter->observe('edge_flush_duration_ms_high', $elapsedMs);
 
-            $this->line(sprintf(
-                '[FLUSH:HIGH] batch=%d → high=%d heartbeat=%d (%.2fms)',
-                $count,
-                $highCount,
-                $hbCount,
-                $elapsedMs,
-            ));
+            $this->line(sprintf('[FLUSH:HIGH] batch=%d → %d 分片 (%.2fms)', $count, count($shardBatches), $elapsedMs));
         } catch (Throwable $e) {
-            $this->error(sprintf(
-                '[FLUSH:HIGH] 高优写入失败（%d 条）→ 死信：%s',
-                $count,
-                $e->getMessage(),
-            ));
-
+            $this->error(sprintf('[FLUSH:HIGH] 失败（%d 条）→ 死信：%s', $count, $e->getMessage()));
             $this->exporter->inc('edge_redis_write_failed_total', $count);
             $this->pushDeadLetter($batch, $e->getMessage());
         }
@@ -1603,10 +1519,7 @@ class EdgeInsertRedisDimCommand extends Command
                         self::STREAM_DEAD,
                         '*',
                         [
-                            'batch' => json_encode(
-                                $item['batch'] ?? $item,
-                                JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE,
-                            ),
+                            'batch' => json_encode($item['batch'] ?? $item, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
                             'error' => $item['error'] ?? '',
                             'ts' => sprintf('%.3f', $item['ts'] ?? microtime(true)),
                         ],
@@ -1623,24 +1536,14 @@ class EdgeInsertRedisDimCommand extends Command
             $this->deadBacklog = max(0, $this->deadBacklog - $count);
 
             $elapsedMs = (microtime(true) - $flushStart) * 1000;
-            $this->lastDeadWaitMs = $waitSum / $count;
             $this->deadFlushLatencySum += $elapsedMs;
             $this->deadFlushTimes++;
 
             $this->exporter->observe('edge_flush_duration_ms_dead', $elapsedMs);
 
-            $this->warn(sprintf(
-                '[DEAD] batch=%d → %s (%.2fms)',
-                $count,
-                self::STREAM_DEAD,
-                $elapsedMs,
-            ));
+            $this->warn(sprintf('[DEAD] batch=%d → %s (%.2fms)', $count, self::STREAM_DEAD, $elapsedMs));
         } catch (Throwable $e) {
-            $this->error(sprintf(
-                '[DEAD] 死信写入失败（%d 条）：%s',
-                $count,
-                $e->getMessage(),
-            ));
+            $this->error(sprintf('[DEAD] 死信写入失败（%d 条）：%s', $count, $e->getMessage()));
         }
     }
 
@@ -1662,21 +1565,15 @@ class EdgeInsertRedisDimCommand extends Command
 
         $this->exporter->set(
             'edge_flush_latency_ms_normal',
-            $this->normalFlushTimes > 0
-                ? $this->normalFlushLatencySum / $this->normalFlushTimes
-                : 0.0,
+            $this->normalFlushTimes > 0 ? $this->normalFlushLatencySum / $this->normalFlushTimes : 0.0,
         );
         $this->exporter->set(
             'edge_flush_latency_ms_high',
-            $this->highFlushTimes > 0
-                ? $this->highFlushLatencySum / $this->highFlushTimes
-                : 0.0,
+            $this->highFlushTimes > 0 ? $this->highFlushLatencySum / $this->highFlushTimes : 0.0,
         );
         $this->exporter->set(
             'edge_flush_latency_ms_dead',
-            $this->deadFlushTimes > 0
-                ? $this->deadFlushLatencySum / $this->deadFlushTimes
-                : 0.0,
+            $this->deadFlushTimes > 0 ? $this->deadFlushLatencySum / $this->deadFlushTimes : 0.0,
         );
 
         $this->exporter->set('edge_flushed_total_normal', $this->normalFlushedCount);
@@ -1694,8 +1591,8 @@ class EdgeInsertRedisDimCommand extends Command
         $this->exporter->set('edge_sample_rate', $this->sampleRate);
         $this->exporter->set('edge_current_batch_size', $this->normalBatchSize);
         $this->exporter->set('edge_current_flush_interval_ms', $this->normalFlushIntervalMs);
-
         $this->exporter->set('edge_heartbeat_write_stream_enabled', $this->heartbeatWriteStream ? 1 : 0);
+        $this->exporter->set('edge_shard_count', $this->shardCount);
     }
 
     /* ==================== Redis 连接池 ==================== */
@@ -1715,12 +1612,7 @@ class EdgeInsertRedisDimCommand extends Command
             $this->configInt('edge.redis.db', defined('REDIS_DB') ? REDIS_DB : 2),
         );
 
-        $this->info(sprintf(
-            '[redis] 连接池已初始化 %s:%s db=%s',
-            REDIS_HOST,
-            REDIS_PORT,
-            REDIS_DB,
-        ));
+        $this->info(sprintf('[redis] 连接池已初始化 %s:%s db=%s', REDIS_HOST, REDIS_PORT, REDIS_DB));
     }
 
     /* ==================== 统计 ==================== */
@@ -1762,20 +1654,15 @@ class EdgeInsertRedisDimCommand extends Command
         $elapsed = max(0.001, microtime(true) - $this->startTime);
         $totalFlushed = $this->normalFlushedCount + $this->highFlushedCount + $this->deadFlushedCount + $this->heartbeatFlushedCount;
         $qps = $totalFlushed / $elapsed;
-        $avgNormalMs = $this->normalFlushTimes > 0
-            ? $this->normalFlushLatencySum / $this->normalFlushTimes
-            : 0.0;
-        $avgHighMs = $this->highFlushTimes > 0
-            ? $this->highFlushLatencySum / $this->highFlushTimes
-            : 0.0;
-        $avgDeadMs = $this->deadFlushTimes > 0
-            ? $this->deadFlushLatencySum / $this->deadFlushTimes
-            : 0.0;
+        $avgNormalMs = $this->normalFlushTimes > 0 ? $this->normalFlushLatencySum / $this->normalFlushTimes : 0.0;
+        $avgHighMs = $this->highFlushTimes > 0 ? $this->highFlushLatencySum / $this->highFlushTimes : 0.0;
+        $avgDeadMs = $this->deadFlushTimes > 0 ? $this->deadFlushLatencySum / $this->deadFlushTimes : 0.0;
 
         $fmt = '  %-22s %s';
 
         $this->info('========== 运行统计 ==========');
         $this->info(sprintf($fmt, '运行时长：', sprintf('%.1fs', $elapsed)));
+        $this->info(sprintf($fmt, '分片数：', (string) $this->shardCount));
         $this->info(sprintf($fmt, '接收消息：', (string) $this->receivedCount));
         $this->info(sprintf($fmt, '普通写入：', (string) $this->normalFlushedCount));
         $this->info(sprintf($fmt, '高优写入：', (string) $this->highFlushedCount));
@@ -1790,7 +1677,7 @@ class EdgeInsertRedisDimCommand extends Command
         $this->info(sprintf($fmt, '高优平均刷盘：', sprintf('%.2fms', $avgHighMs)));
         $this->info(sprintf($fmt, '死信平均刷盘：', sprintf('%.2fms', $avgDeadMs)));
         $this->info(sprintf($fmt, '积压：', sprintf('normal=%d high=%d dead=%d', $this->normalBacklog, $this->highBacklog, $this->deadBacklog)));
-        $this->info(sprintf($fmt, '活跃 Worker：', sprintf('normal=%d high=%d dead=%d (target: n=%d h=%d)', $this->activeNormalWorkers, $this->activeHighWorkers, $this->activeDeadWorkers, $this->targetNormalWorkers, $this->targetHighWorkers)));
+        $this->info(sprintf($fmt, '活跃 Worker：', sprintf('normal=%d high=%d dead=%d', $this->activeNormalWorkers, $this->activeHighWorkers, $this->activeDeadWorkers)));
         $this->info('==============================');
     }
 
@@ -1804,7 +1691,6 @@ class EdgeInsertRedisDimCommand extends Command
             if ($value === null) {
                 return $default;
             }
-
             return (int) $value;
         } catch (Throwable) {
             return $default;
@@ -1813,12 +1699,7 @@ class EdgeInsertRedisDimCommand extends Command
 
     private function debugWorker(string $priority, int $workerId, string $event): void
     {
-        fwrite(STDERR, sprintf(
-            "[WORKER:%s] #%d %s\n",
-            $priority,
-            $workerId,
-            $event,
-        ));
+        fwrite(STDERR, sprintf("[WORKER:%s] #%d %s\n", $priority, $workerId, $event));
     }
 
     /**
@@ -1844,7 +1725,6 @@ class EdgeInsertRedisDimCommand extends Command
                     }
                 }
             }
-
             return [$scheme, '127.0.0.1'];
         }
 

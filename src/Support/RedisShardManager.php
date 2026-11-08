@@ -13,6 +13,7 @@ use Swow\Coroutine;
  * 路由规则：
  * - edge:metrics:* / edge:config:* / edge:global:* → shard-0
  * - device:active:* → shard-0（在线统计 key，集中存储便于 SCAN）
+ * - stream:device:data:{N} → shard-{N % shardCount}（Stream 按编号分片）
  * - device:secret:{clientId}:{username} → 按 clientId
  * - auth:online:{username} → 按 username
  * - fail:{clientId} / block:{clientId} / rate:{clientId} → 按 clientId
@@ -25,6 +26,9 @@ use Swow\Coroutine;
  *   RedisShardManager::init($poolSize, $db);
  *   $conn = RedisShardManager::pop($key);
  *   RedisShardManager::push($key, $conn);
+ *   // 按分片号直接操作（Stream 场景）：
+ *   $conn = RedisShardManager::popByShard($shardNo);
+ *   RedisShardManager::pushByShard($shardNo, $conn);
  *   $stats = RedisShardManager::stats();
  *   $ready = RedisShardManager::isReady();
  */
@@ -102,7 +106,7 @@ class RedisShardManager
                         $authOk = $redis->auth($password);
                         if (! $authOk) {
                             fwrite(STDERR, sprintf(
-                                '[EdgeAuth] Redis AUTH FAILED (%s:%d, password length=%d)'.PHP_EOL,
+                                '[EdgeAuth] Redis AUTH FAILED (%s:%d, password length=%d)' . PHP_EOL,
                                 $host, $port, strlen($password)
                             ));
 
@@ -113,7 +117,7 @@ class RedisShardManager
                         $selectOk = $redis->select($actualDb);
                         if (! $selectOk) {
                             fwrite(STDERR, sprintf(
-                                '[EdgeAuth] Redis SELECT DB %d FAILED'.PHP_EOL,
+                                '[EdgeAuth] Redis SELECT DB %d FAILED' . PHP_EOL,
                                 $actualDb
                             ));
 
@@ -124,14 +128,14 @@ class RedisShardManager
                     $ok++;
                 } catch (\Throwable $e) {
                     fwrite(STDERR, sprintf(
-                        '[EdgeAuth] Redis probe %d failed: %s'.PHP_EOL,
+                        '[EdgeAuth] Redis probe %d failed: %s' . PHP_EOL,
                         $i, $e->getMessage()
                     ));
                 }
             }
 
             fwrite(STDOUT, sprintf(
-                '[EdgeAuth] Redis single-mode probed: %d/%d (%s:%d/%d)'.PHP_EOL,
+                '[EdgeAuth] Redis single-mode probed: %d/%d (%s:%d/%d)' . PHP_EOL,
                 $ok, $probeSize, $host, $port, $actualDb
             ));
 
@@ -151,7 +155,7 @@ class RedisShardManager
                         $failures = self::$fillFailures[0] ?? 0;
                         if ($failures >= $maxFailures) {
                             fwrite(STDERR, sprintf(
-                                '[EdgeAuth] single-mode background fill STOPPED (consecutive failures=%d)'.PHP_EOL,
+                                '[EdgeAuth] single-mode background fill STOPPED (consecutive failures=%d)' . PHP_EOL,
                                 $failures
                             ));
                             break;
@@ -175,7 +179,7 @@ class RedisShardManager
                         } catch (\Throwable $e) {
                             self::$fillFailures[0] = $failures + 1;
                             fwrite(STDERR, sprintf(
-                                '[EdgeAuth] single-mode background fill failed: %s (consecutive=%d)'.PHP_EOL,
+                                '[EdgeAuth] single-mode background fill failed: %s (consecutive=%d)' . PHP_EOL,
                                 $e->getMessage(), $failures + 1
                             ));
                         }
@@ -183,7 +187,7 @@ class RedisShardManager
                     }
 
                     fwrite(STDOUT, sprintf(
-                        '[EdgeAuth] Redis single-mode background filled: %d/%d'.PHP_EOL,
+                        '[EdgeAuth] Redis single-mode background filled: %d/%d' . PHP_EOL,
                         $filled, $remaining
                     ));
                 });
@@ -193,7 +197,7 @@ class RedisShardManager
             self::$ready = true;
 
             if ($ok === 0) {
-                fwrite(STDERR, '[EdgeAuth] Redis single-mode: ALL PROBES FAILED, pool is empty!'.PHP_EOL);
+                fwrite(STDERR, '[EdgeAuth] Redis single-mode: ALL PROBES FAILED, pool is empty!' . PHP_EOL);
             }
 
             return;
@@ -223,14 +227,14 @@ class RedisShardManager
                     $ok++;
                 } catch (\Throwable $e) {
                     fwrite(STDERR, sprintf(
-                        '[EdgeAuth] shard=%d probe %d failed: %s'.PHP_EOL,
+                        '[EdgeAuth] shard=%d probe %d failed: %s' . PHP_EOL,
                         $index, $i, $e->getMessage()
                     ));
                 }
             }
 
             fwrite(STDOUT, sprintf(
-                '[EdgeAuth] Redis shard=%d probed=%d/%d (%s:%d/%d)'.PHP_EOL,
+                '[EdgeAuth] Redis shard=%d probed=%d/%d (%s:%d/%d)' . PHP_EOL,
                 $index, $ok, $probeSize, $cfg['host'], $cfg['port'], $cfg['db']
             ));
 
@@ -248,7 +252,7 @@ class RedisShardManager
                         $failures = self::$fillFailures[$shardIndex] ?? 0;
                         if ($failures >= $maxFailures) {
                             fwrite(STDERR, sprintf(
-                                '[EdgeAuth] shard=%d background fill STOPPED (consecutive failures=%d)'.PHP_EOL,
+                                '[EdgeAuth] shard=%d background fill STOPPED (consecutive failures=%d)' . PHP_EOL,
                                 $shardIndex, $failures
                             ));
                             break;
@@ -269,7 +273,7 @@ class RedisShardManager
                         } catch (\Throwable $e) {
                             self::$fillFailures[$shardIndex] = $failures + 1;
                             fwrite(STDERR, sprintf(
-                                '[EdgeAuth] shard=%d background fill failed: %s (consecutive=%d)'.PHP_EOL,
+                                '[EdgeAuth] shard=%d background fill failed: %s (consecutive=%d)' . PHP_EOL,
                                 $shardIndex, $e->getMessage(), $failures + 1
                             ));
                         }
@@ -277,7 +281,7 @@ class RedisShardManager
                     }
 
                     fwrite(STDOUT, sprintf(
-                        '[EdgeAuth] Redis shard=%d background filled: %d/%d'.PHP_EOL,
+                        '[EdgeAuth] Redis shard=%d background filled: %d/%d' . PHP_EOL,
                         $shardIndex, $filled, $remaining
                     ));
                 });
@@ -288,7 +292,7 @@ class RedisShardManager
 
         self::$ready = true;
         fwrite(STDOUT, sprintf(
-            '[EdgeAuth] Redis sharded mode: %d shards'.PHP_EOL,
+            '[EdgeAuth] Redis sharded mode: %d shards' . PHP_EOL,
             count($shards)
         ));
     }
@@ -317,7 +321,7 @@ class RedisShardManager
 
             // host:port[:[password]][@db]
             if (! preg_match('/^([^:]+):(\d+)(?::([^@]*))?(?:@(\d+))?$/', $part, $m)) {
-                fwrite(STDERR, sprintf('[EdgeAuth] invalid shard config: %s'.PHP_EOL, $part));
+                fwrite(STDERR, sprintf('[EdgeAuth] invalid shard config: %s' . PHP_EOL, $part));
 
                 continue;
             }
@@ -356,6 +360,22 @@ class RedisShardManager
     }
 
     /**
+     * 按编号直接指定分片索引（Stream 场景专用）
+     *
+     * 生产端使用：
+     *   $shardNo = RedisShardManager::shardIndexByNumber($streamNo);
+     *   $conn = RedisShardManager::popByShard($shardNo);
+     */
+    public static function shardIndexByNumber(int $number): int
+    {
+        if (self::$shardCount <= 1) {
+            return 0;
+        }
+
+        return $number % self::$shardCount;
+    }
+
+    /**
      * 从 key 中提取路由因子（clientId 优先，其次 username）
      */
     private static function extractRouteValue(string $key): string
@@ -363,6 +383,11 @@ class RedisShardManager
         // ★ device:active:* 走 shard 0（在线统计 key，集中存储便于 SCAN）
         if (preg_match('#^device:active:#', $key)) {
             return '';  // 返回空 → shard 0
+        }
+
+        // ★ stream:device:data:{N} → 按编号路由到对应分片
+        if (preg_match('#^stream:device:data:(\d+)$#', $key, $m)) {
+            return 'stream-shard-' . $m[1];
         }
 
         // device:secret:{clientId}:{username}
@@ -388,6 +413,81 @@ class RedisShardManager
         return '';
     }
 
+    /**
+     * 按分片号直接获取连接（Stream 消费端专用）
+     */
+    public static function popByShard(int $shardNo, float $timeout = 0.3): ?\Redis
+    {
+        if (! self::$ready || self::$pools === null) {
+            return null;
+        }
+
+        $index = (self::$shardCount <= 1) ? 0 : ($shardNo % self::$shardCount);
+        $pool = self::$pools[$index] ?? null;
+        if ($pool === null) {
+            return null;
+        }
+
+        try {
+            $ms = max(1, (int) ($timeout * 1000));
+
+            return $pool->pop($ms);
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * 按分片号直接归还连接（Stream 消费端专用）
+     */
+    public static function pushByShard(int $shardNo, \Redis $conn): void
+    {
+        if (! self::$ready || self::$pools === null) {
+            return;
+        }
+
+        $index = (self::$shardCount <= 1) ? 0 : ($shardNo % self::$shardCount);
+        $pool = self::$pools[$index] ?? null;
+        if ($pool === null) {
+            return;
+        }
+
+        $cfg = self::$configs[$index] ?? null;
+
+        try {
+            $conn->ping();
+            $pool->push($conn);
+
+            return;
+        } catch (\Throwable) {
+            // dead, recreate
+        }
+
+        if ($cfg !== null) {
+            try {
+                $new = new \Redis;
+                $new->connect($cfg['host'], $cfg['port'], 2.0);
+                if ($cfg['password'] !== '') {
+                    $new->auth($cfg['password']);
+                }
+                if ($cfg['db'] > 0) {
+                    $new->select($cfg['db']);
+                }
+                $pool->push($new);
+
+                return;
+            } catch (\Throwable $e) {
+                fwrite(STDERR, sprintf(
+                    '[EdgeAuth] shard=%d replace failed: %s' . PHP_EOL,
+                    $index, $e->getMessage()
+                ));
+            }
+        }
+    }
+
+    /**
+     * 根据 key 获取连接（通用路由）
+     */
     public static function pop(string $key, float $timeout = 0.3): ?\Redis
     {
         if (! self::$ready || self::$pools === null) {
@@ -409,6 +509,9 @@ class RedisShardManager
         }
     }
 
+    /**
+     * 根据 key 归还连接（通用路由）
+     */
     public static function push(string $key, \Redis $conn): void
     {
         if (! self::$ready || self::$pools === null) {
@@ -447,7 +550,7 @@ class RedisShardManager
                 return;
             } catch (\Throwable $e) {
                 fwrite(STDERR, sprintf(
-                    '[EdgeAuth] shard=%d replace failed: %s'.PHP_EOL,
+                    '[EdgeAuth] shard=%d replace failed: %s' . PHP_EOL,
                     $index, $e->getMessage()
                 ));
             }
