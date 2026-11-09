@@ -194,6 +194,9 @@ function authFallbackUrl(): string
 
 function authenticateDevice(string $clientId, string $username, string $password): array
 {
+    // 打印 设备:用户:密码
+    //fwrite(STDERR, '[clientAccess] ' . $clientId . ':' . $username . ':' . $password . PHP_EOL);
+
     $hash = getDeviceSecret($clientId, $username);
     if ($hash === null) {
         return ['ok' => false, 'reason' => 'no secret'];
