@@ -278,6 +278,10 @@ while ($running) {
                             handleDisconnect($conn, $req);
                             break;
 
+                        case '/admin-api/extension/edge/release':
+                            handleRelease($conn, $req);
+                            break;
+
                         case '/admin-api/extension/edge/super':
                             handleSuper($conn, $req);
                             break;
@@ -372,6 +376,8 @@ while ($running) {
                                     'auth' => AUTH_HTTP_PREFIX.'/auth (POST)',
                                     'super' => AUTH_HTTP_PREFIX.'/super (POST)',
                                     'acl' => AUTH_HTTP_PREFIX.'/acl (POST)',
+                                    'disconnect' => AUTH_HTTP_PREFIX.'/disconnect (POST)',
+                                    'release' => AUTH_HTTP_PREFIX.'/release (POST)',
                                     'health' => AUTH_HTTP_PREFIX.'/health (GET)',
                                     'metrics' => AUTH_HTTP_PREFIX.'/metrics (GET)',
                                 ],
