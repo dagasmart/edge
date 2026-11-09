@@ -8,13 +8,15 @@ use Swow\Psr7\Server\ServerConnection;
 
 /* =========================================================
  * EdgeAuth HTTP 路由处理 - 对齐 NanoMQ auth.http
- * 认证方式：username + password（bcrypt）
+ * 认证方式：client_id + username + password（bcrypt）
  *
- * 改动记录：
- * 1. acquireUserOnline() 返回值检查，单点登录拒绝时正确返回 deny
- * 2. online 锁 TTL 从 300s 缩短为 60s，retry 窗口 30s → 10s
- * 3. 新增 handleRelease() 手动释放端点
+ * 在线锁模式（由 .env MQTT_AUTH_ONLINE_MODE 控制）：
+ *   - client_id  → 按 client_id 锁（多设备共享账号，各自独立）
+ *   - username   → 按 username 锁（严格单点登录）
+ *   - both       → 双重校验
  * ========================================================= */
+
+/* ==================== 响应 ==================== */
 
 function authRespond(ServerConnection $conn, bool $allow, string $reason, int $httpStatus = 0): void
 {
@@ -23,68 +25,62 @@ function authRespond(ServerConnection $conn, bool $allow, string $reason, int $h
         : ($allow ? 200 : 403);
 
     respondJson($conn, [
-        'result' => $allow ? 'allow' : 'deny',
-        'code' => $allow ? 0 : 1,
+        'result'  => $allow ? 'allow' : 'deny',
+        'code'    => $allow ? 0 : 1,
         'message' => $allow ? 'success' : $reason,
-        'data' => [
+        'data'    => [
             'result' => $allow ? 'allow' : 'deny',
             'reason' => $reason,
         ],
     ], $status);
 }
 
+/* ==================== 模式读取 ==================== */
+
 /**
- * 获取设备密钥
- *
- * ★ 所有 Redis 操作显式按 key 路由，确保分片模式下落到正确 shard
+ * 获取在线锁模式
+ * 优先级：.env MQTT_AUTH_ONLINE_MODE → config/edge.php auth.online_mode → 默认 client_id
  */
+function getOnlineMode(): string
+{
+    $env = getenv('MQTT_AUTH_ONLINE_MODE');
+    if ($env !== false && in_array($env, ['client_id', 'username', 'both'], true)) {
+        return $env;
+    }
+
+    if (function_exists('config')) {
+        $mode = config('edge.auth.online_mode');
+        if (in_array($mode, ['client_id', 'username', 'both'], true)) {
+            return $mode;
+        }
+    }
+
+    return 'client_id';
+}
+
+/* ==================== 密钥获取 ==================== */
+
 function getDeviceSecret(string $clientId, string $username): ?string
 {
-    // 1. 优先完整格式
-    $key = 'device:secret:'.$clientId.':'.$username;
+    // 1. 严格按 client_id + username 拼 key
+    $key = 'device:secret:' . $clientId . ':' . $username;
     $val = withRedisForKey($key, static function (Redis $conn) use ($key): mixed {
         $v = $conn->get($key);
-
         return $v !== false ? (string) $v : null;
     });
     if ($val !== null && $val !== '') {
         return $val;
     }
 
-    // 2. 兜底：兼容旧格式 device:secret:{username}
-    $legacyKey = 'device:secret:'.$username;
-    $val = withRedisForKey($legacyKey, static function (Redis $conn) use ($legacyKey): mixed {
-        $v = $conn->get($legacyKey);
-
-        return $v !== false ? (string) $v : null;
-    });
-    if ($val !== null && $val !== '') {
-        // 回填完整格式，下次直接命中
-        try {
-            withRedisForKey($key, static function (Redis $conn) use ($key, $val): void {
-                $conn->setex($key, 300, $val);
-            });
-        } catch (Throwable) {
-            // 回填失败不影响本次认证
-        }
-
-        return $val;
-    }
-
-    // 3. Redis 双 miss → 回源 PG
+    // 2. Redis miss → 回源 PG
     $secret = fallbackToPg($clientId, $username);
     if ($secret !== null) {
         try {
             withRedisForKey($key, static function (Redis $conn) use ($key, $secret): void {
                 $conn->setex($key, 300, $secret);
             });
-            withRedisForKey($legacyKey, static function (Redis $conn) use ($legacyKey, $secret): void {
-                $conn->setex($legacyKey, 300, $secret);
-            });
         } catch (Throwable) {
-            // 回填失败不影响本次认证
         }
-
         return $secret;
     }
 
@@ -96,66 +92,61 @@ function fallbackToPg(string $clientId, string $username): ?string
     $baseUrl = authFallbackUrl();
     if ($baseUrl === '') {
         debugLog('fallbackToPg: EDGE_AUTH_FALLBACK_URL not configured');
-
         return null;
     }
 
     $token = (string) getenv('EDGE_INTERNAL_TOKEN');
     if ($token === '') {
         debugLog('fallbackToPg: EDGE_INTERNAL_TOKEN not configured');
-
         return null;
     }
 
     $url = rtrim($baseUrl, '/')
-        .'/extension/edge/auth/fallback'
-        .'?client_id='.rawurlencode($clientId)
-        .'&username='.rawurlencode($username)
-        .'&service=nano';
+        . '/extension/edge/auth/fallback'
+        . '?client_id=' . rawurlencode($clientId)
+        . '&username=' . rawurlencode($username)
+        . '&service=nano';
 
     try {
         $ch = curl_init($url);
         curl_setopt_array($ch, [
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 2,
+            CURLOPT_TIMEOUT       => 2,
             CURLOPT_CONNECTTIMEOUT => 1,
-            CURLOPT_HTTPHEADER => [
-                'X-Edge-Internal: '.$token,
+            CURLOPT_HTTPHEADER    => [
+                'X-Edge-Internal: ' . $token,
                 'Accept: application/json',
             ],
         ]);
 
-        $response = curl_exec($ch);
+        $response  = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error = curl_error($ch);
+        $error    = curl_error($ch);
         curl_close($ch);
 
         if ($error !== '') {
-            fwrite(STDERR, '[fallbackToPg] curl error: '.$error.PHP_EOL);
-
+            fwrite(STDERR, '[fallbackToPg] curl error: ' . $error . PHP_EOL);
             return null;
         }
 
-        if ($httpCode !== 200 || ! is_string($response) || $response === '') {
+        if ($httpCode !== 200 || !is_string($response) || $response === '') {
             debugLog(sprintf(
                 'fallbackToPg: upstream returned %d for client=%s user=%s',
                 $httpCode,
                 $clientId,
                 $username
             ));
-
             return null;
         }
 
         $data = json_decode($response, true, 512, JSON_THROW_ON_ERROR);
-        if (! is_array($data) || ! isset($data['password'])) {
+        if (!is_array($data) || !isset($data['password'])) {
             return null;
         }
 
         return (string) $data['password'];
     } catch (Throwable $e) {
-        fwrite(STDERR, '[fallbackToPg] '.$e->getMessage().PHP_EOL);
-
+        fwrite(STDERR, '[fallbackToPg] ' . $e->getMessage() . PHP_EOL);
         return null;
     }
 }
@@ -178,14 +169,11 @@ function authFallbackUrl(): string
             $host = $parts['host'];
             $port = $parts['port'] ?? null;
             $scheme = ($parts['scheme'] ?? 'http');
-
             if ($port !== null) {
-                return $scheme.'://'.$host.':'.$port;
+                return $scheme . '://' . $host . ':' . $port;
             }
-
-            return $scheme.'://'.$host;
+            return $scheme . '://' . $host;
         }
-
         return '';
     }
 
@@ -199,8 +187,10 @@ function authFallbackUrl(): string
         $port = 8000;
     }
 
-    return 'http://'.$host.':'.$port;
+    return 'http://' . $host . ':' . $port;
 }
+
+/* ==================== 认证 ==================== */
 
 function authenticateDevice(string $clientId, string $username, string $password): array
 {
@@ -209,128 +199,172 @@ function authenticateDevice(string $clientId, string $username, string $password
         return ['ok' => false, 'reason' => 'no secret'];
     }
 
-    if (! password_verify($password, $hash)) {
+    if (!password_verify($password, $hash)) {
         return ['ok' => false, 'reason' => 'password mismatch'];
     }
 
     return ['ok' => true, 'reason' => 'ok'];
 }
 
-/* =========================================================
- * 严格单点登录（Lua 原子，后登录 deny 不踢前）
- *
- * ★ 分片改造：Lua 涉及 GET/SET/DEL 多 key 原子性，
- * 必须按 username 路由到同一个 shard，不能跨 shard。
- *
- * ★ TTL 改为 60s（异常断线后最多 60s 即可换设备登录）
- * ★ retry 窗口改为 10s（被 deny 的设备 10s 后可重试）
- * ========================================================= */
+/* ==================== 在线锁 - client_id 模式 ==================== */
 
-function acquireUserOnline(
-    string $username,
-    string $clientId,
-    int $ttl = 60,
-    int $retryWindow = 10
-): bool {
-    $key = 'auth:online:'.$username;
-    $retryKey = 'auth:retry:'.$username.':'.$clientId;
+function acquireClientOnline(string $clientId, int $ttl = 60): bool
+{
+    $key = 'auth:online:' . $clientId;
+
+    try {
+        $ok = withRedisForKey($key, static function (Redis $conn) use ($key, $ttl) {
+            return $conn->set($key, '1', ['NX', 'EX' => $ttl]);
+        });
+
+        if (!$ok) {
+            // 已存在（同 client_id 重连），续期
+            withRedisForKey($key, static function (Redis $conn) use ($key, $ttl) {
+                $conn->expire($key, $ttl);
+            });
+        }
+
+        return true;
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[acquireClientOnline] ' . $e->getMessage() . PHP_EOL);
+        return false;
+    }
+}
+
+function releaseClientOnline(string $clientId): void
+{
+    $key = 'auth:online:' . $clientId;
+    try {
+        withRedisForKey($key, static function (Redis $conn) use ($key): void {
+            $conn->del($key);
+        });
+    } catch (Throwable $e) {
+        fwrite(STDERR, '[releaseClientOnline] ' . $e->getMessage() . PHP_EOL);
+    }
+}
+
+/* ==================== 在线锁 - username 模式 ==================== */
+
+function acquireUserOnline(string $username, string $clientId, int $ttl = 60): bool
+{
+    $key = 'auth:online:' . $username;
 
     $script = <<<'LUA'
 local cur = redis.call('GET', KEYS[1])
-
 if cur == false then
     redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
-    redis.call('DEL', KEYS[2])
     return 1
 end
-
 if cur == ARGV[1] then
     redis.call('EXPIRE', KEYS[1], ARGV[2])
-    redis.call('DEL', KEYS[2])
     return 1
 end
-
-local retrying = redis.call('GET', KEYS[2])
-if retrying ~= false then
-    return -1
-end
-
-redis.call('SET', KEYS[2], '1', 'EX', ARGV[3])
 return 0
 LUA;
 
     try {
-        $ret = withRedisForKey(
-            $key,
-            static function (Redis $conn) use (
-                $key,
-                $retryKey,
-                $clientId,
-                $ttl,
-                $retryWindow,
-                $script
-            ): int {
-                return (int) $conn->eval(
-                    $script,
-                    [$key, $retryKey, $clientId, $ttl, $retryWindow],
-                    2
-                );
-            }
-        );
+        $ret = withRedisForKey($key, static function (Redis $conn) use ($script, $key, $username, $clientId, $ttl) {
+            return (int) $conn->eval($script, [$key, $username, $clientId, $ttl], 1);
+        });
 
-        if ($ret === -1) {
-            fwrite(STDERR, sprintf(
-                '[acquireUserOnline] silent-window clientid=%s username=%s%s',
+        if ($ret === 0) {
+            fwrite(STDOUT, sprintf(
+                '[acquireUserOnline] DENY conflict clientid=%s username=%s (already online elsewhere)' . PHP_EOL,
                 $clientId,
-                $username,
-                PHP_EOL
-            ));
-        } elseif ($ret === 0) {
-            fwrite(STDERR, sprintf(
-                '[acquireUserOnline] DENY conflict clientid=%s username=%s (already online elsewhere)%s',
-                $clientId,
-                $username,
-                PHP_EOL
+                $username
             ));
         }
 
         return $ret === 1;
     } catch (Throwable $e) {
-        fwrite(STDERR, '[acquireUserOnline] '.$e->getMessage().PHP_EOL);
-
+        fwrite(STDERR, '[acquireUserOnline] ' . $e->getMessage() . PHP_EOL);
         return false;
     }
 }
 
-function releaseUserOnline(string $username, string $clientId): void
+function releaseUserOnline(string $username): void
 {
-    $key = 'auth:online:'.$username;
-    $retryKey = 'auth:retry:'.$username.':'.$clientId;
-
-    $script = <<<'LUA'
-if redis.call('GET', KEYS[1]) == ARGV[1] then
-    redis.call('DEL', KEYS[1])
-end
-redis.call('DEL', KEYS[2])
-return 0
-LUA;
-
+    $key = 'auth:online:' . $username;
     try {
-        withRedisForKey(
-            $key,
-            static function (Redis $conn) use ($key, $retryKey, $clientId, $script): void {
-                $conn->eval($script, [$key, $retryKey, $clientId], 2);
-            }
-        );
+        withRedisForKey($key, static function (Redis $conn) use ($key): void {
+            $conn->del($key);
+        });
     } catch (Throwable $e) {
-        fwrite(STDERR, '[releaseUserOnline] '.$e->getMessage().PHP_EOL);
+        fwrite(STDERR, '[releaseUserOnline] ' . $e->getMessage() . PHP_EOL);
     }
 }
 
-/* =========================================================
- * Disconnect webhook handler
- * ★ NanoMQ 断开连接时调用，释放 online 锁
- * ========================================================= */
+/* ==================== 在线锁 - both 模式辅助 ==================== */
+
+function trackClientToUser(string $clientId, string $username): void
+{
+    $key = 'auth:client_user_map:' . $clientId;
+    try {
+        withRedisForKey($key, static function (Redis $conn) use ($key, $username): void {
+            $conn->setex($key, 300, $username);
+        });
+    } catch (Throwable) {
+    }
+}
+
+function untrackClientToUser(string $clientId): void
+{
+    $key = 'auth:client_user_map:' . $clientId;
+    try {
+        withRedisForKey($key, static function (Redis $conn) use ($key): void {
+            $conn->del($key);
+        });
+    } catch (Throwable) {
+    }
+}
+
+/* ==================== 在线锁统一入口 ==================== */
+
+function acquireOnlineLock(string $clientId, string $username, int $ttl = 60): bool
+{
+    $mode = getOnlineMode();
+
+    switch ($mode) {
+        case 'username':
+            return acquireUserOnline($username, $clientId, $ttl);
+
+        case 'both':
+            $userOk = acquireUserOnline($username, $clientId, $ttl);
+            if (!$userOk) {
+                return false;
+            }
+            trackClientToUser($clientId, $username);
+            return true;
+
+        case 'client_id':
+        default:
+            return acquireClientOnline($clientId, $ttl);
+    }
+}
+
+function releaseOnlineLock(string $clientId, string $username): void
+{
+    $mode = getOnlineMode();
+
+    switch ($mode) {
+        case 'username':
+            releaseUserOnline($username);
+            break;
+
+        case 'both':
+            releaseUserOnline($username);
+            releaseClientOnline($clientId);
+            untrackClientToUser($clientId);
+            break;
+
+        case 'client_id':
+        default:
+            releaseClientOnline($clientId);
+            break;
+    }
+}
+
+/* ==================== Disconnect webhook ==================== */
 
 function handleDisconnect(ServerConnection $conn, ServerRequest $req): void
 {
@@ -351,35 +385,29 @@ function handleDisconnect(ServerConnection $conn, ServerRequest $req): void
         $data['username'] ?? $data['user'] ?? ''
     ));
 
-    if ($clientId === '' || $username === '') {
+    if ($clientId === '') {
         respondJson($conn, [
             'result' => 'error',
-            'reason' => 'missing client_id / username',
+            'reason' => 'missing client_id',
         ], 400);
-
         return;
     }
 
-    releaseUserOnline($username, $clientId);
+    releaseOnlineLock($clientId, $username);
 
     fwrite(STDOUT, sprintf(
-        '[EdgeAuth] [disconnect] SN=%s clientId=%s online lock released'.PHP_EOL,
-        $username,
-        $clientId
+        '[EdgeAuth] [disconnect] clientId=%s username=%s online lock released' . PHP_EOL,
+        $clientId,
+        $username
     ));
 
     respondJson($conn, [
-        'result' => 'ok',
+        'result'   => 'ok',
         'released' => true,
     ], 200);
 }
 
-/* =========================================================
- * Release 手动释放端点
- * ★ 当 disconnect webhook 丢失或设备管理平台需要主动踢人时使用
- * ★ 调用方式：POST /admin-api/extension/edge/release
- *   body: {"username": "fxc", "client_id": "xxx"}
- * ========================================================= */
+/* ==================== 手动释放端点 ==================== */
 
 function handleRelease(ServerConnection $conn, ServerRequest $req): void
 {
@@ -394,36 +422,35 @@ function handleRelease(ServerConnection $conn, ServerRequest $req): void
     }
 
     $clientId = trim((string) (
-        $data['clientid'] ?? $data['client_id'] ?? $data['clientId'] ?? ''
+        $data['client_id'] ?? $data['clientid'] ?? $data['clientId'] ?? ''
     ));
     $username = trim((string) (
         $data['username'] ?? $data['user'] ?? ''
     ));
 
-    if ($username === '' || $clientId === '') {
+    if ($clientId === '') {
         respondJson($conn, [
             'result' => 'error',
-            'reason' => 'missing username / client_id',
+            'reason' => 'missing client_id',
         ], 400);
-
         return;
     }
 
-    // 幂等：无论锁是否存在都尝试释放，不报错
-    releaseUserOnline($username, $clientId);
+    releaseOnlineLock($clientId, $username);
 
     fwrite(STDOUT, sprintf(
-        '[EdgeAuth] [release] manual release username=%s clientId=%s%s',
-        $username,
+        '[EdgeAuth] [release] clientId=%s username=%s lock manually released' . PHP_EOL,
         $clientId,
-        PHP_EOL
+        $username
     ));
 
     respondJson($conn, [
-        'result' => 'ok',
+        'result'   => 'ok',
         'released' => true,
     ], 200);
 }
+
+/* ==================== 认证主逻辑 ==================== */
 
 function handleAuth(ServerConnection $conn, ServerRequest $req): void
 {
@@ -448,28 +475,24 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     if ($clientId === '' || $username === '') {
         metricsInc('auth_fail');
         authRespond($conn, false, 'missing client_id / username');
-
         return;
     }
 
     if (isClientBlocked($clientId)) {
         metricsInc('auth_fail');
         authRespond($conn, false, 'client_blocked');
-
         return;
     }
 
     if ($password === '') {
         metricsInc('auth_fail');
         authRespond($conn, false, 'missing password');
-
         return;
     }
 
-    if (! concurrencyAcquire()) {
+    if (!concurrencyAcquire()) {
         metricsInc('auth_fail');
         authRespond($conn, false, 'overloaded');
-
         return;
     }
 
@@ -479,17 +502,15 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         metricsInc('auth_fail');
         metricsInc('device_concurrency_exceeded');
         authRespond($conn, false, 'device_overloaded');
-
         return;
     }
 
-    $rateKey = 'rate:'.$clientId;
+    $rateKey = 'rate:' . $clientId;
     if (rateLimited($rateKey)) {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
         metricsInc('auth_fail');
         authRespond($conn, false, 'rate_limited');
-
         return;
     }
 
@@ -498,19 +519,18 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
         $authenticated = $result['ok'] ?? false;
         $reason = $result['reason'] ?? 'unknown';
 
-        if (! $authenticated) {
+        if (!$authenticated) {
             if (in_array($reason, ['password mismatch', 'no secret'], true)) {
                 recordClientFail($clientId);
             }
             metricsInc('auth_fail');
             authRespond($conn, false, $reason);
-
             return;
         }
 
-        // ★ 按 clientId 路由清除 fail/block 计数
-        $failKey = 'fail:'.$clientId;
-        $blockKey = 'block:'.$clientId;
+        // 认证通过，清除 fail/block 计数
+        $failKey  = 'fail:' . $clientId;
+        $blockKey = 'block:' . $clientId;
         try {
             withRedisForKey($failKey, static function (Redis $conn) use ($failKey, $blockKey): void {
                 $conn->del($failKey, $blockKey);
@@ -520,15 +540,14 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
 
         EdgeAuthContext::setAuth($username, $clientId);
 
-        // ★ 认证成功，获取 online 锁（TTL=60s 兜底，retry=10s）
-        $onlineOk = acquireUserOnline($username, $clientId, 60, 10);
-        if (! $onlineOk) {
+        // 获取在线锁（模式由 MQTT_AUTH_ONLINE_MODE 控制）
+        $onlineOk = acquireOnlineLock($clientId, $username, 60);
+        if (!$onlineOk) {
             deviceConcurrencyRelease($deviceToken);
             concurrencyRelease();
             metricsInc('auth_fail');
             metricsInc('auth_conflict');
             authRespond($conn, false, 'already_online_elsewhere');
-
             return;
         }
 
@@ -537,14 +556,13 @@ function handleAuth(ServerConnection $conn, ServerRequest $req): void
     } finally {
         deviceConcurrencyRelease($deviceToken);
         concurrencyRelease();
-
-        // ★ 不再在这里释放 online 锁！
-        // 锁由 disconnect webhook（handleDisconnect）显式释放
-        // Lua 脚本中 SET EX 60 提供 TTL 兜底，防止 disconnect 丢失导致永久死锁
-
+        // online 锁不在这里释放，由 disconnect webhook 或 handleRelease 显式释放
+        // TTL 60s 兜底防止 disconnect 丢失
         EdgeAuthContext::clear();
     }
 }
+
+/* ==================== 其他路由 ==================== */
 
 function handleSuper(ServerConnection $conn, ServerRequest $req): void
 {

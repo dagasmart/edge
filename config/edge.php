@@ -8,6 +8,12 @@ return [
         'tls' => [
             'enable' => false,
         ],
+        // 认证相关
+        'auth' => [
+            // 在线锁模式：client_id | username | both
+            // 优先读 .env MQTT_AUTH_ONLINE_MODE，兜底默认 client_id
+            'online_mode' => env('MQTT_AUTH_ONLINE_MODE', 'client_id'),
+        ],
         'batch_size' => 200,           // 批量写入大小（普通 Channel 初始 batch）
         'flush_interval_ms' => 100,   // 最大刷盘间隔（毫秒）
         'channel_size' => 4096,       // Channel 队列容量（普通 Channel）
