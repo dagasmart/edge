@@ -205,7 +205,19 @@ while ($running) {
                 } catch (Throwable $e) {
                     $msg = $e->getMessage();
                     if (! str_contains($msg, 'closed') && ! str_contains($msg, 'reset') && ! str_contains($msg, 'timed out')) {
-                        fwrite(STDERR, '[recv] '.$msg.PHP_EOL);
+                        $remoteAddr = '';
+                        try {
+                            $peerAddr = $conn->getPeerAddress();
+                            $peerPort = $conn->getPeerPort();
+                            $peerAddr = preg_replace('/^::ffff:/', '', $peerAddr);
+                            $remoteAddr = $peerAddr . ':' . $peerPort;
+                        } catch (Throwable) {
+                        }
+                        if ($remoteAddr !== '') {
+                            fwrite(STDERR, '[recv] ' . $msg . ' from ' . $remoteAddr . PHP_EOL);
+                        } else {
+                            fwrite(STDERR, '[recv] ' . $msg . PHP_EOL);
+                        }
                     }
                     break;
                 }

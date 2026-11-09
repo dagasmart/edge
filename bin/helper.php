@@ -413,46 +413,41 @@ function deviceConcurrencyStats(): array
 }
 
 /* =========================================================
- * 客户端失败熔断（原样保留）
+ * 客户端失败熔断
+ *
+ * ★ 改动：
+ * 1. recordClientFail() - fail 窗口 300s → 60s
+ * 2. isClientBlocked() - 删除刷新 TTL 逻辑（防攻击者续期）
  * ========================================================= */
 
 function isClientBlocked(string $clientId): bool
 {
-    $blocked = redisGet('block:'.$clientId);
+    $blocked = redisGet('block:' . $clientId);
     if ($blocked === null) {
         return false;
     }
 
-    // TTL 剩余不足一半时刷新，防止攻击者通过持续重试无限续期
-    try {
-        withRedisForKey('block:'.$clientId, static function (Redis $conn) use ($clientId): void {
-            $ttl = $conn->ttl('block:'.$clientId);
-            if ($ttl > 0 && $ttl < 300) { // 600 的一半
-                $conn->expire('block:'.$clientId, 600);
-            }
-        });
-    } catch (Throwable) {
-    }
-
+    // ★ 不再刷新 TTL，让 block 自然过期，防止持续重试续期
     return true;
 }
 
 /**
  * 5 次失败即封禁：60s → 120s → 240s → 480s → 960s → 封顶 1h
+ * ★ fail 窗口从 300s 改为 60s
  */
 function recordClientFail(string $clientId): void
 {
-    $key = 'fail:'.$clientId;
+    $key = 'fail:' . $clientId;
     withRedisForKey($key, static function (Redis $conn) use ($key, $clientId): void {
         $script = 'local c = redis.call("INCR", KEYS[1])
 if c == 1 then redis.call("EXPIRE", KEYS[1], ARGV[1]) end
 return c';
-        $c = (int) $conn->eval($script, [$key, 300], 1);
+        $c = (int) $conn->eval($script, [$key, 60], 1);  // ★ 改 300 → 60
 
         if ($c >= 5) {
             $ttl = min(3600, 60 * (2 ** min($c - 5, 6)));
-            $conn->setex('block:'.$clientId, $ttl, (string) $c);
-            fwrite(STDERR, '[block] '.$clientId.' (fail count='.$c.', ttl='.$ttl.'s)'.PHP_EOL);
+            $conn->setex('block:' . $clientId, $ttl, (string) $c);
+            fwrite(STDERR, '[block] ' . $clientId . ' (fail count=' . $c . ', ttl=' . $ttl . 's)' . PHP_EOL);
         }
     });
 }
@@ -556,7 +551,7 @@ if (! function_exists('respondJson')) {
 
         $body = json_encode($data, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
         if ($body === false) {
-            fwrite(STDERR, '[respondJson] json_encode failed: '.json_last_error_msg().PHP_EOL);
+            fwrite(STDERR, '[respondJson] json_encode failed: ' . json_last_error_msg() . PHP_EOL);
             $body = '{"error":"json_encode_failed"}';
             $status = 500;
         }
@@ -570,7 +565,7 @@ if (! function_exists('respondJson')) {
                 'Content-Length' => (string) $length,
             ]);
         } catch (Throwable $e) {
-            fwrite(STDERR, '[respondJson] respond failed: '.$e->getMessage().PHP_EOL);
+            fwrite(STDERR, '[respondJson] respond failed: ' . $e->getMessage() . PHP_EOL);
         }
     }
 }
@@ -581,6 +576,6 @@ if (! function_exists('debugLog')) {
         if (! defined('DEBUG') || DEBUG !== true) {
             return;
         }
-        fwrite(STDERR, '[EdgeAuth] '.$msg.PHP_EOL);
+        fwrite(STDERR, '[EdgeAuth] ' . $msg . PHP_EOL);
     }
 }
