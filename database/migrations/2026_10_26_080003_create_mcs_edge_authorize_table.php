@@ -18,15 +18,14 @@ return new class extends Migration
                 $table->comment('边缘网关认证表');
                 $table->id();
 
+                $table->string('client_id', 100)
+                    ->comment('设备 cli|sn');
+
                 $table->string('username', 64)
-                    ->unique()
                     ->comment('用户名');
 
                 $table->string('password', 100)
                     ->comment('密码 password_hash');
-
-                $table->string('client_id', 100)
-                    ->comment('设备 cli|sn');
 
                 $table->boolean('active')
                     ->default(false)

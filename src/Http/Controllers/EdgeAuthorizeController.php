@@ -35,12 +35,12 @@ class EdgeAuthorizeController extends AdminController
                     ->sortable()
                     ->set('fixed', 'left')
                     ->width(80),
+                amis()->TableColumn('client_id', '终端sn')
+                    ->searchable(['name' => 'client_id', 'type' => 'input-text', 'placeholder' => '请输入终端sn'])
+                    ->set('fixed', 'left'),
                 amis()->TableColumn('username', '账号')
                     ->searchable(['name' => 'username', 'type' => 'input-text', 'placeholder' => '请输入账号'])
                     ->copyable()
-                    ->set('fixed', 'left'),
-                amis()->TableColumn('client_id', '终端sn')
-                    ->searchable(['name' => 'client_id', 'type' => 'input-text', 'placeholder' => '请输入终端sn'])
                     ->set('fixed', 'left'),
                 amis()->TableColumn('active', '状态')
                     ->set('type', 'switch')
@@ -52,8 +52,8 @@ class EdgeAuthorizeController extends AdminController
                     ->set('onText', '是')
                     ->set('offText', '否')
                     ->width(80),
-                amis()->TableColumn('secret', '密钥secret')
-                    ->copyable(),
+//                amis()->TableColumn('secret', '密钥secret')
+//                    ->copyable(),
                 amis()->TableColumn('secret_change_at', '更新时间')
                     ->type('datetime')
                     ->width(150),
@@ -72,19 +72,23 @@ class EdgeAuthorizeController extends AdminController
             amis()->Tabs()->tabsMode('line')->tabs([
                 amis()->Tab()->title('认证信息')->icon('menu')->body([
                     amis()->TextControl('client_id', '终端sn')
+                        ->placeholder('请输入设备终端sn/client_id')
                         ->clearable()
                         ->size('md')
                         ->required(),
                     amis()->TextControl('username', '账号')
                         ->clearable()
+                        ->placeholder('账号必须字母数字组合，3-20字以内')
                         ->size('md')
                         ->required(),
                     amis()->TextControl('password', '密码')
-                        ->type('input-password')   // ← 密码输入框，不回显明文
+                        ->type('input-password')
+                        ->name('pwd_confirm_new')// ← 改成一个不像密码的名字
                         ->clearable()
+                        ->placeholder($isEdit ? '为空时保留原密码' : '密码6-12个字符之间')
                         ->size('md')
                         ->description('新增必填；编辑时留空则不修改')
-                        ->required(),
+                        ->required(!$isEdit),
                     amis()->SwitchControl('is_super', '超管')
                         ->onText('是')
                         ->offText('否')
