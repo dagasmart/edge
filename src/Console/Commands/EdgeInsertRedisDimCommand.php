@@ -1030,7 +1030,6 @@ class EdgeInsertRedisDimCommand extends Command
 
     private function routeToHighChannel(array $item, string $device): void
     {
-        // ★ FIX: Worker 全部退出时自动降级普通通道，避免消息饿死
         $aliveHigh = $this->countAliveWorkers($this->highWorkerCoroutines);
         if ($aliveHigh < 1) {
             $this->warn('[ROUTE] 高优 Worker 全部退出，降级普通通道 device=' . $device);
@@ -1045,14 +1044,15 @@ class EdgeInsertRedisDimCommand extends Command
             return;
         }
 
-        try {
-            $this->highChannel->push($item);
-            $this->receivedCount++;
-            $this->highBacklog++;
-        } catch (Throwable $e) {
-            $this->error('[CHANNEL] 高优队列 push 失败：' . $e->getMessage());
-            $this->exporter->inc('edge_dead_letter_total');
+        $ret = $this->highChannel->push($item, 0);
+        if ($ret < 0) {
+            $this->error(sprintf('[CHANNEL] 高优队列 push 失败(ret=%d)，降级普通通道 device=%s', $ret, $device));
+            $this->routeToNormalChannel($item, $device);
+            return;
         }
+
+        $this->receivedCount++;
+        $this->highBacklog++;
     }
 
     private function pushDeadLetter(array $batch, string $reason): void
@@ -1195,7 +1195,7 @@ class EdgeInsertRedisDimCommand extends Command
     {
         $batch = [];
         $capacity = max(1, $this->normalBatchSize);
-        $flushIntervalSec = max(0.001, $this->normalFlushIntervalMs / 1000);
+        $flushIntervalSec = max(0.02, $this->normalFlushIntervalMs / 1000); // ★ 下限 20ms
         $lastFlush = microtime(true);
         $workerId = Coroutine::getCurrent()->getId();
 
@@ -1207,23 +1207,22 @@ class EdgeInsertRedisDimCommand extends Command
                 break;
             }
 
-            $timeout = $this->stopping ? 0 : max(0, (int) (
+            // ★ FIX: 跟高优一样，timeout 下限 20ms
+            $timeout = $this->stopping ? 0 : max(20, (int)(
                 ($flushIntervalSec - (microtime(true) - $lastFlush)) * 1000
             ));
 
             $item = null;
             try {
-                if ($timeout > 0) {
-                    /** @var array<string, mixed>|null $item */
-                    $item = $this->normalChannel->pop($timeout);
-                } else {
-                    /** @var array<string, mixed>|null $item */
-                    $item = $this->normalChannel->pop(0);
-                }
+                /** @var array<string, mixed>|null $item */
+                $item = $this->normalChannel->pop($timeout);
             } catch (Throwable) {
+                // ★ FIX: 静默，不刷屏
+                $lastFlush = microtime(true);
                 continue;
             }
 
+            // 以下逻辑不变...
             if ($item === self::STOP_SENTINEL) {
                 if ($batch !== []) {
                     $this->flushNormalBatch($batch);
@@ -1267,8 +1266,8 @@ class EdgeInsertRedisDimCommand extends Command
     private function runHighWorker(): void
     {
         $batch = [];
-        $capacity = max(1, $this->highBatchSize);
-        $flushIntervalSec = max(0.001, $this->highFlushIntervalMs / 1000);
+        $capacity = 1; // 每条立即 flush
+        $flushIntervalSec = 0.02; // 20ms
         $lastFlush = microtime(true);
         $workerId = Coroutine::getCurrent()->getId();
 
@@ -1276,20 +1275,24 @@ class EdgeInsertRedisDimCommand extends Command
         $this->activeHighWorkers++;
 
         while (true) {
-            $timeout = $this->stopping ? 0 : max(0, (int) (
+            if ($this->stopping && !$this->highChannel->isAvailable()) {
+                break;
+            }
+
+            // ★ FIX: 超时至少 20ms，不再传 1ms
+            $timeout = $this->stopping ? 0 : max(20, (int)(
                 ($flushIntervalSec - (microtime(true) - $lastFlush)) * 1000
             ));
 
             $item = null;
             try {
-                if ($timeout > 0) {
-                    /** @var array<string, mixed>|null $item */
-                    $item = $this->highChannel->pop($timeout);
-                } else {
-                    /** @var array<string, mixed>|null $item */
-                    $item = $this->highChannel->pop(0);
+                /** @var array<string, mixed>|null $item */
+                $item = $this->highChannel->pop($timeout);
+            } catch (Throwable $e) {
+                $lastFlush = microtime(true);
+                if ($this->output->isVerbose()) {
+                    $this->line(sprintf('[WORKER:high] #%d pop timeout', $workerId)); // ★ 去掉 (normal)
                 }
-            } catch (Throwable) {
                 continue;
             }
 
@@ -1314,12 +1317,20 @@ class EdgeInsertRedisDimCommand extends Command
                 if ($this->stopping) {
                     $this->activeHighWorkers = max(0, $this->activeHighWorkers - 1);
                     $this->removeSelfFromPool($this->highWorkerCoroutines, Coroutine::getCurrent());
-                    $this->debugWorker('high', $workerId, 'stopped by null+stopping');
+                    $this->debugWorker('high', $workerId, 'stopped by stopping');
                     break;
                 }
 
                 continue;
             }
+
+            // ★ 确认拿到消息
+            $this->line(sprintf(
+                '[WORKER:high] #%d got topic=%s device=%s',
+                $workerId,
+                $item['topic'] ?? 'unknown',
+                $item['device'] ?? 'unknown'
+            ));
 
             $batch[] = $item;
 
@@ -1359,6 +1370,7 @@ class EdgeInsertRedisDimCommand extends Command
                     $item = $this->deadChannel->pop(0);
                 }
             } catch (Throwable) {
+                $lastFlush = microtime(true);
                 continue;
             }
 
@@ -1656,17 +1668,21 @@ class EdgeInsertRedisDimCommand extends Command
         $host = '127.0.0.1';
         $scheme = 'http';
 
-        try {
-            $output = [];
-            @exec('hostname -I 2>/dev/null', $output);
-            if (! empty($output) && ! empty($output[0])) {
-                $ips = preg_split('/\s+/', trim($output[0]));
-                if (! empty($ips[0])) {
-                    $host = $ips[0];
+        if (PHP_OS_FAMILY === 'Windows') {
+            $host = gethostbyname(gethostname());
+        } else {
+            try {
+                $output = [];
+                @exec('hostname -I 2>/dev/null', $output);
+                if (! empty($output) && ! empty($output[0])) {
+                    $ips = preg_split('/\s+/', trim($output[0]));
+                    if (! empty($ips[0])) {
+                        $host = $ips[0];
+                    }
                 }
+            } catch (Throwable) {
+                // ignore
             }
-        } catch (Throwable) {
-            // ignore
         }
 
         return [$scheme, $host];
@@ -1679,7 +1695,8 @@ class EdgeInsertRedisDimCommand extends Command
 
     private function debugWorker(string $type, int $workerId, string $message): void
     {
-        if ($this->option('verbose')) {
+        // Laravel 内置：php artisan xxx -v / -vv / -vvv 时 $this->output->isVerbose() 为 true
+        if ($this->output->isVerbose()) {
             $this->line(sprintf('[WORKER:%s] #%d %s', $type, $workerId, $message));
         }
     }

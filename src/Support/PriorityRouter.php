@@ -12,7 +12,7 @@ namespace DagaSmart\Edge\Support;
  */
 class PriorityRouter
 {
-    /** @var string[] */
+    /** @var string[] 编译后的正则表达式数组 */
     private readonly array $highPriorityTopics;
 
     public function __construct(
@@ -27,19 +27,7 @@ class PriorityRouter
      */
     public function isHighPriority(string $topic): bool
     {
-        // 通过反射拿到编译后的正则数组，避免硬编码属性名
-        $patterns = [];
-        foreach (get_object_vars($this) as $value) {
-            if (is_array($value) && $value !== []) {
-                $first = reset($value);
-                if (is_string($first) && str_starts_with($first, '/')) {
-                    $patterns = $value;
-                    break;
-                }
-            }
-        }
-
-        foreach ($patterns as $pattern) {
+        foreach ($this->highPriorityTopics as $pattern) {
             if (@preg_match($pattern, $topic) === 1) {
                 return true;
             }
@@ -54,6 +42,14 @@ class PriorityRouter
     public function getBatchController(): ?MultiDimAdaptiveBatch
     {
         return $this->batch;
+    }
+
+    /**
+     * 获取编译后的正则模式列表（调试用）
+     */
+    public function getCompiledPatterns(): array
+    {
+        return $this->highPriorityTopics;
     }
 
     /**
