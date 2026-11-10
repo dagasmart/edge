@@ -73,7 +73,8 @@ class NanoMQ
                         }
 
                         $this->clearConnection();
-                        sleep(min($retryDelay, 10));
+                        // ★ FIX: sleep() → swow_co_sleep()
+                        swow_co_sleep(min($retryDelay, 10));
                         $retryDelay = min($retryDelay * 2, $maxRetryDelay);
                         continue;
                     }
@@ -114,22 +115,14 @@ class NanoMQ
                     $msg = $e->getMessage();
                     $code = $e->getCode();
 
-                    // ★ 错误码 1 = CONNECTION_FAILED，静默
-                    if ($code === 1 || $code === 66
-                        || str_contains($msg, 'reached EOF')
-                        || str_contains($msg, 'Transferring data')
-                        || str_contains($msg, 'feof()')
-                        || str_contains($msg, 'socket')
-                        || str_contains($msg, 'data transfer')
-                        || str_contains($msg, 'connection')
-                    ) {
-                        // 静默
-                    } else {
+                    // 错误码 1 = CONNECTION_FAILED，静默
+                    if ($code !== 1 && $code !== 66 && ! $this->isNetworkSilentException($msg)) {
                         fwrite(STDERR, '[MQTT] 订阅异常：' . $msg . PHP_EOL);
                     }
 
                     $this->clearConnection();
-                    usleep($retryDelay * 1000000);
+                    // ★ FIX: usleep() → swow_co_sleep()
+                    swow_co_sleep((float) $retryDelay);
                     $retryDelay = min($retryDelay * 2, $maxRetryDelay);
 
                 } catch (Throwable $e) {
@@ -139,20 +132,13 @@ class NanoMQ
 
                     $msg = $e->getMessage();
 
-                    if (str_contains($msg, 'feof()')
-                        || str_contains($msg, 'socket')
-                        || str_contains($msg, 'stream')
-                        || str_contains($msg, 'reached EOF')
-                        || str_contains($msg, 'Transferring data')
-                        || str_contains($msg, 'data transfer')
-                    ) {
-                        // 静默
-                    } else {
+                    if (! $this->isNetworkSilentException($msg)) {
                         fwrite(STDERR, '[MQTT] 未知异常：' . $msg . PHP_EOL);
                     }
 
                     $this->clearConnection();
-                    usleep($retryDelay * 1000000);
+                    // ★ FIX: usleep() → swow_co_sleep()
+                    swow_co_sleep((float) $retryDelay);
                     $retryDelay = min($retryDelay * 2, $maxRetryDelay);
                 }
             }
@@ -164,6 +150,38 @@ class NanoMQ
                 // ignore
             }
         });
+    }
+
+    /**
+     * 判断是否为网络/连接类异常（可静默，不需要告警）
+     */
+    private function isNetworkSilentException(string $msg): bool
+    {
+        static $silentKeywords = [
+            'feof()',
+            'socket',
+            'stream',
+            'reached eof',
+            'transferring data',
+            'data transfer',
+            'connection refused',
+            'connection reset',
+            'connection timed out',
+            'timed out',
+            'channel wait producer failed',
+            'channel closed',
+            'broken pipe',
+            'connection already in progress',
+        ];
+
+        $lower = strtolower($msg);
+        foreach ($silentKeywords as $keyword) {
+            if (str_contains($lower, $keyword)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function clearConnection(): void
