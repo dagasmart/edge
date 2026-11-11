@@ -26,6 +26,10 @@ use Throwable;
  * ★ FIX: Channel::push() 返回 static（Channel 对象），改用 try/catch 判定满队列
  * ★ FIX: Channel::pop() 的 timeout 单位是微秒，批量刷新计时改为微秒并按时间 flush
  * ★ FIX: 停机时调用 NanoMQ::stop()，避免退出阶段继续重连
+ * ★ FIX: collectWorkerMetrics() 指标名对齐 PrometheusExporter 注册表；counter 不再误用 set()
+ * ★ FIX: 补齐 flushed_total / wait_ms / qps / mqtt_connected 等已注册但从未写入的指标
+ * ★ FIX: DB Facade 直接关闭 QueryLog，不再依赖 class_exists('DB') 别名
+ * ★ FIX: 快速退出分支主动 stop metrics server，确保 9090 端口即时释放
  */
 class EdgeInsertRedisDimCommand extends Command
 {
@@ -213,9 +217,10 @@ class EdgeInsertRedisDimCommand extends Command
 
     public function handle(): int
     {
-        if (class_exists('DB')) {
-            DB::disableQueryLog();
-        }
+        // ★ FIX: 直接调用 Facade。class_exists('DB') 依赖 config/app.php 的 aliases，
+        // Laravel 11+ 默认不再注册该别名时会返回 false，QueryLog 便不会关闭；
+        // 常驻协程下查询日志持续累积会造成内存泄漏。
+        DB::disableQueryLog();
 
         $this->startTime = microtime(true);
         $this->info('[edge:insert-redis-dim] 启动（分片版），PID=' . getmypid());
@@ -487,6 +492,9 @@ class EdgeInsertRedisDimCommand extends Command
 
         if ($this->stopping) {
             $this->info('[edge] 快速退出模式');
+            // ★ FIX: exit(0) 前主动释放监听 socket，避免端口残留占用
+            $this->exporter->stop();
+            $this->mqtt?->stop();
             $this->printStats();
             $this->info('[edge:insert-redis-dim] 已停止');
             exit(0);
@@ -1464,6 +1472,7 @@ class EdgeInsertRedisDimCommand extends Command
 
         $flushStart = microtime(true);
         $count = count($batch);
+        $this->recordWaitMs('normal', $batch);
 
         try {
             $shardBatches = [];
@@ -1512,6 +1521,7 @@ class EdgeInsertRedisDimCommand extends Command
 
             $this->normalFlushedCount += $count;
             $this->exporter->inc('edge_data_write_success_total', $count);
+            $this->exporter->inc('edge_flushed_total_normal', $count);
             $this->normalBacklog = max(0, $this->normalBacklog - $count);
 
             $elapsedMs = (microtime(true) - $flushStart) * 1000;
@@ -1541,6 +1551,7 @@ class EdgeInsertRedisDimCommand extends Command
 
         $flushStart = microtime(true);
         $count = count($batch);
+        $this->recordWaitMs('high', $batch);
 
         try {
             $shardBatches = [];
@@ -1590,6 +1601,7 @@ class EdgeInsertRedisDimCommand extends Command
 
             $this->highFlushedCount += $count;
             $this->exporter->inc('edge_high_write_success_total', $count);
+            $this->exporter->inc('edge_flushed_total_high', $count);
             $this->highBacklog = max(0, $this->highBacklog - $count);
 
             $elapsedMs = (microtime(true) - $flushStart) * 1000;
@@ -1613,6 +1625,7 @@ class EdgeInsertRedisDimCommand extends Command
         }
 
         $flushStart = microtime(true);
+        $this->recordWaitMs('dead', $batch);
 
         try {
             $conn = RedisShardManager::popByShard(0);
@@ -1650,6 +1663,7 @@ class EdgeInsertRedisDimCommand extends Command
             }
 
             $this->deadFlushedCount += count($batch);
+            $this->exporter->inc('edge_flushed_total_dead', count($batch));
             $elapsedMs = (microtime(true) - $flushStart) * 1000;
             $this->deadFlushLatencySum += $elapsedMs;
             $this->deadFlushTimes++;
@@ -1664,15 +1678,84 @@ class EdgeInsertRedisDimCommand extends Command
 
     private function collectWorkerMetrics(): void
     {
-        $this->exporter->set('edge_active_normal_workers', $this->activeNormalWorkers);
-        $this->exporter->set('edge_active_high_workers', $this->activeHighWorkers);
-        $this->exporter->set('edge_active_dead_workers', $this->activeDeadWorkers);
+        // ★ FIX: 原名 edge_active_normal_workers / edge_normal_backlog / edge_dropped_total
+        // 在 PrometheusExporter::reset() 中并未注册，set() 会被静默忽略；
+        // edge_received_total 是 counter，也不能用 set() 覆盖（由 inc() 累加）。
+        $this->exporter->set('edge_active_workers_normal', $this->activeNormalWorkers);
+        $this->exporter->set('edge_active_workers_high', $this->activeHighWorkers);
+        $this->exporter->set('edge_active_workers_dead', $this->activeDeadWorkers);
         $this->exporter->set('edge_active_clients', $this->activeClientCount);
-        $this->exporter->set('edge_normal_backlog', $this->normalBacklog);
-        $this->exporter->set('edge_high_backlog', $this->highBacklog);
-        $this->exporter->set('edge_dead_backlog', $this->deadBacklog);
-        $this->exporter->set('edge_received_total', $this->receivedCount);
-        $this->exporter->set('edge_dropped_total', $this->droppedCount);
+
+        $this->exporter->set('edge_channel_backlog_normal', $this->normalBacklog);
+        $this->exporter->set('edge_channel_backlog_high', $this->highBacklog);
+        $this->exporter->set('edge_channel_backlog_dead', $this->deadBacklog);
+        $this->exporter->set('edge_queue_backlog', $this->normalBacklog + $this->highBacklog + $this->deadBacklog);
+
+        $this->exporter->set('edge_message_wait_ms_normal', $this->lastNormalWaitMs);
+        $this->exporter->set('edge_message_wait_ms_high', $this->lastHighWaitMs);
+        $this->exporter->set('edge_message_wait_ms_dead', $this->lastDeadWaitMs);
+
+        $this->exporter->set('edge_flush_latency_ms_normal', $this->avgLatency($this->normalFlushLatencySum, $this->normalFlushTimes));
+        $this->exporter->set('edge_flush_latency_ms_high', $this->avgLatency($this->highFlushLatencySum, $this->highFlushTimes));
+        $this->exporter->set('edge_flush_latency_ms_dead', $this->avgLatency($this->deadFlushLatencySum, $this->deadFlushTimes));
+
+        $this->exporter->set('edge_qps', $this->currentQps());
+        $this->exporter->set('edge_current_flush_interval_ms', $this->normalFlushIntervalMs);
+        $this->exporter->set('edge_mqtt_connected', ($this->mqtt !== null && $this->mqtt->isRunning()) ? 1 : 0);
+
+        // counter 类指标一律由 inc() 累加，此处不再用 set() 覆盖
+    }
+
+    /** 平均 flush 耗时（毫秒） */
+    private function avgLatency(float $sum, int $times): float
+    {
+        return $times > 0 ? $sum / $times : 0.0;
+    }
+
+    /** 最近 1 秒内收到的消息数（qpsWindow 上限 200，极高流量下会低估） */
+    private function currentQps(): float
+    {
+        if ($this->qpsWindow === []) {
+            return 0.0;
+        }
+
+        $cutoff = microtime(true) - 1.0;
+        $hits = 0;
+        foreach ($this->qpsWindow as $t) {
+            if ($t >= $cutoff) {
+                $hits++;
+            }
+        }
+
+        return (float) $hits;
+    }
+
+    /** 记录本批消息在 Channel 中的平均等待时间（毫秒） */
+    private function recordWaitMs(string $channel, array $batch): void
+    {
+        $now = microtime(true);
+        $sum = 0.0;
+        $n = 0;
+
+        foreach ($batch as $item) {
+            if (isset($item['_enqueued_at'])) {
+                $sum += ($now - (float) $item['_enqueued_at']) * 1000;
+                $n++;
+            }
+        }
+
+        if ($n === 0) {
+            return;
+        }
+
+        $avg = $sum / $n;
+        if ($channel === 'normal') {
+            $this->lastNormalWaitMs = $avg;
+        } elseif ($channel === 'high') {
+            $this->lastHighWaitMs = $avg;
+        } elseif ($channel === 'dead') {
+            $this->lastDeadWaitMs = $avg;
+        }
     }
 
     private function printStats(): void
