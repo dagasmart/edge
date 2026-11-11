@@ -114,7 +114,7 @@ class NanoMQ
                     $this->lastActivityAt = $connectedAt;
 
                     fwrite(STDERR, sprintf(
-                        "[MQTT] 连接成功 | client_id=%s | 订阅 topics=%s\n",
+                        "\033[32m[MQTT] 连接成功 | client_id=%s | 订阅 topics=%s\033[0m\n",
                         $this->safeGetClientId($mqtt),
                         implode(', ', $topics),
                     ));
@@ -373,7 +373,7 @@ class NanoMQ
         }
 
         fwrite(STDERR, sprintf(
-            "[MQTT] 连接中断（持续 %.1fs，原因=%s），%ds 后重连...\n",
+            "\033[31m[MQTT] 连接中断（持续 %.1fs，原因=%s），%ds 后重连...\033[0m\n",
             $duration,
             $reason,
             $retryDelay,
