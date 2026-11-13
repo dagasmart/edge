@@ -51,6 +51,7 @@ class EdgeAuthorizeController extends AdminController
                     ->set('type', 'switch')
                     ->set('onText', '是')
                     ->set('offText', '否')
+                    ->set('visible', is_plat_administrator())
                     ->width(80),
 //                amis()->TableColumn('secret', '密钥secret')
 //                    ->copyable(),

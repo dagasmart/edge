@@ -49,6 +49,8 @@ return new class extends Migration
                     ->nullable()
                     ->comment('描述');
 
+                $table->integer('mer_id')->nullable();
+
                 $table->timestamps();
 
                 $table->index('client_id');

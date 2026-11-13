@@ -40,7 +40,7 @@ class EdgeInsertRedisDimCommand extends Command
         {--sample-rate-max=1.0 : 最大采样率}
         {--device-active-ttl= : 设备活跃 key TTL(秒)}
         {--heartbeat-topic=heartbeat/response : 心跳 topic}
-        {--heartbeat-write-stream=1 : 心跳是否写入 Redis Stream(0/1)}
+        {--heartbeat-write-stream=0 : 心跳是否写入 Redis Stream(0/1)}
         {--shard-count=2 : Stream 分片数量}';
 
     protected $description = '订阅 NanoMQ 多主题，按优先级路由并批量写入 Redis Stream（分片版）';
@@ -372,7 +372,7 @@ class EdgeInsertRedisDimCommand extends Command
                             $this->renewDeviceActive($activeKey);
                         }
                         if (! $this->heartbeatWriteStream) {
-                            return;
+                            return;   // ← 直接 return，不进任何 channel
                         }
                     }
 
