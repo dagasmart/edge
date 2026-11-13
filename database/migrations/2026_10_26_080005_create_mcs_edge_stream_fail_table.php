@@ -9,6 +9,8 @@ use Illuminate\Support\Facades\Schema;
 
 return new class extends Migration
 {
+    protected $connection = 'master';
+
     private string $name = 'mcs_edge_stream_fail';
 
     public function up(): void
