@@ -1,5 +1,7 @@
 <?php
+
 declare(strict_types=1);
+
 namespace DagaSmart\Edge\Http\Controllers;
 
 use DagaSmart\BizAdmin\Renderers\Form;
@@ -53,8 +55,8 @@ class EdgeAuthorizeController extends AdminController
                     ->set('offText', '否')
                     ->set('visible', is_plat_administrator())
                     ->width(80),
-//                amis()->TableColumn('secret', '密钥secret')
-//                    ->copyable(),
+                //                amis()->TableColumn('secret', '密钥secret')
+                //                    ->copyable(),
                 amis()->TableColumn('secret_change_at', '更新时间')
                     ->type('datetime')
                     ->width(150),
@@ -89,7 +91,7 @@ class EdgeAuthorizeController extends AdminController
                         ->placeholder($isEdit ? '为空时保留原密码' : '密码6-12个字符之间')
                         ->size('md')
                         ->description('新增必填；编辑时留空则不修改')
-                        ->required(!$isEdit),
+                        ->required(! $isEdit),
                     amis()->SwitchControl('is_super', '超管')
                         ->onText('是')
                         ->offText('否')

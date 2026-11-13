@@ -21,7 +21,14 @@ class EdgeAuthorizeService extends AdminService
     protected string $modelName = EdgeAuthorize::class;
 
     // ==================== 超级用户白名单 ====================
-    protected array $superUsers = ['admin', 'gateway01', 'bench_client'];
+    protected array $superUsers = ['admin', 'supper', 'bench_client'];
+
+    public function saving(&$data, $primaryKey = ''): void
+    {
+        parent::saving($data, $primaryKey);
+
+        $data['password'] = $data['password'] ?? $data['pwd_confirm_new'] ?? null;
+    }
 
     // ==================== 认证 ====================
 
